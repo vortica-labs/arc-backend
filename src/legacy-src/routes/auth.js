@@ -36,7 +36,8 @@ const {
   verifyOtpAndLogin,
   resetPasswordWithOtp,
   checkPasswordSame,
-  generateGuestToken
+  generateGuestToken,
+  googleTokenLogin
 } = require('../controllers/authController');
 
 const router = express.Router();
@@ -151,7 +152,10 @@ router.delete('/account', protect, deleteAccountValidation, deleteAccount);
 router.post('/logout', logout);
 router.post('/complete-google-profile', protect, completeGoogleProfile);
 
-// Google OAuth routes
+// Client-side Google OAuth (popup flow — no redirect URI required)
+router.post('/google/token', googleTokenLogin);
+
+// Legacy server-side Google OAuth routes (kept for reference)
 router.get('/google',
   passport.authenticate('google', { scope: ['profile', 'email'] })
 );

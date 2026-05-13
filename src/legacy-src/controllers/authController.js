@@ -1049,6 +1049,89 @@ const generateGuestToken = async (req, res) => {
   }
 };
 
+const googleTokenLogin = async (req, res) => {
+  try {
+    const { access_token } = req.body;
+    if (!access_token) {
+      return res.status(400).json({ success: false, message: 'access_token is required' });
+    }
+
+    const axios = require('axios');
+    const { data: profile } = await axios.get('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${access_token}` }
+    });
+
+    const email = profile.email?.toLowerCase();
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'Email not provided by Google' });
+    }
+
+    let user = await User.findOne({ email });
+
+    if (!user) {
+      const { uploadAvatarFromUrl } = require('../utils/cloudinary');
+      let avatarUrl = profile.picture || '';
+      if (profile.picture) {
+        try {
+          const uploaded = await uploadAvatarFromUrl(profile.picture);
+          avatarUrl = uploaded.url;
+        } catch (_) {
+          avatarUrl = profile.picture;
+        }
+      }
+
+      const randomStr = Math.random().toString(36).substring(2, 10) + Date.now().toString(36).substring(2, 10);
+      let baseUsername = `g_${randomStr.substring(0, 14)}`;
+      let checkUser = await User.findOne({ username: baseUsername });
+      let finalUsername = baseUsername;
+      let counter = 1;
+      while (checkUser && counter < 1000) {
+        const maxLen = 18 - counter.toString().length;
+        finalUsername = `g_${randomStr.substring(0, maxLen)}${counter}`;
+        if (finalUsername.length > 20) finalUsername = finalUsername.substring(0, 20);
+        checkUser = await User.findOne({ username: finalUsername });
+        counter++;
+      }
+
+      user = await User.create({
+        email,
+        googleId: profile.sub,
+        username: finalUsername,
+        password: require('crypto').randomBytes(32).toString('hex'),
+        userType: 'player',
+        profile: {
+          displayName: profile.name || email.split('@')[0],
+          avatar: avatarUrl
+        },
+        needsProfileCompletion: true,
+        isActive: true
+      });
+    } else {
+      user.lastSeen = new Date();
+      await user.save();
+    }
+
+    const token = generateToken({ id: user._id, username: user.username, userType: user.userType });
+    const refreshToken = generateRefreshToken({ id: user._id });
+
+    return res.json({
+      success: true,
+      token,
+      refreshToken,
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        userType: user.userType,
+        needsProfileCompletion: user.needsProfileCompletion
+      }
+    });
+  } catch (error) {
+    log.error('Google token login error:', { error: String(error) });
+    return res.status(500).json({ success: false, message: 'Google login failed' });
+  }
+};
+
 module.exports = {
   register,
   login,
@@ -1067,5 +1150,6 @@ module.exports = {
   verifyOtpAndLogin,
   resetPasswordWithOtp,
   checkPasswordSame,
-  generateGuestToken
+  generateGuestToken,
+  googleTokenLogin
 };
