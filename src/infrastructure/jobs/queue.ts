@@ -9,7 +9,14 @@ export const QUEUE_NAMES = {
 } as const;
 
 // ── Connection config (reuses the same Redis as caching/sockets) ──────────
-const connection = { url: env.REDIS_URL };
+const connection = {
+  socket: {
+    host: env.REDIS_HOST,
+    port: env.REDIS_PORT
+  },
+  username: env.REDIS_USERNAME,
+  password: env.REDIS_PASSWORD
+};
 
 // ── Queues ─────────────────────────────────────────────────────────────────
 export const emailQueue = new Queue(QUEUE_NAMES.EMAIL, { connection });
