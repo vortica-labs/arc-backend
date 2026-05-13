@@ -24,9 +24,15 @@ export const createSocketServer = (httpServer: HttpServer): Server => {
   const io = new Server(httpServer, {
     cors: {
       origin: allowedOrigins,
-      credentials: true
+      credentials: true,
+      methods: ["GET", "POST"]
     },
-    transports: ["websocket", "polling"]
+    transports: ["polling", "websocket"],
+    allowUpgrades: true,
+    pingTimeout: 60000,
+    pingInterval: 25000,
+    upgradeTimeout: 30000,
+    maxHttpBufferSize: 1e6
   });
 
   io.adapter(createAdapter(redisPubClient, redisSubClient));

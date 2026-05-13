@@ -201,8 +201,15 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
     }
     session.participants.add(userIdStr);
     socket.join(`call-${data.callId}`);
-    const existingParticipants = Array.from(session.participants).filter((id) => id !== userIdStr);
-    socket.emit("group-call-joined", { callId: data.callId, participants: existingParticipants });
+    const existingParticipants = Array.from(session.participants)
+      .filter((id) => id !== userIdStr)
+      .map((id) => ({ userId: id, username: id }));
+    socket.emit("group-call-joined", {
+      callId: data.callId,
+      callType: session.callType,
+      chatRoomId: session.chatRoomId,
+      participants: existingParticipants,
+    });
     socket.to(`call-${data.callId}`).emit("group-call-participant-joined", { callId: data.callId, userId: userIdStr });
   });
 
