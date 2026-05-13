@@ -11,7 +11,7 @@ const { formatUserDTO, formatPostDTO } = require('../utils/dto');
 const { getJson, setJson, del } = require('../utils/redisCache');
 const { invalidateUserCache } = require('../middleware/auth');
 const log = require('../utils/logger');
-const { normalizeQuerySearch, escapeRegex } = require('../utils/searchQuery');
+const { normalizeQuerySearch, buildPrefixRegex } = require('../utils/searchQuery');
 
 // ── Redis Profile Cache helpers ──
 const PROFILE_CACHE_TTL = 300; // 5 minutes
@@ -69,14 +69,11 @@ const getUsers = async (req, res) => {
     }
 
     if (search) {
-      const pattern = escapeRegex(search);
+      const pattern = buildPrefixRegex(search);
       andConditions.push({
         $or: [
           { username: { $regex: pattern, $options: 'i' } },
           { 'profile.displayName': { $regex: pattern, $options: 'i' } },
-          { 'profile.bio': { $regex: pattern, $options: 'i' } },
-          { 'playerInfo.games.name': { $regex: pattern, $options: 'i' } },
-          { 'teamInfo.recruitingFor': { $regex: pattern, $options: 'i' } },
         ],
       });
     }
@@ -633,8 +630,8 @@ const getFollowers = async (req, res) => {
     if (search) {
       const searchLower = search.toLowerCase();
       followers = followers.filter(follower =>
-        follower.username?.toLowerCase().includes(searchLower) ||
-        (follower.profile?.displayName && follower.profile.displayName.toLowerCase().includes(searchLower))
+        follower.username?.toLowerCase().startsWith(searchLower) ||
+        (follower.profile?.displayName && follower.profile.displayName.toLowerCase().startsWith(searchLower))
       );
     }
 

@@ -6,7 +6,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const log = require('../utils/logger');
-const { normalizeQuerySearch, escapeRegex } = require('../utils/searchQuery');
+const { normalizeQuerySearch, buildPrefixRegex } = require('../utils/searchQuery');
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
@@ -599,7 +599,7 @@ const getTournaments = async (req, res) => {
     if (format) queryFilter.format = format;
 
     if (search) {
-      const pattern = escapeRegex(search);
+      const pattern = buildPrefixRegex(search);
       const searchCondition = {
         $or: [
           { name: { $regex: pattern, $options: 'i' } },

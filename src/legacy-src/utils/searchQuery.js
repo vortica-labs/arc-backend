@@ -6,7 +6,14 @@ const normalizeQuerySearch = (value) => {
 
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+const buildPrefixRegex = (value) => {
+  const term = normalizeQuerySearch(value);
+  if (!term) return '';
+  return `^${escapeRegex(term)}`;
+};
+
 module.exports = {
   normalizeQuerySearch,
   escapeRegex,
+  buildPrefixRegex,
 };
