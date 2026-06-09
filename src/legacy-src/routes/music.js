@@ -5,6 +5,24 @@ const { optionalAuth } = require('../middleware/auth');
 const router = express.Router();
 const JAMENDO_BASE = 'https://api.jamendo.com/v3.0/tracks';
 
+const FALLBACK_TRACKS = [
+  { trackId: 'fb-1',  title: 'Victory Run',    artist: 'Gaming Beats',   url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3',  coverUrl: '', duration: 372, source: 'demo' },
+  { trackId: 'fb-2',  title: 'Arena',          artist: 'Arc Studio',     url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3',  coverUrl: '', duration: 221, source: 'demo' },
+  { trackId: 'fb-3',  title: 'Clutch Moment',  artist: 'BGMI Vibes',     url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-3.mp3',  coverUrl: '', duration: 204, source: 'demo' },
+  { trackId: 'fb-4',  title: 'Drop Zone',      artist: 'Gaming Beats',   url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-4.mp3',  coverUrl: '', duration: 407, source: 'demo' },
+  { trackId: 'fb-5',  title: 'Final Circle',   artist: 'Arc Studio',     url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-5.mp3',  coverUrl: '', duration: 183, source: 'demo' },
+  { trackId: 'fb-6',  title: 'Sniper View',    artist: 'War Zone',       url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-6.mp3',  coverUrl: '', duration: 291, source: 'demo' },
+  { trackId: 'fb-7',  title: 'Squad Wipe',     artist: 'Gaming Beats',   url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-7.mp3',  coverUrl: '', duration: 375, source: 'demo' },
+  { trackId: 'fb-8',  title: 'Rank Push',      artist: 'Arc Studio',     url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-8.mp3',  coverUrl: '', duration: 319, source: 'demo' },
+  { trackId: 'fb-9',  title: 'Neon Rush',      artist: 'Electric Gamer', url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-9.mp3',  coverUrl: '', duration: 204, source: 'demo' },
+  { trackId: 'fb-10', title: 'Boss Fight',     artist: 'War Zone',       url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-10.mp3', coverUrl: '', duration: 350, source: 'demo' },
+  { trackId: 'fb-11', title: 'Midnight Grind', artist: 'Pixel Sounds',   url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-11.mp3', coverUrl: '', duration: 283, source: 'demo' },
+  { trackId: 'fb-12', title: 'Headshot',       artist: 'Gaming Beats',   url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-12.mp3', coverUrl: '', duration: 410, source: 'demo' },
+  { trackId: 'fb-13', title: 'Chicken Dinner', artist: 'Arc Studio',     url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-13.mp3', coverUrl: '', duration: 188, source: 'demo' },
+  { trackId: 'fb-14', title: 'Tactical Push',  artist: 'War Zone',       url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-14.mp3', coverUrl: '', duration: 266, source: 'demo' },
+  { trackId: 'fb-15', title: 'Respawn',        artist: 'Pixel Sounds',   url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-15.mp3', coverUrl: '', duration: 335, source: 'demo' },
+];
+
 const searchJamendo = async (q, tags, limit) => {
   const clientId = process.env.JAMENDO_CLIENT_ID;
   if (!clientId) return [];
@@ -106,7 +124,7 @@ router.get('/search', optionalAuth, async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit, 10) || 20, 50);
 
     if (!q && !tags) {
-      return res.status(200).json({ success: true, tracks: [] });
+      return res.status(200).json({ success: true, tracks: FALLBACK_TRACKS.slice(0, limit) });
     }
 
     const bothActive = jamendoConfigured && soundcloudConfigured;
@@ -135,7 +153,8 @@ router.get('/search', optionalAuth, async (req, res) => {
       if (i < jamendoTracks.length) merged.push(jamendoTracks[i]);
     }
 
-    return res.json({ success: true, tracks: merged.slice(0, limit) });
+    const results = merged.length > 0 ? merged.slice(0, limit) : FALLBACK_TRACKS.slice(0, limit);
+    return res.json({ success: true, tracks: results, fallback: merged.length === 0 });
   } catch (err) {
     if (err.response && err.response.status === 429) {
       return res.status(429).json({ success: false, message: 'Too many requests. Try again in a minute.' });

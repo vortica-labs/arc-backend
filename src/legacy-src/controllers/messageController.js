@@ -200,11 +200,11 @@ const sendDirectMessage = async (req, res) => {
     // Plain object so nested populated (e.g. sharedPost.author) serializes correctly in JSON/socket
     const messagePojo = message.toObject ? message.toObject() : message;
 
-    // Create notification for recipient
-    await createMessageNotification(recipientIdResolved, senderId, message._id);
-
     // Emit real-time message to recipient
+    let recipientIsOnline = false;
     if (io) {
+      // Check if recipient has an active socket connection
+      recipientIsOnline = (io.sockets?.adapter?.rooms?.get(`user-${recipientIdResolved}`)?.size || 0) > 0;
       io.to(`user-${recipientIdResolved}`).emit('newMessage', {
         chatId: `direct_${senderId}`,
         message: messagePojo
@@ -212,6 +212,12 @@ const sendDirectMessage = async (req, res) => {
       if (process.env.NODE_ENV === 'development') { console.log('Real-time message emitted successfully');}
     } else {
       if (process.env.NODE_ENV === 'development') { console.log('Socket.io not available for real-time messaging');}
+    }
+
+    // Only create a DB notification when recipient is offline — avoids notification
+    // bell incrementing for messages the user already saw in real-time.
+    if (!recipientIsOnline) {
+      await createMessageNotification(recipientIdResolved, senderId, message._id);
     }
 
     res.status(201).json({
@@ -1088,6 +1094,17 @@ const addReaction = async (req, res) => {
     }
 
     await message.save();
+
+    // Broadcast reaction update in real-time
+    if (io) {
+      const reactionPayload = { messageId: message._id, reactions: message.reactions };
+      if (message.chatRoom) {
+        io.to(`chat-${message.chatRoom}`).emit('message_reaction', reactionPayload);
+      } else if (message.recipient) {
+        io.to(`user-${message.sender}`).emit('message_reaction', reactionPayload);
+        io.to(`user-${message.recipient}`).emit('message_reaction', reactionPayload);
+      }
+    }
 
     res.status(200).json({
       success: true,
@@ -2192,6 +2209,29 @@ const toggleMuteChat = async (req, res) => {
   }
 };
 
+// Toggle mute for a group chat room
+const toggleMuteGroup = async (req, res) => {
+  try {
+    const { chatRoomId } = req.params;
+    const currentUser = await User.findById(req.user._id);
+    if (!currentUser) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const mutedSet = new Set((currentUser.mutedChats || []).map(id => id.toString()));
+    if (mutedSet.has(chatRoomId)) {
+      mutedSet.delete(chatRoomId);
+    } else {
+      mutedSet.add(chatRoomId);
+    }
+    currentUser.mutedChats = Array.from(mutedSet);
+    await currentUser.save();
+
+    res.json({ success: true, muted: mutedSet.has(chatRoomId), mutedChats: currentUser.mutedChats });
+  } catch (error) {
+    log.error('toggleMuteGroup error:', { error: String(error) });
+    res.status(500).json({ success: false, message: 'Failed to toggle group mute' });
+  }
+};
+
 // Toggle pin for a DM chat
 const togglePinChat = async (req, res) => {
   try {
@@ -2589,6 +2629,7 @@ module.exports = {
   leaveGroup,
   createCallSummary,
   toggleMuteChat,
+  toggleMuteGroup,
   togglePinChat,
   togglePinGroup,
   getChatPreferences,

@@ -63,6 +63,9 @@ router.post("/:messageId/reaction", protect, addReactionValidation, messageContr
 router.post("/:messageId/invite-response", protect, messageController.handleInviteResponse);
 router.get("/preferences", protect, messageController.getChatPreferences);
 router.post("/chat/:userId/mute", protect, messageController.toggleMuteChat);
+// Mobile-compatible mute endpoints
+router.post("/direct/:userId/mute", protect, messageController.toggleMuteChat);
+router.post("/rooms/:chatRoomId/mute", protect, messageController.toggleMuteGroup);
 router.post("/chat/:userId/pin", protect, messageController.togglePinChat);
 router.post("/group/:chatRoomId/pin", protect, messageController.togglePinGroup);
 // Report a message

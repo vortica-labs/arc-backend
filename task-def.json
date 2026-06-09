@@ -40,7 +40,8 @@
         { "name": "RAZORPAY_KEY_ID",     "valueFrom": "arn:aws:secretsmanager:us-east-1:906446637180:secret:arc/prod/backend-GscdDk:RAZORPAY_KEY_ID::" },
         { "name": "RAZORPAY_KEY_SECRET", "valueFrom": "arn:aws:secretsmanager:us-east-1:906446637180:secret:arc/prod/backend-GscdDk:RAZORPAY_KEY_SECRET::" },
         { "name": "GEMINI_API_KEY",      "valueFrom": "arn:aws:secretsmanager:us-east-1:906446637180:secret:arc/prod/backend-GscdDk:GEMINI_API_KEY::" },
-        { "name": "GROQ_API_KEY",        "valueFrom": "arn:aws:secretsmanager:us-east-1:906446637180:secret:arc/prod/backend-GscdDk:GROQ_API_KEY::" }
+        { "name": "GROQ_API_KEY",        "valueFrom": "arn:aws:secretsmanager:us-east-1:906446637180:secret:arc/prod/backend-GscdDk:GROQ_API_KEY::" },
+        { "name": "JAMENDO_CLIENT_ID",   "valueFrom": "arn:aws:secretsmanager:us-east-1:906446637180:secret:arc/prod/backend-GscdDk:JAMENDO_CLIENT_ID::" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
