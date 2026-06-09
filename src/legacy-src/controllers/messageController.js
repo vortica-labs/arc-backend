@@ -278,7 +278,7 @@ const getDirectMessages = async (req, res) => {
     
     .populate('sender', 'username profile.displayName profile.avatar')
     .populate('recipient', 'username profile.displayName profile.avatar')
-    .populate('replyTo', 'content.text sender')
+    .populate({ path: 'replyTo', select: 'content.text content.media sender', populate: { path: 'sender', select: 'username profile.displayName profile.avatar' } })
     .populate('forwardedFrom', 'content.text content.media sender')
     .populate('forwardedFrom.sender', 'username profile.displayName profile.avatar')
     .populate('sharedPost', 'content.text content.media author')
@@ -938,7 +938,7 @@ const getGroupMessages = async (req, res) => {
       ]
     })
     .populate('sender', 'username profile.displayName profile.avatar')
-    .populate('replyTo', 'content.text sender')
+    .populate({ path: 'replyTo', select: 'content.text content.media sender', populate: { path: 'sender', select: 'username profile.displayName profile.avatar' } })
     .populate('forwardedFrom', 'content.text content.media sender')
     .populate('forwardedFrom.sender', 'username profile.displayName profile.avatar')
     .populate('reactions.user', 'username profile.displayName')
