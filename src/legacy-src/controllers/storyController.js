@@ -1,10 +1,52 @@
 const Story = require('../models/Story');
+const StoryView = require('../models/StoryView');
 const User = require('../models/User');
 const { uploadMultipleFiles } = require('../utils/cloudinary');
 const { STORY_MAX_SECONDS, processStoryVideo } = require('../utils/videoProcessing');
 const log = require('../utils/logger');
+const mongoose = require('mongoose');
 
 const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
+
+const toIdStr = (v) => (v == null ? '' : typeof v === 'string' ? v : (v.toString && v.toString()) || String(v));
+
+const getStoryViewCountMap = async (storyIds) => {
+  const objectIds = storyIds
+    .map((id) => toIdStr(id))
+    .filter((id) => mongoose.Types.ObjectId.isValid(id))
+    .map((id) => new mongoose.Types.ObjectId(id));
+
+  if (!objectIds.length) return new Map();
+
+  const rows = await StoryView.aggregate([
+    { $match: { story: { $in: objectIds } } },
+    { $group: { _id: '$story', count: { $sum: 1 } } }
+  ]);
+
+  return new Map(rows.map((row) => [toIdStr(row._id), row.count]));
+};
+
+const withStoryViewCounts = async (stories) => {
+  const plainStories = stories.map((story) => (
+    typeof story.toObject === 'function' ? story.toObject() : story
+  ));
+  const counts = await getStoryViewCountMap(plainStories.map((story) => story._id));
+  return plainStories.map((story) => ({
+    ...story,
+    viewCount: counts.get(toIdStr(story._id)) || 0
+  }));
+};
+
+const mapViewer = (view) => {
+  const user = view.user || {};
+  return {
+    _id: toIdStr(user._id || view.user),
+    username: user.username || '',
+    profile: user.profile || {},
+    profilePicture: user.profilePicture,
+    viewedAt: view.viewedAt
+  };
+};
 
 // Create story (single image or video, max 30s for video; optional music)
 const createStory = async (req, res) => {
@@ -45,7 +87,7 @@ const createStory = async (req, res) => {
     await story.populate('author', 'username profile.displayName profile.avatar');
     return res.status(201).json({
       success: true,
-      data: { story }
+      data: { story: { ...story.toObject(), viewCount: 0 } }
     });
   } catch (err) {
     return res.status(500).json({
@@ -61,7 +103,6 @@ const getStoriesFeed = async (req, res) => {
     if (!req.user || !req.user._id) {
       return res.status(401).json({ success: false, message: 'Not authenticated' });
     }
-    const mongoose = require('mongoose');
     const since = new Date(Date.now() - TWENTY_FOUR_HOURS_MS);
     const myId = req.user._id;
     const myIdStr = myId.toString();
@@ -130,12 +171,15 @@ const getStoriesFeed = async (req, res) => {
     } else {
       finalUsers = usersWithStories;
     }
+    const latestStoryIds = finalUsers.map((u) => u.latestStoryId).filter(Boolean);
+    const latestViewCounts = await getStoryViewCountMap(latestStoryIds);
+
     // Normalize _id to string for every entry so frontend always gets consistent format (safe for JSON)
-    const toIdStr = (v) => (v == null ? '' : typeof v === 'string' ? v : (v.toString && v.toString()) || String(v));
     finalUsers = finalUsers.map((u) => ({
       _id: toIdStr(u._id),
       count: u.count,
       latestStoryId: u.latestStoryId,
+      latestStoryViewCount: latestViewCounts.get(toIdStr(u.latestStoryId)) || 0,
       latestMedia: u.latestMedia,
       latestCreatedAt: u.latestCreatedAt,
       author: u.author ? {
@@ -168,10 +212,12 @@ const getUserStories = async (req, res) => {
       createdAt: { $gte: since }
     })
       .sort({ createdAt: 1 })
-      .populate('author', 'username profile.displayName profile.avatar');
+      .populate('author', 'username profile.displayName profile.avatar profilePicture')
+      .lean();
+    const storiesWithCounts = await withStoryViewCounts(stories);
     return res.json({
       success: true,
-      data: { stories }
+      data: { stories: storiesWithCounts }
     });
   } catch (err) {
     return res.status(500).json({
@@ -185,20 +231,89 @@ const getUserStories = async (req, res) => {
 const viewStory = async (req, res) => {
   try {
     const { storyId } = req.params;
-    const story = await Story.findById(storyId);
+    if (!mongoose.Types.ObjectId.isValid(storyId)) {
+      return res.status(400).json({ success: false, message: 'Invalid story id' });
+    }
+    const story = await Story.findById(storyId).select('author').lean();
     if (!story) {
       return res.status(404).json({ success: false, message: 'Story not found' });
     }
-    const userId = req.user._id.toString();
-    if (!story.views.some(v => v.user.toString() === userId)) {
-      story.views.push({ user: req.user._id });
-      await story.save();
+    const userId = toIdStr(req.user._id);
+    const authorId = toIdStr(story.author);
+    let viewed = false;
+
+    if (authorId !== userId) {
+      try {
+        const result = await StoryView.updateOne(
+          { story: story._id, user: req.user._id },
+          {
+            $setOnInsert: {
+              story: story._id,
+              author: story.author,
+              user: req.user._id,
+              viewedAt: new Date()
+            }
+          },
+          { upsert: true }
+        );
+        viewed = !!result.upsertedCount;
+      } catch (error) {
+        if (error?.code !== 11000) throw error;
+      }
     }
-    return res.json({ success: true });
+    const viewCount = await StoryView.countDocuments({ story: story._id });
+    return res.json({ success: true, data: { viewed, viewCount } });
   } catch (err) {
     return res.status(500).json({
       success: false,
       message: err.message || 'Failed to record view'
+    });
+  }
+};
+
+// Get viewer list for own story
+const getStoryViewers = async (req, res) => {
+  try {
+    const { storyId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(storyId)) {
+      return res.status(400).json({ success: false, message: 'Invalid story id' });
+    }
+
+    const story = await Story.findById(storyId).select('author').lean();
+    if (!story) {
+      return res.status(404).json({ success: false, message: 'Story not found' });
+    }
+    if (toIdStr(story.author) !== toIdStr(req.user._id)) {
+      return res.status(403).json({ success: false, message: 'Not allowed to view story viewers' });
+    }
+
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const skip = (page - 1) * limit;
+
+    const [total, views] = await Promise.all([
+      StoryView.countDocuments({ story: story._id }),
+      StoryView.find({ story: story._id })
+        .sort({ viewedAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .populate('user', 'username profile.displayName profile.avatar profilePicture')
+        .lean()
+    ]);
+
+    return res.json({
+      success: true,
+      data: {
+        viewers: views.map(mapViewer),
+        total,
+        page,
+        limit
+      }
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message || 'Failed to fetch story viewers'
     });
   }
 };
@@ -213,7 +328,10 @@ const deleteStory = async (req, res) => {
     if (story.author.toString() !== req.user._id.toString()) {
       return res.status(403).json({ success: false, message: 'Not allowed to delete this story' });
     }
-    await Story.findByIdAndDelete(req.params.storyId);
+    await Promise.all([
+      Story.findByIdAndDelete(req.params.storyId),
+      StoryView.deleteMany({ story: req.params.storyId })
+    ]);
     return res.json({ success: true, message: 'Story deleted' });
   } catch (err) {
     return res.status(500).json({
@@ -228,5 +346,6 @@ module.exports = {
   getStoriesFeed,
   getUserStories,
   viewStory,
+  getStoryViewers,
   deleteStory
 };
