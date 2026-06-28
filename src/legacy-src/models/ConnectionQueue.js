@@ -31,6 +31,14 @@ const connectionQueueSchema = new mongoose.Schema({
     enum: ['', 'male', 'female'],
     default: ''
   },
+  region: {
+    type: String,
+    default: ''
+  },
+  lastMatchedUserIds: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  }],
   status: {
     type: String,
     enum: ['waiting', 'matched', 'cancelled'],
@@ -50,10 +58,15 @@ const connectionQueueSchema = new mongoose.Schema({
 
 // Index for better query performance
 connectionQueueSchema.index({ userId: 1 });
+connectionQueueSchema.index(
+  { userId: 1, status: 1 },
+  { unique: true, partialFilterExpression: { status: 'waiting' } }
+);
 connectionQueueSchema.index({ status: 1, selectedGame: 1 });
 connectionQueueSchema.index({ status: 1, tags: 1 }); // For tag-based matching
 connectionQueueSchema.index({ status: 1, selectedGame: 1, tags: 1 }); // Combined matching
-connectionQueueSchema.index({ expiresAt: 1 });
+connectionQueueSchema.index({ status: 1, joinedAt: 1 });
+connectionQueueSchema.index({ status: 1, gender: 1, joinedAt: 1 });
 
 // TTL index to automatically remove expired entries
 connectionQueueSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });

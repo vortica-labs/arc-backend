@@ -62,7 +62,15 @@ export const createSocketServer = (httpServer: HttpServer): Server => {
 
     socket.join(`user-${userId}`);
     socket.on("join-user-room", (incomingUserId: string) => {
-      socket.join(`user-${String(incomingUserId)}`);
+      if (String(incomingUserId) !== String(userId)) {
+        logger.warn("Rejected socket user-room join for another user", {
+          socketId: socket.id,
+          authenticatedUserId: userId,
+          requestedUserId: String(incomingUserId)
+        });
+        return;
+      }
+      socket.join(`user-${userId}`);
     });
 
     socket.on("ping", () => socket.emit("pong"));

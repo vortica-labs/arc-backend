@@ -12,7 +12,7 @@ import {
 const router = Router();
 
 // Test endpoint to check queue status (no auth required for testing)
-router.get("/queue-status", async (_req: Request, res: Response) => {
+router.get("/queue-status", protect, async (_req: Request, res: Response) => {
   try {
     const queueCount = await ConnectionQueue.countDocuments({ status: "waiting" });
     const activeConnections = await RandomConnection.countDocuments({ status: "active" });

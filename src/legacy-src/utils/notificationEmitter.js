@@ -1,3 +1,5 @@
+const log = require('./logger');
+
 let io;
 
 const setIoInstance = (ioInstance) => {
@@ -49,10 +51,56 @@ const sendExpoPushNotifications = async (userId, notification) => {
   }
 };
 
+const NOTIFICATION_SETTING_DEFAULTS = {
+  likes: true,
+  comments: true,
+  follows: true,
+  messages: true,
+  tournamentUpdates: true,
+  scrimUpdates: true,
+  recruitmentApps: true,
+  systemAlerts: true
+};
+
+const getPreferenceKeyForNotification = (notificationData) => {
+  switch (notificationData?.type) {
+    case 'like':
+      return 'likes';
+    case 'comment':
+    case 'mention':
+      return 'comments';
+    case 'follow':
+      return 'follows';
+    case 'message':
+      return 'messages';
+    case 'tournament':
+      return notificationData?.data?.customData?.scrimId || notificationData?.data?.customData?.scrimCode
+        ? 'scrimUpdates'
+        : 'tournamentUpdates';
+    case 'system':
+    case 'achievement':
+      return 'systemAlerts';
+    default:
+      return null;
+  }
+};
+
+const shouldDeliverNotification = async (notificationData) => {
+  const preferenceKey = getPreferenceKeyForNotification(notificationData);
+  if (!preferenceKey) return true;
+
+  const User = require('../models/User');
+  const user = await User.findById(notificationData.recipient).select('notificationSettings').lean();
+  const settings = { ...NOTIFICATION_SETTING_DEFAULTS, ...(user?.notificationSettings || {}) };
+  return settings[preferenceKey] !== false;
+};
+
 const createAndEmitNotification = async (notificationData) => {
   try {
+    const allowed = await shouldDeliverNotification(notificationData).catch(() => true);
+    if (!allowed) return null;
+
     const Notification = require('../models/Notification');
-const log = require('./logger');
     const notification = await Notification.createNotification(notificationData);
     
     // Emit real-time notification

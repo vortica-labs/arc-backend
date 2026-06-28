@@ -46,6 +46,7 @@ const bootstrap = async () => {
   const app = createApp();
   const httpServer = createServer(app);
   const io = createSocketServer(httpServer);
+  app.set("io", io);
 
   const notificationEmitter = safeRequire<{ setIoInstance?: (ioServer: unknown) => void }>(
     path.join(backendRootPath, "utils", "notificationEmitter.js")

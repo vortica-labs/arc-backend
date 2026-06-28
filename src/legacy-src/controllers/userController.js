@@ -3407,6 +3407,64 @@ const updatePrivacySettings = async (req, res) => {
   }
 };
 
+const notificationSettingDefaults = {
+  likes: true,
+  comments: true,
+  follows: true,
+  messages: true,
+  tournamentUpdates: true,
+  scrimUpdates: true,
+  recruitmentApps: true,
+  systemAlerts: true
+};
+
+const normalizeNotificationSettings = (settings) => ({
+  ...notificationSettingDefaults,
+  ...(settings?.toObject ? settings.toObject() : settings || {})
+});
+
+const getNotificationSettings = async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id).select('notificationSettings').lean();
+    return res.status(200).json({
+      success: true,
+      data: normalizeNotificationSettings(user?.notificationSettings)
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: 'Failed to get notification settings' });
+  }
+};
+
+const updateNotificationSettings = async (req, res) => {
+  try {
+    const allowedKeys = Object.keys(notificationSettingDefaults);
+    const update = {};
+
+    allowedKeys.forEach((key) => {
+      if (typeof req.body?.[key] === 'boolean') {
+        update[`notificationSettings.${key}`] = req.body[key];
+      }
+    });
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ success: false, message: 'At least one notification setting is required' });
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.user._id,
+      { $set: update },
+      { new: true, runValidators: true }
+    ).select('notificationSettings');
+
+    return res.status(200).json({
+      success: true,
+      data: normalizeNotificationSettings(user?.notificationSettings)
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: 'Failed to update notification settings' });
+  }
+};
+
 const getDmPrivacy = async (req, res) => {
   try {
     const targetUserId = req.params.userId;
@@ -3505,5 +3563,7 @@ module.exports = {
   rejectLeaveRequest,
   getPrivacySettings,
   updatePrivacySettings,
+  getNotificationSettings,
+  updateNotificationSettings,
   getDmPrivacy
 };

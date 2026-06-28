@@ -13,6 +13,25 @@ type ActiveCallSession = {
   roomName: string;
 };
 
+type LeanRandomSession = {
+  roomId: string;
+  status: string;
+  participants: Array<{ userId: unknown }>;
+};
+
+type RandomConnectionModel = {
+  findOne: (filter: Record<string, unknown>) => {
+    select: (fields: string) => {
+      lean: () => Promise<LeanRandomSession | null>;
+    };
+  };
+};
+
+type RandomConnectController = {
+  markSessionReady?: (roomId: string, userId: string, server: Server) => Promise<unknown>;
+  getSessionTimerState?: (roomId: string, userId: string) => Promise<unknown>;
+};
+
 const activeCalls = new Map<string, ActiveCallSession>();
 let randomMatchLoopStarted = false;
 
@@ -23,6 +42,41 @@ const safeRequire = <T>(modulePath: string): T | null => {
   } catch (_error) {
     return null;
   }
+};
+
+const getObjectIdString = (value: unknown): string => {
+  if (!value) return "";
+  if (typeof value === "object" && "_id" in value && (value as { _id?: unknown })._id) {
+    return String((value as { _id: unknown })._id);
+  }
+  return String(value);
+};
+
+const getRandomConnectionModel = (): RandomConnectionModel | null =>
+  safeRequire<RandomConnectionModel>(path.join(backendModelPath, "RandomConnection.js"));
+
+const getRandomConnectController = (): RandomConnectController | null =>
+  safeRequire<RandomConnectController>(path.join(backendControllerPath, "randomConnectController.js"));
+
+const findAuthorizedRandomSession = async (
+  roomId: string,
+  userId: string,
+  targetUserId?: string
+): Promise<LeanRandomSession | null> => {
+  const RandomConnection = getRandomConnectionModel();
+  if (!RandomConnection || !roomId || !userId) return null;
+
+  const session = await RandomConnection.findOne({
+    roomId,
+    status: "active",
+    "participants.userId": userId
+  }).select("roomId status participants.userId").lean();
+
+  if (!session) return null;
+  const participantIds = new Set((session.participants || []).map((participant) => getObjectIdString(participant.userId)));
+  if (!participantIds.has(userId)) return null;
+  if (targetUserId && !participantIds.has(targetUserId)) return null;
+  return session;
 };
 
 const handleGroupCallLeave = (io: Server, callId: string, userId: string, socket?: Socket) => {
@@ -63,14 +117,24 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
     }
   });
 
-  socket.on("join-random-room", (roomId: string) => {
+  socket.on("join-random-room", async (roomId: string) => {
     if (!roomId) {
+      return;
+    }
+    const roomIdStr = String(roomId);
+    const session = await findAuthorizedRandomSession(roomIdStr, userIdStr);
+    if (!session) {
+      socket.emit("random-session-error", { roomId: roomIdStr, message: "Random Connect session not found or not authorized" });
       return;
     }
     const room = `random-room-${String(roomId)}`;
     socket.join(room);
     socket.emit("room-joined", { roomId: String(roomId) });
     socket.to(room).emit("user-joined-room", { roomId: String(roomId), userId: userIdStr });
+    const controller = getRandomConnectController();
+    await controller?.markSessionReady?.(roomIdStr, userIdStr, io);
+    const timerState = await controller?.getSessionTimerState?.(roomIdStr, userIdStr);
+    if (timerState) socket.emit("random-session-timer-sync", timerState);
   });
 
   socket.on("leave-random-room", (roomId: string) => {
@@ -79,8 +143,25 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
     }
   });
 
-  socket.on("random-connection-message", (data: { roomId?: string; message?: string }) => {
+  socket.on("random-session-ready", async (data: { roomId?: string }) => {
+    if (!data?.roomId) return;
+    const roomId = String(data.roomId);
+    const session = await findAuthorizedRandomSession(roomId, userIdStr);
+    if (!session) {
+      socket.emit("random-session-error", { roomId, message: "Random Connect session not authorized" });
+      return;
+    }
+    const controller = getRandomConnectController();
+    await controller?.markSessionReady?.(roomId, userIdStr, io);
+  });
+
+  socket.on("random-connection-message", async (data: { roomId?: string; message?: string }) => {
     if (!data?.roomId || !data?.message) {
+      return;
+    }
+    const session = await findAuthorizedRandomSession(String(data.roomId), userIdStr);
+    if (!session) {
+      socket.emit("random-session-error", { roomId: data.roomId, message: "Random Connect session not authorized" });
       return;
     }
     socket.to(`random-room-${data.roomId}`).emit("random-connection-message", {
@@ -91,8 +172,14 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
     });
   });
 
-  socket.on("webrtc-signal", (data: { roomId?: string; signal?: unknown; targetUserId?: string }) => {
+  socket.on("webrtc-signal", async (data: { roomId?: string; signal?: unknown; targetUserId?: string }) => {
     if (!data?.roomId || !data?.signal || !data?.targetUserId) {
+      return;
+    }
+    const targetUserId = String(data.targetUserId);
+    const session = await findAuthorizedRandomSession(String(data.roomId), userIdStr, targetUserId);
+    if (!session) {
+      socket.emit("random-session-error", { roomId: data.roomId, message: "Random Connect signal rejected" });
       return;
     }
     io.to(`user-${String(data.targetUserId)}`).emit("webrtc-signal", {
@@ -102,8 +189,14 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
     });
   });
 
-  socket.on("webrtc-request-offer", (data: { roomId?: string; targetUserId?: string }) => {
+  socket.on("webrtc-request-offer", async (data: { roomId?: string; targetUserId?: string }) => {
     if (!data?.roomId || !data?.targetUserId) {
+      return;
+    }
+    const targetUserId = String(data.targetUserId);
+    const session = await findAuthorizedRandomSession(String(data.roomId), userIdStr, targetUserId);
+    if (!session) {
+      socket.emit("random-session-error", { roomId: data.roomId, message: "Random Connect offer request rejected" });
       return;
     }
     io.to(`user-${String(data.targetUserId)}`).emit("webrtc-request-offer", {
@@ -112,20 +205,26 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
     });
   });
 
-  socket.on("video-state-change", (data: { roomId?: string; videoEnabled?: boolean; targetUserId?: string }) => {
+  socket.on("video-state-change", async (data: { roomId?: string; videoEnabled?: boolean; targetUserId?: string }) => {
     if (!data?.roomId || !data?.targetUserId) {
       return;
     }
+    const targetUserId = String(data.targetUserId);
+    const session = await findAuthorizedRandomSession(String(data.roomId), userIdStr, targetUserId);
+    if (!session) return;
     io.to(`user-${String(data.targetUserId)}`).emit("video-state-change", {
       fromUserId: userIdStr,
       videoEnabled: data.videoEnabled
     });
   });
 
-  socket.on("media-state", (data: { roomId?: string; targetUserId?: string; video?: boolean; audio?: boolean }) => {
+  socket.on("media-state", async (data: { roomId?: string; targetUserId?: string; video?: boolean; audio?: boolean }) => {
     if (!data?.roomId || !data?.targetUserId) {
       return;
     }
+    const targetUserId = String(data.targetUserId);
+    const session = await findAuthorizedRandomSession(String(data.roomId), userIdStr, targetUserId);
+    if (!session) return;
     io.to(`user-${String(data.targetUserId)}`).emit("media-state", {
       fromUserId: userIdStr,
       video: data.video,
@@ -133,7 +232,7 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
     });
   });
 
-  socket.on("call-request", (data: { callId?: string; targetUserId?: string; callType?: "voice" | "video"; fromUsername?: string; fromDisplayName?: string; fromAvatar?: string }) => {
+  socket.on("call-request", (data: { callId?: string; targetUserId?: string; callType?: "voice" | "video"; fromUsername?: string; fromDisplayName?: string; fromAvatar?: string; randomRoomId?: string }) => {
     if (!data?.callId || !data?.targetUserId || !data?.callType) {
       return;
     }
@@ -144,6 +243,7 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
       fromUsername: data.fromUsername,
       fromDisplayName: data.fromDisplayName,
       fromAvatar: data.fromAvatar,
+      randomRoomId: data.randomRoomId,
     });
   });
 

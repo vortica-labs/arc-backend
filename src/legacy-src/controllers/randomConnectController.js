@@ -6,12 +6,293 @@ const log = require('../utils/logger');
 
 // Free users: daily match limit. Premium: unlimited matches.
 const FREE_DAILY_MATCH_LIMIT = 5;
+const FREE_TO_FREE_SESSION_SECONDS = Number(process.env.RANDOM_CONNECT_FREE_SESSION_SECONDS || 180);
+const SESSION_WARNING_SECONDS = 30;
+const TAG_FALLBACK_MS = Number(process.env.RANDOM_CONNECT_TAG_FALLBACK_MS || 20000);
+const RECENT_PARTNER_AVOID_MS = Number(process.env.RANDOM_CONNECT_RECENT_PARTNER_AVOID_MS || 10 * 60 * 1000);
+const MATCH_BATCH_LIMIT = Number(process.env.RANDOM_CONNECT_MATCH_BATCH_LIMIT || 100);
+const ACTIVE_SESSION_STATUSES = ['waiting', 'active'];
+const PREMIUM_TIERS = ['player_pro', 'player_pro_plus', 'team_pro', 'team_org'];
+const sessionTimerHandles = new Map();
 
 const isPremiumUser = (user) => {
   if (!user) return false;
-  if (user.isPremium === true) return true;
   const tier = user.membership?.tier || 'free';
-  return ['player_pro', 'player_pro_plus', 'team_pro', 'team_org'].includes(tier);
+  const isPremiumTier = PREMIUM_TIERS.includes(tier);
+  const validUntil = user.membership?.validUntil;
+  const isExpired = validUntil ? new Date(validUntil).getTime() < Date.now() : false;
+  return (user.isPremium === true || isPremiumTier) && !isExpired;
+};
+
+const getIo = (req) => req?.app?.get?.('io') || global._arcSocketIO || null;
+
+const normalizeTags = (tags = []) => {
+  if (!Array.isArray(tags)) return [];
+  return [...new Set(tags
+    .map(tag => String(tag || '').trim().toLowerCase())
+    .filter(tag => tag.length > 0 && tag.length <= 30))]
+    .slice(0, 10);
+};
+
+const sanitizePreferredGender = (preferredGender) =>
+  (preferredGender === 'male' || preferredGender === 'female') ? preferredGender : '';
+
+const getUserIdString = (value) => {
+  if (!value) return '';
+  if (value._id) return value._id.toString();
+  return value.toString();
+};
+
+const getMembershipTier = (user) => user?.membership?.tier || 'free';
+
+const getPremiumSnapshot = (user) => ({
+  isPremium: isPremiumUser(user),
+  membershipTier: getMembershipTier(user)
+});
+
+const buildSessionPolicy = (userA, userB) => {
+  const aPremium = isPremiumUser(userA);
+  const bPremium = isPremiumUser(userB);
+  const isLimited = !aPremium && !bPremium;
+  return {
+    isLimited,
+    durationLimitSeconds: isLimited ? FREE_TO_FREE_SESSION_SECONDS : null,
+    limitReason: isLimited ? 'free_to_free' : 'premium_unlimited'
+  };
+};
+
+const buildSessionPolicyPayload = (connection) => ({
+  isLimited: Boolean(connection.durationLimitSeconds),
+  durationLimitSeconds: connection.durationLimitSeconds || null,
+  connectedAt: connection.connectedAt || null,
+  timerStartedAt: connection.timerStartedAt || null,
+  expiresAt: connection.expiresAt || null,
+  serverTime: new Date(),
+  warningSeconds: SESSION_WARNING_SECONDS
+});
+
+const buildConnectionPayload = (connection) => {
+  const obj = connection?.toObject ? connection.toObject() : connection;
+  if (!obj) return null;
+  return {
+    roomId: obj.roomId,
+    sessionId: obj.roomId,
+    participants: (obj.participants || []).map(p => ({
+      userId: getUserIdString(p.userId),
+      username: p.username,
+      displayName: p.displayName,
+      avatar: p.avatar,
+      videoEnabled: p.videoEnabled,
+      isPremium: Boolean(p.isPremium),
+      membershipTier: p.membershipTier || 'free',
+      readyAt: p.readyAt || null
+    })),
+    selectedGame: obj.selectedGame || null,
+    tags: obj.tags || [],
+    matchedTags: obj.matchedTags || [],
+    matchQuality: obj.matchQuality || 'unknown',
+    status: obj.status,
+    sessionPolicy: buildSessionPolicyPayload(obj),
+    createdAt: obj.createdAt,
+    updatedAt: obj.updatedAt
+  };
+};
+
+const emitToParticipants = (io, connection, eventName, payload) => {
+  if (!io || !connection) return;
+  const data = {
+    roomId: connection.roomId,
+    sessionId: connection.roomId,
+    ...payload
+  };
+  io.to(`random-room-${connection.roomId}`).emit(eventName, data);
+  (connection.participants || []).forEach(participant => {
+    const participantId = getUserIdString(participant.userId);
+    if (participantId) io.to(`user-${participantId}`).emit(eventName, data);
+  });
+};
+
+const clearSessionTimers = (roomId) => {
+  const handles = sessionTimerHandles.get(roomId);
+  if (!handles) return;
+  handles.forEach(handle => clearTimeout(handle));
+  sessionTimerHandles.delete(roomId);
+};
+
+const sendTimerWarning = async (roomId, io) => {
+  const connection = await RandomConnection.findOneAndUpdate(
+    {
+      roomId,
+      status: 'active',
+      durationLimitSeconds: { $type: 'number' },
+      timerWarningSentAt: { $exists: false }
+    },
+    { $set: { timerWarningSentAt: new Date() } },
+    { new: true }
+  );
+  if (!connection) return;
+  emitToParticipants(io, connection, 'random-session-timer-warning', {
+    remainingSeconds: SESSION_WARNING_SECONDS,
+    sessionPolicy: buildSessionPolicyPayload(connection)
+  });
+};
+
+const endExpiredSession = async (roomId, io) => {
+  const now = new Date();
+  const connection = await RandomConnection.findOneAndUpdate(
+    {
+      roomId,
+      status: 'active',
+      durationLimitSeconds: { $type: 'number' },
+      expiresAt: { $lte: now }
+    },
+    [
+      {
+        $set: {
+          status: 'ended',
+          endTime: now,
+          endReason: 'timeout',
+          duration: {
+            $floor: {
+              $divide: [
+                { $subtract: [now, { $ifNull: ['$connectedAt', '$startTime'] }] },
+                1000
+              ]
+            }
+          }
+        }
+      }
+    ],
+    { new: true }
+  );
+  if (!connection) return;
+  clearSessionTimers(roomId);
+  emitToParticipants(io, connection, 'random-session-ended', {
+    reason: 'timeout',
+    message: 'Free Random Connect session limit reached.',
+    sessionPolicy: buildSessionPolicyPayload(connection)
+  });
+};
+
+const scheduleSessionTimers = (connection, io) => {
+  if (!connection?.durationLimitSeconds || !connection.expiresAt || !io) return;
+  const roomId = connection.roomId;
+  clearSessionTimers(roomId);
+  const expiresAtMs = new Date(connection.expiresAt).getTime();
+  const warningDelay = Math.max(0, expiresAtMs - Date.now() - SESSION_WARNING_SECONDS * 1000);
+  const endDelay = Math.max(0, expiresAtMs - Date.now());
+  const warningHandle = setTimeout(() => {
+    sendTimerWarning(roomId, io).catch(error => log.error('Random Connect timer warning error:', { error: String(error) }));
+  }, warningDelay);
+  const endHandle = setTimeout(() => {
+    endExpiredSession(roomId, io).catch(error => log.error('Random Connect timeout error:', { error: String(error) }));
+  }, endDelay);
+  sessionTimerHandles.set(roomId, [warningHandle, endHandle]);
+};
+
+const syncExpiredSessions = async (io) => {
+  const now = new Date();
+  const warningAt = new Date(now.getTime() + SESSION_WARNING_SECONDS * 1000);
+  const warningSessions = await RandomConnection.find({
+    status: 'active',
+    durationLimitSeconds: { $type: 'number' },
+    expiresAt: { $lte: warningAt, $gt: now },
+    timerWarningSentAt: { $exists: false }
+  }).select('roomId');
+  await Promise.all(warningSessions.map(session => sendTimerWarning(session.roomId, io)));
+
+  const expiredSessions = await RandomConnection.find({
+    status: 'active',
+    durationLimitSeconds: { $type: 'number' },
+    expiresAt: { $lte: now }
+  }).select('roomId');
+  await Promise.all(expiredSessions.map(session => endExpiredSession(session.roomId, io)));
+};
+
+const getSessionTimerState = async (roomId, userId) => {
+  const connection = await RandomConnection.findOne({
+    roomId,
+    ...(userId ? { 'participants.userId': userId } : {}),
+    status: { $in: ACTIVE_SESSION_STATUSES }
+  });
+  if (!connection) return null;
+  return {
+    roomId: connection.roomId,
+    sessionId: connection.roomId,
+    status: connection.status,
+    sessionPolicy: buildSessionPolicyPayload(connection)
+  };
+};
+
+const markSessionReady = async (roomId, userId, io) => {
+  if (!roomId || !userId) return null;
+  const userIdStr = userId.toString();
+  const now = new Date();
+
+  let connection = await RandomConnection.findOneAndUpdate(
+    {
+      roomId,
+      status: 'active',
+      'participants.userId': userId
+    },
+    {
+      $set: {
+        'participants.$.readyAt': now
+      }
+    },
+    { new: true }
+  );
+
+  if (!connection) return null;
+
+  const readyParticipantIds = new Set((connection.participants || [])
+    .filter(participant => participant.readyAt)
+    .map(participant => getUserIdString(participant.userId)));
+
+  emitToParticipants(io, connection, 'random-session-ready', {
+    readyUserId: userIdStr,
+    readyCount: readyParticipantIds.size,
+    participantCount: connection.participants.length,
+    sessionPolicy: buildSessionPolicyPayload(connection)
+  });
+
+  const allReady = (connection.participants || []).length >= 2 &&
+    (connection.participants || []).every(participant => participant.readyAt);
+
+  if (allReady && !connection.timerStartedAt) {
+    const expiresAt = connection.durationLimitSeconds
+      ? new Date(now.getTime() + connection.durationLimitSeconds * 1000)
+      : null;
+
+    connection = await RandomConnection.findOneAndUpdate(
+      {
+        roomId,
+        status: 'active',
+        timerStartedAt: { $exists: false }
+      },
+      {
+        $set: {
+          connectedAt: now,
+          timerStartedAt: now,
+          startTime: now,
+          ...(expiresAt ? { expiresAt } : {})
+        }
+      },
+      { new: true }
+    ) || connection;
+
+    emitToParticipants(io, connection, 'random-session-timer-started', {
+      sessionPolicy: buildSessionPolicyPayload(connection)
+    });
+    scheduleSessionTimers(connection, io);
+  } else {
+    const state = await getSessionTimerState(roomId, userId);
+    if (state && io) {
+      io.to(`user-${userIdStr}`).emit('random-session-timer-sync', state);
+    }
+  }
+
+  return buildConnectionPayload(connection);
 };
 
 // Random Connect: for PLAYERS only. Matches 2 players who share at least one tag → video call.
@@ -22,6 +303,7 @@ const joinQueue = async (req, res) => {
     const userId = req.user._id;
     const isPremium = isPremiumUser(req.user);
     const userGender = req.user.profile?.gender || '';
+    const io = getIo(req);
 
     // Only players can use Random Connect (teams cannot)
     if (req.user.userType !== 'player') {
@@ -33,7 +315,7 @@ const joinQueue = async (req, res) => {
     }
 
     // Free users: daily limit (5) only when using gender filter (Male/Female). Default "Any" = unlimited.
-    const usingGenderFilter = preferredGender === 'male' || preferredGender === 'female';
+    const usingGenderFilter = sanitizePreferredGender(preferredGender) !== '';
     if (!isPremium && usingGenderFilter) {
       const startOfToday = new Date();
       startOfToday.setHours(0, 0, 0, 0);
@@ -63,12 +345,12 @@ const joinQueue = async (req, res) => {
     }
 
     // Normalize tags - remove duplicates, trim, lowercase
-    const normalizedTags = [...new Set(tags.map(tag => tag.trim().toLowerCase()).filter(tag => tag.length > 0))];
+    const normalizedTags = normalizeTags(tags);
 
     if (process.env.NODE_ENV === 'development') { console.log(`User ${userId} attempting to join queue - Game: ${selectedGame || 'none'}, Tags: ${normalizedTags.join(', ')}`);
 }
     // Clean up any existing connections first
-    await cleanupExistingConnections(userId, req.app.get('io'));
+    await cleanupExistingConnections(userId, io);
 
     // Check if user is already in queue
     const existingInQueue = await ConnectionQueue.findOne({
@@ -76,7 +358,7 @@ const joinQueue = async (req, res) => {
       status: 'waiting'
     });
 
-    const queuePreferredGender = (preferredGender === 'male' || preferredGender === 'female') ? preferredGender : '';
+    const queuePreferredGender = sanitizePreferredGender(preferredGender);
     if (existingInQueue) {
       if (process.env.NODE_ENV === 'development') { console.log(`User ${userId} already in queue, updating preferences`);}
       existingInQueue.selectedGame = selectedGame || null;
@@ -87,25 +369,48 @@ const joinQueue = async (req, res) => {
       existingInQueue.updatedAt = new Date();
       await existingInQueue.save();
     } else {
-      await ConnectionQueue.create({
-        userId,
-        username: req.user.username,
-        displayName: req.user.profile?.displayName,
-        avatar: req.user.profile?.avatar,
-        selectedGame: selectedGame || null,
-        tags: normalizedTags,
-        videoEnabled,
-        gender: userGender,
-        preferredGender: queuePreferredGender
-      });
+      try {
+        await ConnectionQueue.create({
+          userId,
+          username: req.user.username,
+          displayName: req.user.profile?.displayName,
+          avatar: req.user.profile?.avatar,
+          selectedGame: selectedGame || null,
+          tags: normalizedTags,
+          videoEnabled,
+          gender: userGender,
+          preferredGender: queuePreferredGender
+        });
+      } catch (error) {
+        if (error?.code !== 11000) throw error;
+        await ConnectionQueue.updateOne(
+          { userId, status: 'waiting' },
+          {
+            $set: {
+              username: req.user.username,
+              displayName: req.user.profile?.displayName,
+              avatar: req.user.profile?.avatar,
+              selectedGame: selectedGame || null,
+              tags: normalizedTags,
+              videoEnabled,
+              gender: userGender,
+              preferredGender: queuePreferredGender,
+              updatedAt: new Date()
+            }
+          },
+          { upsert: true }
+        );
+      }
       if (process.env.NODE_ENV === 'development') { console.log(`User ${userId} added to queue`);}
     }
 
     // Gender filter: Male/Female only (free: 5/day when used; Any = unlimited)
-    const matchOptions = { preferredGender: null };
-    if (preferredGender === 'male' || preferredGender === 'female') {
-      matchOptions.preferredGender = preferredGender;
-    }
+    const currentEntry = await ConnectionQueue.findOne({ userId, status: 'waiting' }).lean();
+    const matchOptions = {
+      preferredGender: queuePreferredGender || null,
+      currentGender: userGender,
+      currentEntry
+    };
 
     // Try to find a match immediately
     const match = await findMatch(userId, selectedGame, normalizedTags, matchOptions);
@@ -113,73 +418,40 @@ const joinQueue = async (req, res) => {
     if (match) {
       if (process.env.NODE_ENV === 'development') { console.log(`✅ Instant match found for ${userId} with ${match.userId}`);
       }
-      // Create connection immediately
-      const roomId = uuidv4();
-      const usedGenderFilter = preferredGender === 'male' || preferredGender === 'female';
-      const connection = await RandomConnection.create({
-        roomId,
-        participants: [
-          {
-            userId,
-            username: req.user.username,
-            displayName: req.user.profile?.displayName,
-            avatar: req.user.profile?.avatar,
-            videoEnabled
-          },
-          {
-            userId: match.userId,
-            username: match.username,
-            displayName: match.displayName,
-            avatar: match.avatar,
-            videoEnabled: match.videoEnabled
-          }
-        ],
-        selectedGame: selectedGame || null,
+      const claimed = await claimWaitingPair(userId, match.userId);
+      if (!claimed) {
+        return res.status(200).json({
+          success: true,
+          message: 'Added to queue. Waiting for match...',
+          matched: false
+        });
+      }
+
+      const usedGenderFilter = queuePreferredGender !== '';
+      const connection = await createConnectionForPair({
+        user1: {
+          userId,
+          username: req.user.username,
+          displayName: req.user.profile?.displayName,
+          avatar: req.user.profile?.avatar,
+          videoEnabled
+        },
+        user2: match,
+        selectedGame: selectedGame || match.selectedGame || null,
         tags: normalizedTags,
-        status: 'active',
-        createdBy: userId,
-        usedGenderFilter: usedGenderFilter
+        usedGenderFilter,
+        matchedTags: match.commonTags || [],
+        matchQuality: match.matchQuality || 'unknown'
       });
 
-      if (process.env.NODE_ENV === 'development') { console.log(`✅ Connection created with room ID: ${roomId}`);
-}
-      // Remove both users from queue
-      await ConnectionQueue.deleteMany({
-        userId: { $in: [userId, match.userId] }
-      });
-
-      // Prepare connection data
       const userIdStr = userId.toString();
       const matchUserIdStr = match.userId.toString();
-      
-      const connectionData = {
-        roomId: connection.roomId,
-        sessionId: connection.roomId,
-        participants: [
-          {
-            userId: userIdStr,
-            username: req.user.username,
-            displayName: req.user.profile?.displayName,
-            avatar: req.user.profile?.avatar,
-            videoEnabled
-          },
-          {
-            userId: matchUserIdStr,
-            username: match.username,
-            displayName: match.displayName,
-            avatar: match.avatar,
-            videoEnabled: match.videoEnabled
-          }
-        ],
-        selectedGame: selectedGame || null,
-        tags: normalizedTags
-      };
+      const connectionData = buildConnectionPayload(connection);
 
       // CRITICAL: Emit socket events for BOTH users
-      const io = req.app.get('io');
       if (io) {
         if (process.env.NODE_ENV === 'development') { console.log(`📤 Emitting connection-matched events to both users...`);}
-        await emitConnectionMatched(io, userIdStr, matchUserIdStr, connectionData, roomId);
+        await emitConnectionMatched(io, userIdStr, matchUserIdStr, connectionData, connection.roomId);
       } else {
         console.warn('⚠️ Socket.io not available, cannot emit events');
       }
@@ -190,13 +462,7 @@ const joinQueue = async (req, res) => {
         success: true,
         message: 'Connection established!',
         connection: {
-          roomId: connectionData.roomId,
-          participants: connectionData.participants, // Already properly formatted
-          selectedGame: connectionData.selectedGame,
-          tags: connectionData.tags,
-          status: 'active',
-          createdAt: connection.createdAt,
-          updatedAt: connection.updatedAt
+          ...connectionData
         },
         matched: true,
         roomId: connection.roomId
@@ -220,12 +486,79 @@ const joinQueue = async (req, res) => {
   }
 };
 
-// Find another player with at least one same tag → exactly 2 players for video call
-// options: { preferredGender } — premium-only filter (male | female | other)
+const getRecentPartnerIds = async (userId) => {
+  const since = new Date(Date.now() - RECENT_PARTNER_AVOID_MS);
+  const recentSessions = await RandomConnection.find({
+    'participants.userId': userId,
+    createdAt: { $gte: since },
+    status: { $in: ['active', 'ended', 'disconnected'] }
+  })
+    .select('participants.userId')
+    .lean();
+
+  const currentUserId = userId.toString();
+  return new Set(recentSessions
+    .flatMap(session => session.participants || [])
+    .map(participant => getUserIdString(participant.userId))
+    .filter(participantId => participantId && participantId !== currentUserId));
+};
+
+const scoreCandidate = ({ currentEntry, candidate, tags, selectedGame, currentGender, allowFallback, recentPartnerIds }) => {
+  const candidateId = getUserIdString(candidate.userId);
+  if (!candidateId || candidateId === getUserIdString(currentEntry.userId)) return null;
+  if (!allowFallback && recentPartnerIds.has(candidateId)) return null;
+
+  if (candidate.preferredGender && candidate.preferredGender !== currentGender) return null;
+
+  const candidateTags = Array.isArray(candidate.tags) ? candidate.tags : [];
+  const commonTags = tags.filter(tag => candidateTags.includes(tag));
+  const hasCurrentTags = tags.length > 0;
+  const hasCandidateTags = candidateTags.length > 0;
+  const sameGame = selectedGame && candidate.selectedGame && selectedGame === candidate.selectedGame;
+
+  let score = 0;
+  let matchQuality = 'random';
+
+  if (hasCurrentTags) {
+    if (commonTags.length > 0) {
+      score += 100 + commonTags.length * 25;
+      matchQuality = commonTags.length === tags.length && commonTags.length === candidateTags.length ? 'exact_tag' : 'partial_tag';
+    } else if (!allowFallback) {
+      return null;
+    } else {
+      score += hasCandidateTags ? 12 : 4;
+      matchQuality = 'expanded';
+    }
+  } else if (hasCandidateTags && !allowFallback) {
+    score += 20;
+    matchQuality = 'expanded';
+  }
+
+  if (sameGame) {
+    score += 35;
+    if (matchQuality === 'random') matchQuality = 'same_game';
+  } else if (selectedGame && !allowFallback) {
+    return null;
+  }
+
+  if (recentPartnerIds.has(candidateId)) score -= 200;
+  const waitedSeconds = Math.max(0, (Date.now() - new Date(candidate.joinedAt || candidate.createdAt || Date.now()).getTime()) / 1000);
+  score += Math.min(30, waitedSeconds / 4);
+
+  return { candidate, score, commonTags, matchQuality };
+};
+
+// Find another player using tag priority, reciprocal gender filters, recent-partner avoidance, then fallback expansion.
 const findMatch = async (userId, selectedGame, tags = [], options = {}) => {
   try {
     const userIdStr = userId.toString();
-    const { preferredGender } = options;
+    const { preferredGender, currentGender = '', currentEntry: providedCurrentEntry } = options;
+    const currentEntry = providedCurrentEntry || await ConnectionQueue.findOne({ userId, status: 'waiting' }).lean();
+    if (!currentEntry) return null;
+
+    const joinedAt = new Date(currentEntry.joinedAt || currentEntry.createdAt || Date.now()).getTime();
+    const allowFallback = Date.now() - joinedAt >= TAG_FALLBACK_MS;
+    const recentPartnerIds = await getRecentPartnerIds(userId);
 
     const query = {
       userId: { $ne: userId },
@@ -237,39 +570,48 @@ const findMatch = async (userId, selectedGame, tags = [], options = {}) => {
       if (process.env.NODE_ENV === 'development') { console.log(`🔍 Random Connect (Premium): filter by gender ${preferredGender}`);}
     }
 
-    if (tags.length > 0) {
-      // Same-tag matching: find queue entries that have at least one tag in common
+    if (tags.length > 0 && !allowFallback) {
       query.tags = { $in: tags };
-      if (process.env.NODE_ENV === 'development') { console.log(`🔍 Random Connect: looking for another player with tags: ${tags.join(', ')}`);}
-    } else if (selectedGame) {
+    } else if (selectedGame && !allowFallback) {
       query.selectedGame = selectedGame;
-    } else {
-      if (process.env.NODE_ENV === 'development') { console.log(`🔍 Random Connect: matching with any waiting player`);}
     }
 
     const potentialMatches = await ConnectionQueue.find(query)
-      .sort({ createdAt: 1 }); // FIFO
+      .sort({ joinedAt: 1, createdAt: 1 })
+      .limit(MATCH_BATCH_LIMIT)
+      .lean();
 
-    if (potentialMatches.length > 0) {
-      // Pick first waiting player (FIFO) - exactly 2 players per room
-      const match = potentialMatches[0];
-      
-      // Count common tags for logging
-      const commonTags = tags.length > 0 && match.tags 
-        ? tags.filter(tag => match.tags.includes(tag))
-        : [];
-      
-      if (process.env.NODE_ENV === 'development') { console.log(`✅ Matched user ${userIdStr} with ${match.userId}`);}
-      if (process.env.NODE_ENV === 'development') { console.log(`   Common tags: ${commonTags.join(', ') || 'none'}`);
+    const scored = potentialMatches
+      .map(candidate => scoreCandidate({
+        currentEntry,
+        candidate,
+        tags,
+        selectedGame,
+        currentGender,
+        allowFallback,
+        recentPartnerIds
+      }))
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score || new Date(a.candidate.joinedAt || a.candidate.createdAt).getTime() - new Date(b.candidate.joinedAt || b.candidate.createdAt).getTime());
+
+    if (scored.length > 0) {
+      const best = scored[0];
+      const match = best.candidate;
+      if (process.env.NODE_ENV === 'development') {
+        console.log(`✅ Matched user ${userIdStr} with ${match.userId} (${best.matchQuality}, score ${best.score})`);
       }
       return {
+        _id: match._id,
         userId: match.userId,
         username: match.username,
         displayName: match.displayName,
         avatar: match.avatar,
         videoEnabled: match.videoEnabled,
         tags: match.tags || [],
-        selectedGame: match.selectedGame
+        selectedGame: match.selectedGame,
+        preferredGender: match.preferredGender || '',
+        commonTags: best.commonTags,
+        matchQuality: best.matchQuality
       };
     }
 
@@ -281,13 +623,90 @@ const findMatch = async (userId, selectedGame, tags = [], options = {}) => {
   }
 };
 
+const claimWaitingPair = async (userId1, userId2) => {
+  const firstClaim = await ConnectionQueue.updateOne(
+    { userId: userId1, status: 'waiting' },
+    { $set: { status: 'matched', updatedAt: new Date() } }
+  );
+  if (firstClaim.modifiedCount !== 1) return false;
+
+  const secondClaim = await ConnectionQueue.updateOne(
+    { userId: userId2, status: 'waiting' },
+    { $set: { status: 'matched', updatedAt: new Date() } }
+  );
+  if (secondClaim.modifiedCount !== 1) {
+    await ConnectionQueue.updateOne({ userId: userId1, status: 'matched' }, { $set: { status: 'waiting' } });
+    return false;
+  }
+
+  return true;
+};
+
+const buildParticipant = (queueLikeUser, dbUser, videoEnabled) => {
+  const premium = getPremiumSnapshot(dbUser);
+  return {
+    userId: dbUser._id,
+    username: queueLikeUser.username || dbUser.username,
+    displayName: queueLikeUser.displayName || dbUser.profile?.displayName,
+    avatar: queueLikeUser.avatar || dbUser.profile?.avatar,
+    videoEnabled: videoEnabled !== undefined ? videoEnabled : queueLikeUser.videoEnabled,
+    isPremium: premium.isPremium,
+    membershipTier: premium.membershipTier
+  };
+};
+
+const createConnectionForPair = async ({ user1, user2, selectedGame, tags, usedGenderFilter, matchedTags = [], matchQuality = 'unknown' }) => {
+  const [dbUser1, dbUser2] = await Promise.all([
+    User.findById(user1.userId || user1._id).select('username profile.displayName profile.avatar isPremium membership'),
+    User.findById(user2.userId || user2._id).select('username profile.displayName profile.avatar isPremium membership')
+  ]);
+
+  if (!dbUser1 || !dbUser2) {
+    throw new Error('Matched user profile not found');
+  }
+
+  const policy = buildSessionPolicy(dbUser1, dbUser2);
+  const roomId = uuidv4();
+  const connection = await RandomConnection.create({
+    roomId,
+    participants: [
+      buildParticipant(user1, dbUser1, user1.videoEnabled),
+      buildParticipant(user2, dbUser2, user2.videoEnabled)
+    ],
+    selectedGame: selectedGame || null,
+    tags: tags || [],
+    matchedTags,
+    matchQuality,
+    status: 'active',
+    createdBy: dbUser1._id,
+    usedGenderFilter: Boolean(usedGenderFilter),
+    durationLimitSeconds: policy.durationLimitSeconds,
+    endReason: null
+  });
+
+  await ConnectionQueue.deleteMany({
+    userId: { $in: [dbUser1._id, dbUser2._id] }
+  });
+
+  return connection;
+};
+
 // Match users from queue (used by periodic matcher)
 const matchUsersFromQueue = async (io) => {
   try {
+    await syncExpiredSessions(io);
+    await ConnectionQueue.deleteMany({
+      $or: [
+        { expiresAt: { $lte: new Date() } },
+        { status: { $in: ['matched', 'cancelled'] }, updatedAt: { $lte: new Date(Date.now() - 60 * 1000) } }
+      ]
+    });
+
     // Get all waiting users
     const waitingUsers = await ConnectionQueue.find({ status: 'waiting' })
-      .sort({ createdAt: 1 })
-      .limit(50); // Process up to 50 users at a time
+      .sort({ joinedAt: 1, createdAt: 1 })
+      .limit(MATCH_BATCH_LIMIT)
+      .lean();
 
     if (waitingUsers.length < 2) {
       return; // Need at least 2 users to match
@@ -295,19 +714,19 @@ const matchUsersFromQueue = async (io) => {
 
     if (process.env.NODE_ENV === 'development') { console.log(`🔍 Periodic matching: Found ${waitingUsers.length} users in queue`);
 }
-    const matchedPairs = [];
     const processedUserIds = new Set();
 
     // Try to match each user with another
     for (let i = 0; i < waitingUsers.length; i++) {
-      if (processedUserIds.has(waitingUsers[i].userId.toString())) {
+      const user1 = waitingUsers[i];
+      const user1Id = user1.userId.toString();
+      if (processedUserIds.has(user1Id)) {
         continue; // Already matched
       }
 
-      const user1 = waitingUsers[i];
       const matchOptions = (user1.preferredGender === 'male' || user1.preferredGender === 'female')
-        ? { preferredGender: user1.preferredGender }
-        : {};
+        ? { preferredGender: user1.preferredGender, currentGender: user1.gender || '', currentEntry: user1 }
+        : { currentGender: user1.gender || '', currentEntry: user1 };
       const match = await findMatch(
         user1.userId,
         user1.selectedGame || null,
@@ -316,108 +735,41 @@ const matchUsersFromQueue = async (io) => {
       );
 
       if (match && !processedUserIds.has(match.userId.toString())) {
-        // Found a match!
-        const user2 = waitingUsers.find(u => u.userId.toString() === match.userId.toString());
-        
-        if (user2 && user2.status === 'waiting') {
-          matchedPairs.push({ user1, user2, match });
-          processedUserIds.add(user1.userId.toString());
-          processedUserIds.add(user2.userId.toString());
-        }
-      }
-    }
-
-    // Create connections for matched pairs
-    for (const { user1, user2, match } of matchedPairs) {
-      try {
-        // Double-check both users are still waiting
-        const user1Check = await ConnectionQueue.findOne({
-          userId: user1.userId,
-          status: 'waiting'
-        });
-        const user2Check = await ConnectionQueue.findOne({
-          userId: user2.userId,
-          status: 'waiting'
-        });
-
-        if (!user1Check || !user2Check) {
-          if (process.env.NODE_ENV === 'development') { console.log(`⚠️ One user already matched, skipping pair ${user1.userId} <-> ${user2.userId}`);}
+        const claimed = await claimWaitingPair(user1.userId, match.userId);
+        if (!claimed) {
           continue;
         }
 
         const usedGenderFilter = (user1.preferredGender === 'male' || user1.preferredGender === 'female' ||
-          user2.preferredGender === 'male' || user2.preferredGender === 'female');
-        const roomId = uuidv4();
-        const connection = await RandomConnection.create({
-          roomId,
-          participants: [
-            {
-              userId: user1.userId,
-              username: user1.username,
-              displayName: user1.displayName,
-              avatar: user1.avatar,
-              videoEnabled: user1.videoEnabled
-            },
-            {
-              userId: user2.userId,
-              username: user2.username,
-              displayName: user2.displayName,
-              avatar: user2.avatar,
-              videoEnabled: user2.videoEnabled
-            }
-          ],
-          selectedGame: user1.selectedGame || null,
+          match.preferredGender === 'male' || match.preferredGender === 'female');
+        const connection = await createConnectionForPair({
+          user1,
+          user2: match,
+          selectedGame: user1.selectedGame || match.selectedGame || null,
           tags: user1.tags || [],
-          status: 'active',
-          createdBy: user1.userId,
-          usedGenderFilter: usedGenderFilter
+          usedGenderFilter,
+          matchedTags: match.commonTags || [],
+          matchQuality: match.matchQuality || 'unknown'
         });
 
-        if (process.env.NODE_ENV === 'development') { console.log(`✅ Periodic match: Created connection ${roomId} for users ${user1.userId} <-> ${user2.userId}`);
-}
-        // Remove both users from queue
-        await ConnectionQueue.deleteMany({
-          userId: { $in: [user1.userId, user2.userId] }
-        });
-
-        // Prepare connection data
-        const userId1Str = user1.userId.toString();
-        const userId2Str = user2.userId.toString();
-        
-        const connectionData = {
-          roomId: connection.roomId,
-          sessionId: connection.roomId,
-          participants: [
-            {
-              userId: userId1Str,
-              username: user1.username,
-              displayName: user1.displayName,
-              avatar: user1.avatar,
-              videoEnabled: user1.videoEnabled
-            },
-            {
-              userId: userId2Str,
-              username: user2.username,
-              displayName: user2.displayName,
-              avatar: user2.avatar,
-              videoEnabled: user2.videoEnabled
-            }
-          ],
-          selectedGame: user1.selectedGame || null,
-          tags: user1.tags || []
-        };
-
-        // Emit socket events with improved delivery
-        if (io) {
-          await emitConnectionMatched(io, userId1Str, userId2Str, connectionData, roomId);
+        if (process.env.NODE_ENV === 'development') {
+          console.log(`✅ Periodic match: Created connection ${connection.roomId} for users ${user1.userId} <-> ${match.userId}`);
         }
-      } catch (error) {
-        console.error(`❌ Error creating periodic match for ${user1.userId} <-> ${user2.userId}:`, error);
+        const userId1Str = user1.userId.toString();
+        const userId2Str = match.userId.toString();
+        const connectionData = buildConnectionPayload(connection);
+
+        if (io) {
+          await emitConnectionMatched(io, userId1Str, userId2Str, connectionData, connection.roomId);
+        }
+
+        processedUserIds.add(userId1Str);
+        processedUserIds.add(userId2Str);
       }
     }
 
-    if (matchedPairs.length > 0) {
-      if (process.env.NODE_ENV === 'development') { console.log(`✅ Periodic matching: Successfully matched ${matchedPairs.length} pairs`);}
+    if (processedUserIds.size > 0) {
+      if (process.env.NODE_ENV === 'development') { console.log(`✅ Periodic matching: Successfully matched ${processedUserIds.size / 2} pairs`);}
     }
   } catch (error) {
     log.error('❌ Periodic matching error:', { error: String(error) });
@@ -592,9 +944,11 @@ const cleanupExistingConnections = async (userId, io) => {
     if (activeConnection) {
       if (process.env.NODE_ENV === 'development') { console.log(`Cleaning up existing connection for user ${userId}`);
       }
+      clearSessionTimers(activeConnection.roomId);
       activeConnection.status = 'disconnected';
       activeConnection.endTime = new Date();
-      activeConnection.duration = Math.floor((activeConnection.endTime - activeConnection.startTime) / 1000);
+      activeConnection.endReason = 'cleanup';
+      activeConnection.duration = Math.floor((activeConnection.endTime - (activeConnection.connectedAt || activeConnection.startTime)) / 1000);
       
       const participant = activeConnection.participants.find(p => p.userId.toString() === userId.toString());
       if (participant) {
@@ -680,17 +1034,11 @@ const getCurrentConnection = async (req, res) => {
     }
 
     const connectionObj = connection.toObject ? connection.toObject() : connection;
-    connectionObj.sessionId = connectionObj.roomId;
-    if (connectionObj.participants) {
-      connectionObj.participants = connectionObj.participants.map(p => ({
-        ...p,
-        userId: (p.userId && p.userId._id ? p.userId._id : p.userId).toString()
-      }));
-    }
+    const connectionPayload = buildConnectionPayload(connectionObj);
 
     res.status(200).json({
       success: true,
-      connection: connectionObj
+      connection: connectionPayload
     });
 
   } catch (error) {
@@ -724,10 +1072,12 @@ const disconnectConnection = async (req, res) => {
       });
     }
 
+    clearSessionTimers(connection.roomId);
     // Update connection status
     connection.status = 'disconnected';
     connection.endTime = new Date();
-    connection.duration = Math.floor((connection.endTime - connection.startTime) / 1000);
+    connection.endReason = 'user_left';
+    connection.duration = Math.floor((connection.endTime - (connection.connectedAt || connection.startTime)) / 1000);
     
     const participant = connection.participants.find(p => p.userId.toString() === userId.toString());
     if (participant) {
@@ -737,7 +1087,7 @@ const disconnectConnection = async (req, res) => {
     await connection.save();
 
     // Notify other participants
-    const io = req.app.get('io');
+    const io = getIo(req);
     if (io) {
       const userIdStr = userId.toString();
       const otherParticipants = connection.participants.filter(p => p.userId.toString() !== userIdStr);
@@ -748,6 +1098,11 @@ const disconnectConnection = async (req, res) => {
           disconnectedUserId: userIdStr,
           reason: 'User disconnected'
         });
+      });
+      emitToParticipants(io, connection, 'random-session-ended', {
+        reason: 'user_left',
+        disconnectedUserId: userId.toString(),
+        sessionPolicy: buildSessionPolicyPayload(connection)
       });
     }
 
@@ -868,9 +1223,11 @@ const cleanupCurrentConnection = async (req, res) => {
     if (activeConnection) {
       if (process.env.NODE_ENV === 'development') { console.log(`Found active connection ${activeConnection.roomId} for user ${userId}`);
       }
+      clearSessionTimers(activeConnection.roomId);
       activeConnection.status = 'disconnected';
       activeConnection.endTime = new Date();
-      activeConnection.duration = Math.floor((activeConnection.endTime - activeConnection.startTime) / 1000);
+      activeConnection.endReason = 'cleanup';
+      activeConnection.duration = Math.floor((activeConnection.endTime - (activeConnection.connectedAt || activeConnection.startTime)) / 1000);
       
       const participant = activeConnection.participants.find(p => p.userId.toString() === userId.toString());
       if (participant) {
@@ -880,7 +1237,7 @@ const cleanupCurrentConnection = async (req, res) => {
       await activeConnection.save();
 
       // Notify other participants
-      const io = req.app.get('io');
+      const io = getIo(req);
       if (io) {
         const userIdStr = userId.toString();
         const otherParticipants = activeConnection.participants.filter(p => p.userId.toString() !== userIdStr);
@@ -891,6 +1248,11 @@ const cleanupCurrentConnection = async (req, res) => {
             disconnectedUserId: userIdStr,
             reason: 'User left'
           });
+        });
+        emitToParticipants(io, activeConnection, 'random-session-ended', {
+          reason: 'cleanup',
+          disconnectedUserId: userIdStr,
+          sessionPolicy: buildSessionPolicyPayload(activeConnection)
         });
       }
 
@@ -919,7 +1281,7 @@ const cleanupCurrentConnection = async (req, res) => {
 const getActiveSessions = async (req, res) => {
   try {
     const sessions = await RandomConnection.find({ status: 'active' })
-      .select('roomId startTime participants.username participants.displayName tags')
+      .select('roomId startTime connectedAt expiresAt durationLimitSeconds participants.username participants.displayName participants.isPremium tags matchQuality matchedTags')
       .lean();
 
     const list = sessions.map(s => ({
@@ -927,7 +1289,12 @@ const getActiveSessions = async (req, res) => {
       roomId: s.roomId,
       usernames: (s.participants || []).map(p => p.username || p.displayName || '?').filter(Boolean),
       startedAt: s.startTime,
-      tags: s.tags || []
+      connectedAt: s.connectedAt,
+      expiresAt: s.expiresAt,
+      durationLimitSeconds: s.durationLimitSeconds,
+      tags: s.tags || [],
+      matchedTags: s.matchedTags || [],
+      matchQuality: s.matchQuality || 'unknown'
     }));
 
     res.status(200).json({
@@ -998,5 +1365,16 @@ module.exports = {
   disconnectConnection,
   sendMessage,
   cleanupCurrentConnection,
-  matchUsersFromQueue
+  matchUsersFromQueue,
+  markSessionReady,
+  getSessionTimerState,
+  syncExpiredSessions,
+  _private: {
+    normalizeTags,
+    sanitizePreferredGender,
+    isPremiumUser,
+    buildSessionPolicy,
+    scoreCandidate,
+    buildSessionPolicyPayload
+  }
 };

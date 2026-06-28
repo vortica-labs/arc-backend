@@ -3,6 +3,8 @@ import { paymentController, protect } from "./payments.legacy-adapters";
 
 const router = Router();
 
+router.get("/history", protect, paymentController.getPaymentHistory);
+
 // Subscription payment routes
 router.post("/subscription/create-order", protect, paymentController.createOrder);
 router.post("/subscription/verify", protect, paymentController.verifyPayment);

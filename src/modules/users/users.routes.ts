@@ -26,6 +26,8 @@ router.get("/:identifier/tournaments", optionalAuth, userController.getLiveTourn
 router.get("/:username/tournament-history", optionalAuth, userController.getUserTournamentHistory);
 router.get("/privacy-settings", protect, userController.getPrivacySettings);
 router.put("/privacy-settings", protect, userController.updatePrivacySettings);
+router.get("/notification-settings", protect, userController.getNotificationSettings);
+router.put("/notification-settings", protect, userController.updateNotificationSettings);
 router.get("/:userId/dm-privacy", protect, userController.getDmPrivacy);
 router.get("/:identifier", optionalAuth, userController.getUser);
 router.post("/:id/follow", protect, userController.toggleFollow);

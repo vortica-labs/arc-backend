@@ -11,6 +11,9 @@ const {
   recordClipView,
   toggleLike,
   addComment,
+  recordShare,
+  toggleSave,
+  trackInteraction,
   updatePost,
   deletePost,
   reportPost,
@@ -72,6 +75,9 @@ router.get('/:id', optionalAuth, getPost);
 router.post('/:id/view', protect, recordClipView);
 router.post('/:id/like', protect, toggleLike);
 router.post('/:id/comment', protect, addCommentValidation, handleValidationErrors, addComment);
+router.post('/:id/share', protect, recordShare);
+router.post('/:id/save', protect, toggleSave);
+router.post('/interaction', protect, trackInteraction);
 router.put('/:id', protect, updatePostValidation, handleValidationErrors, updatePost);
 router.delete('/:id', protect, deletePost);
 router.post('/:id/report', protect, reportPost);

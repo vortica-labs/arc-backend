@@ -22,6 +22,7 @@ const createScrim = async (req, res) => {
     const {
       name,
       description,
+      format,
       scrimType,
       timeSlot,
       numberOfMatches,
@@ -55,6 +56,14 @@ const createScrim = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: 'Number of matches must be between 1 and 4'
+      });
+    }
+
+    const normalizedFormat = typeof format === 'string' ? format.trim() : 'Squad';
+    if (!['Solo', 'Squad'].includes(normalizedFormat)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Scrim format must be either Solo or Squad'
       });
     }
 
@@ -112,7 +121,7 @@ const createScrim = async (req, res) => {
       name,
       description: description || '',
       game: 'BGMI',
-      format: 'Squad',
+      format: normalizedFormat,
       scrimType,
       timeSlot: scrimType === 'Daily' ? timeSlot : null,
       numberOfMatches: parseInt(numberOfMatches),

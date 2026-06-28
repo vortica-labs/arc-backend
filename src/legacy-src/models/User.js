@@ -417,6 +417,16 @@ const userSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Post'
   }],
+  savedPosts: [{
+    post: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Post'
+    },
+    savedAt: {
+      type: Date,
+      default: Date.now
+    }
+  }],
   isVerified: {
     type: Boolean,
     default: false
@@ -448,6 +458,40 @@ const userSchema = new mongoose.Schema({
       type: String,
       enum: ['anyone', 'people_you_follow', 'nobody'],
       default: 'anyone'
+    }
+  },
+  notificationSettings: {
+    likes: {
+      type: Boolean,
+      default: true
+    },
+    comments: {
+      type: Boolean,
+      default: true
+    },
+    follows: {
+      type: Boolean,
+      default: true
+    },
+    messages: {
+      type: Boolean,
+      default: true
+    },
+    tournamentUpdates: {
+      type: Boolean,
+      default: true
+    },
+    scrimUpdates: {
+      type: Boolean,
+      default: true
+    },
+    recruitmentApps: {
+      type: Boolean,
+      default: true
+    },
+    systemAlerts: {
+      type: Boolean,
+      default: true
     }
   },
   googleId: {
@@ -602,5 +646,7 @@ userSchema.methods.populateTeamInfo = async function() {
   }
   return this;
 };
+
+userSchema.index({ 'savedPosts.post': 1 });
 
 module.exports = mongoose.model('User', userSchema);

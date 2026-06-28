@@ -3,6 +3,7 @@
  */
 const User = require('../models/User');
 const Tournament = require('../models/Tournament');
+const PaymentTransaction = require('../models/PaymentTransaction');
 const { PLAYER_PLANS, TEAM_PLANS } = require('./membershipController');
 
 // Lazily initialise Razorpay so a missing key doesn't crash module load
@@ -59,6 +60,31 @@ function getPriceForPeriod(plan, billingPeriod) {
       return plan.priceYearly || plan.priceMonthly * 12;
     default:
       return plan.priceMonthly || 0;
+  }
+}
+
+function amountFromRazorpayPayment(payment, fallbackAmount) {
+  if (payment && typeof payment.amount === 'number') {
+    return payment.amount / 100;
+  }
+  return typeof fallbackAmount === 'number' ? fallbackAmount : 0;
+}
+
+async function recordPaymentTransaction(transaction) {
+  try {
+    const paymentId = transaction.paymentId;
+    if (paymentId) {
+      return await PaymentTransaction.findOneAndUpdate(
+        { paymentId },
+        { $setOnInsert: transaction },
+        { new: true, upsert: true, setDefaultsOnInsert: true }
+      );
+    }
+
+    return await PaymentTransaction.create(transaction);
+  } catch (error) {
+    console.error('Failed to record payment transaction:', error);
+    return null;
   }
 }
 
@@ -191,6 +217,26 @@ async function verifyPayment(req, res) {
     };
 
     await user.save();
+
+    await recordPaymentTransaction({
+      user: userId,
+      type: 'subscription',
+      amount: amountFromRazorpayPayment(payment, getPriceForPeriod(plan, billingPeriod)),
+      currency: payment.currency || 'INR',
+      status: 'completed',
+      description: `${plan.name} subscription (${billingPeriod})`,
+      orderId: razorpay_order_id,
+      paymentId: razorpay_payment_id,
+      referenceId: userId,
+      referenceType: 'membership',
+      metadata: {
+        planId,
+        billingPeriod,
+        tier,
+        validUntil,
+        razorpayStatus: payment.status
+      }
+    });
 
     res.status(200).json({
       success: true,
@@ -368,17 +414,22 @@ async function verifyTournamentPayment(req, res) {
 
     await tournament.save();
 
-    const paymentRecord = {
-      razorpay_order_id,
-      razorpay_payment_id,
-      razorpay_signature,
-      tournamentId,
-      userId: req.user._id,
-      amount: tournament.entryFee,
-      currency: 'INR',
+    await recordPaymentTransaction({
+      user: req.user._id,
+      type: 'tournament',
+      amount: amountFromRazorpayPayment(payment, tournament.entryFee),
+      currency: payment.currency || 'INR',
       status: 'completed',
-      createdAt: new Date()
-    };
+      description: `Tournament registration: ${tournament.name}`,
+      orderId: razorpay_order_id,
+      paymentId: razorpay_payment_id,
+      referenceId: tournament._id,
+      referenceType: 'tournament',
+      metadata: {
+        tournamentId,
+        razorpayStatus: payment.status
+      }
+    });
 
     res.status(200).json({
       success: true,
@@ -462,10 +513,77 @@ async function verifyBoostPayment(req, res) {
       $set: { 'boostMeta.targetReach': targetReach, 'boostMeta.targetPlayers': targetPlayers, 'boostMeta.targetTeams': targetTeams }
     });
 
+    await recordPaymentTransaction({
+      user: req.user._id,
+      type: 'boost',
+      amount: amountFromRazorpayPayment(payment),
+      currency: payment.currency || 'INR',
+      status: 'completed',
+      description: `Post boost (${frequency})`,
+      orderId: razorpay_order_id,
+      paymentId: razorpay_payment_id,
+      referenceId: postId,
+      referenceType: 'post',
+      metadata: {
+        frequency,
+        targetReach,
+        targetPlayers,
+        targetTeams,
+        boostExpiresAt,
+        razorpayStatus: payment.status
+      }
+    });
+
     res.status(200).json({ success: true, message: 'Boost activated successfully', boostExpiresAt });
   } catch (error) {
     console.error('Error verifying boost payment:', error);
     res.status(500).json({ success: false, message: 'Payment verification failed' });
+  }
+}
+
+async function getPaymentHistory(req, res) {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
+    const cursor = req.query.cursor ? new Date(req.query.cursor) : null;
+    const query = { user: req.user._id };
+
+    if (cursor && !Number.isNaN(cursor.getTime())) {
+      query.createdAt = { $lt: cursor };
+    }
+
+    const payments = await PaymentTransaction.find(query)
+      .sort({ createdAt: -1 })
+      .limit(limit + 1)
+      .lean();
+
+    const hasMore = payments.length > limit;
+    const page = hasMore ? payments.slice(0, limit) : payments;
+    const nextCursor = hasMore ? page[page.length - 1]?.createdAt : null;
+
+    res.status(200).json({
+      success: true,
+      data: {
+        payments: page.map(payment => ({
+          _id: payment._id,
+          type: payment.type,
+          amount: payment.amount,
+          currency: payment.currency,
+          status: payment.status,
+          description: payment.description,
+          orderId: payment.orderId,
+          paymentId: payment.paymentId,
+          referenceId: payment.referenceId,
+          referenceType: payment.referenceType,
+          createdAt: payment.createdAt,
+          updatedAt: payment.updatedAt
+        })),
+        hasMore,
+        nextCursor
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching payment history:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch payment history' });
   }
 }
 
@@ -476,5 +594,6 @@ module.exports = {
   createTournamentOrder,
   verifyTournamentPayment,
   createBoostOrder,
-  verifyBoostPayment
+  verifyBoostPayment,
+  getPaymentHistory
 };

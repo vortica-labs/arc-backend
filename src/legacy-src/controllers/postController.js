@@ -4,6 +4,7 @@ const Notification = require('../models/Notification');
 const { uploadMultipleFiles } = require('../utils/cloudinary');
 const { createLikeNotification, createCommentNotification, createMentionNotification } = require('../utils/notificationService');
 const { formatPostDTO } = require('../utils/dto');
+const { getRecommendedPosts, recordEngagementEvent } = require('../services/recommendationService');
 const log = require('../utils/logger');
 
 // Create new post
@@ -240,38 +241,11 @@ const createPost = async (req, res) => {
 // Get clips feed (posts that have at least one video - Reels/Shorts style)
 const getClips = async (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
-
-    const filter = {
-      isActive: true,
-      hiddenByAdmin: { $ne: true },
-      'content.media': { $elemMatch: { type: 'video' } }
-    };
-
-    const isGuest = req.user && req.user.userType === 'guest';
-
-    if (!req.user || isGuest) {
-      filter.visibility = 'public';
-    } else {
-      const following = Array.isArray(req.user.following) ? req.user.following : [];
-      filter.$or = [
-        { visibility: 'public' },
-        { author: req.user._id },
-        { visibility: 'followers', author: { $in: following } }
-      ];
-    }
-
-    const posts = await Post.find(filter)
-      .populate('author', 'username profile.displayName profile.avatar userType')
-      .populate('likes.user', 'username profile.displayName profile.avatar')
-      .populate('comments.user', 'username profile.displayName profile.avatar')
-      .sort({ boostExpiresAt: -1, boostedAt: -1, createdAt: -1 })
-      .skip(skip)
-      .limit(limit);
-
-    const total = await Post.countDocuments(filter);
+    const result = await getRecommendedPosts({
+      user: req.user,
+      query: req.query,
+      mode: 'clips'
+    });
 
     // Prevent caching/ETag 304 issues for clients
     res.set('Cache-Control', 'no-store');
@@ -280,15 +254,7 @@ const getClips = async (req, res) => {
 
     res.status(200).json({
       success: true,
-      data: {
-        posts: posts.map(p => formatPostDTO(p, isGuest, req.user && req.user._id && !isGuest && p.author && p.author._id && p.author._id.toString() === req.user._id.toString())),
-        pagination: {
-          current: page,
-          total: Math.ceil(total / limit),
-          count: posts.length,
-          totalClips: total
-        }
-      }
+      data: result
     });
   } catch (error) {
     res.status(500).json({
@@ -302,61 +268,15 @@ const getClips = async (req, res) => {
 // Get all posts (feed)
 const getPosts = async (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
-    
-    const { postType, author, tags, visibility } = req.query;
-
-    // Build filter object
-    const filter = { isActive: true, hiddenByAdmin: { $ne: true } };
-    
-    if (postType) filter.postType = postType;
-    if (author) filter.author = author;
-    if (tags) filter.tags = { $in: tags.split(',') };
-    if (visibility) filter.visibility = visibility;
-
-    // If user is not authenticated, only show public posts
-    const isGuest = req.user && req.user.userType === 'guest';
-    
-    if (!req.user || visibility === 'public' || isGuest) {
-      filter.visibility = 'public';
-    } else {
-      // If user is authenticated, show public posts and their own posts
-      if (!visibility) {
-        const following = Array.isArray(req.user.following) ? req.user.following : [];
-        filter.$or = [
-          { visibility: 'public' },
-          { author: req.user._id },
-          { 
-            visibility: 'followers',
-            author: { $in: following }
-          }
-        ];
-      }
-    }
-
-    const posts = await Post.find(filter)
-      .populate('author', 'username profile.displayName profile.avatar userType')
-      .populate('likes.user', 'username profile.displayName profile.avatar')
-      .populate('comments.user', 'username profile.displayName profile.avatar')
-      .sort({ boostExpiresAt: -1, boostedAt: -1, createdAt: -1 })
-      .skip(skip)
-      .limit(limit);
-
-    const total = await Post.countDocuments(filter);
+    const result = await getRecommendedPosts({
+      user: req.user,
+      query: req.query,
+      mode: 'feed'
+    });
 
     res.status(200).json({
       success: true,
-      data: {
-        posts: posts.map(p => formatPostDTO(p, isGuest, req.user && req.user._id && !isGuest && p.author && p.author._id && p.author._id.toString() === req.user._id.toString())),
-        pagination: {
-          current: page,
-          total: Math.ceil(total / limit),
-          count: posts.length,
-          totalPosts: total
-        }
-      }
+      data: result
     });
 
   } catch (error) {
@@ -405,34 +325,46 @@ const recordClipView = async (req, res) => {
   try {
     const postId = req.params.id;
     const userId = req.user._id;
+    const context = req.body?.context || req.query?.context || 'clips';
+    const durationMs = Math.max(0, parseInt(req.body?.durationMs, 10) || 0);
+    const completionRate = Math.min(1, Math.max(0, Number(req.body?.completionRate) || 0));
 
-    const post = await Post.findById(postId);
-    if (!post) {
+    const now = new Date();
+    const updatedPost = await Post.findOneAndUpdate(
+      {
+        _id: postId,
+        isActive: true,
+        'viewedBy.user': { $ne: userId }
+      },
+      {
+        $push: { viewedBy: { user: userId, viewedAt: now } },
+        $inc: { views: 1 }
+      },
+      { new: true }
+    ).select('author views viewedBy');
+
+    const post = updatedPost || await Post.findById(postId).select('author views viewedBy isActive');
+    if (!post || post.isActive === false) {
       return res.status(404).json({ success: false, message: 'Post not found' });
     }
 
-    // Ensure viewedBy array exists
-    if (!post.viewedBy) post.viewedBy = [];
-
-    const alreadyViewed = post.viewedBy.some(
-      (v) => v.user && v.user.toString() === userId.toString()
-    );
-    if (alreadyViewed) {
-      return res.status(200).json({
-        success: true,
-        message: 'View already recorded',
-        data: { viewCount: post.viewedBy.length }
-      });
-    }
-
-    post.viewedBy.push({ user: userId, viewedAt: new Date() });
-    post.views = post.viewedBy.length;
-    await post.save();
+    await recordEngagementEvent({
+      userId,
+      postId,
+      authorId: post.author,
+      eventType: 'view',
+      context,
+      durationMs,
+      completionRate
+    });
 
     res.status(200).json({
       success: true,
-      message: 'View recorded',
-      data: { viewCount: post.viewedBy.length }
+      message: updatedPost ? 'View recorded' : 'View already recorded',
+      data: {
+        viewCount: Math.max(post.views || 0, Array.isArray(post.viewedBy) ? post.viewedBy.length : 0),
+        unique: Boolean(updatedPost)
+      }
     });
   } catch (error) {
     res.status(500).json({
@@ -477,11 +409,28 @@ const getPost = async (req, res) => {
       });
     }
 
-    // Increment view count
-    post.views += 1;
-    await post.save();
-
+    const viewerId = req.user?._id;
     const isGuest = req.user && req.user.userType === 'guest';
+    if (viewerId && !isGuest) {
+      await Post.updateOne(
+        {
+          _id: postId,
+          'viewedBy.user': { $ne: viewerId }
+        },
+        {
+          $push: { viewedBy: { user: viewerId, viewedAt: new Date() } },
+          $inc: { views: 1 }
+        }
+      );
+      await recordEngagementEvent({
+        userId: viewerId,
+        postId,
+        authorId: post.author?._id || post.author,
+        eventType: 'view',
+        context: 'post'
+      });
+    }
+
     const isAuthor = Boolean(req.user && req.user._id && !isGuest && post.author && post.author._id && post.author._id.toString() === req.user._id.toString());
 
     res.status(200).json({
@@ -506,46 +455,58 @@ const toggleLike = async (req, res) => {
     const postId = req.params.id;
     const userId = req.user._id;
 
-    const post = await Post.findById(postId);
-
+    const existingPost = await Post.findById(postId).select('author likes isActive');
+    const post = existingPost;
     if (!post) {
       return res.status(404).json({
         success: false,
         message: 'Post not found'
       });
     }
+    if (post.isActive === false) {
+      return res.status(404).json({ success: false, message: 'Post not found' });
+    }
 
-    // Check if user already liked the post
-    const likeIndex = post.likes.findIndex((like) => {
+    const alreadyLiked = post.likes.findIndex((like) => {
       const likeUser = like?.user?._id || like?.user;
       if (!likeUser) return false;
       return likeUser.toString() === userId.toString();
+    }) > -1;
+
+    const updatedPost = alreadyLiked
+      ? await Post.findOneAndUpdate(
+        { _id: postId, 'likes.user': userId },
+        { $pull: { likes: { user: userId } } },
+        { new: true }
+      ).select('author likes')
+      : await Post.findOneAndUpdate(
+        { _id: postId, 'likes.user': { $ne: userId } },
+        { $push: { likes: { user: userId, likedAt: new Date() } } },
+        { new: true }
+      ).select('author likes');
+
+    const finalPost = updatedPost || await Post.findById(postId).select('author likes');
+    const isLiked = !alreadyLiked;
+
+    await recordEngagementEvent({
+      userId,
+      postId,
+      authorId: finalPost.author,
+      eventType: isLiked ? 'like' : 'unlike',
+      context: req.body?.context || 'feed'
     });
 
-    if (likeIndex > -1) {
-      // Unlike the post (remove all duplicates for safety)
-      post.likes = post.likes.filter((like) => {
-        const likeUser = like?.user?._id || like?.user;
-        return likeUser ? likeUser.toString() !== userId.toString() : true;
-      });
-    } else {
-      // Like the post
-      post.likes.push({ user: userId });
-
-      // Create notification for post author (if not liking own post)
-      if (post.author.toString() !== userId.toString()) {
-        await createLikeNotification(post.author, userId, post._id);
-      }
+    // Create notification for post author (if not liking own post)
+    if (isLiked && finalPost.author.toString() !== userId.toString()) {
+      await createLikeNotification(finalPost.author, userId, finalPost._id);
     }
-
-    await post.save();
 
     res.status(200).json({
       success: true,
-      message: likeIndex > -1 ? 'Post unliked' : 'Post liked',
+      message: isLiked ? 'Post liked' : 'Post unliked',
       data: {
-        likeCount: post.likes.length,
-        isLiked: likeIndex === -1
+        likeCount: finalPost.likes.length,
+        isLiked
       }
     });
 
@@ -572,15 +533,6 @@ const addComment = async (req, res) => {
       });
     }
 
-    const post = await Post.findById(postId);
-
-    if (!post) {
-      return res.status(404).json({
-        success: false,
-        message: 'Post not found'
-      });
-    }
-
     // Add comment
     const comment = {
       user: userId,
@@ -589,16 +541,34 @@ const addComment = async (req, res) => {
       createdAt: new Date()
     };
 
-    post.comments.push(comment);
-    await post.save();
+    const post = await Post.findOneAndUpdate(
+      { _id: postId, isActive: true },
+      { $push: { comments: comment } },
+      { new: true }
+    )
+      .populate('comments.user', 'username profile.displayName profile.avatar')
+      .select('author comments');
 
-    // Populate the new comment
-    await post.populate('comments.user', 'username profile.displayName profile.avatar');
+    if (!post) {
+      return res.status(404).json({
+        success: false,
+        message: 'Post not found'
+      });
+    }
 
     // Create notification for post author (if not commenting on own post)
     if (post.author.toString() !== userId.toString()) {
       await createCommentNotification(post.author, userId, post._id, text.trim());
     }
+
+    await recordEngagementEvent({
+      userId,
+      postId,
+      authorId: post.author,
+      eventType: 'comment',
+      context: req.body?.context || 'feed',
+      metadata: { length: text.trim().length }
+    });
 
     const newComment = post.comments[post.comments.length - 1];
 
@@ -616,6 +586,111 @@ const addComment = async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Failed to add comment',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+// Record a unique share action for ranking and creator analytics
+const recordShare = async (req, res) => {
+  try {
+    const postId = req.params.id;
+    const userId = req.user._id;
+
+    const post = await Post.findOneAndUpdate(
+      {
+        _id: postId,
+        isActive: true,
+        'shares.user': { $ne: userId }
+      },
+      {
+        $push: { shares: { user: userId, sharedAt: new Date() } }
+      },
+      { new: true }
+    ).select('author shares');
+
+    const finalPost = post || await Post.findById(postId).select('author shares isActive');
+    if (!finalPost || finalPost.isActive === false) {
+      return res.status(404).json({ success: false, message: 'Post not found' });
+    }
+
+    await recordEngagementEvent({
+      userId,
+      postId,
+      authorId: finalPost.author,
+      eventType: 'share',
+      context: req.body?.context || 'feed',
+      metadata: { channel: req.body?.channel || 'unknown' }
+    });
+
+    res.status(200).json({
+      success: true,
+      message: post ? 'Share recorded' : 'Share already recorded',
+      data: {
+        shareCount: finalPost.shares?.length || 0,
+        unique: Boolean(post)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to record share',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+// Toggle saved post state. Stored on User so it can feed personalization.
+const toggleSave = async (req, res) => {
+  try {
+    const postId = req.params.id;
+    const userId = req.user._id;
+
+    const post = await Post.findOne({ _id: postId, isActive: true }).select('author');
+    if (!post) {
+      return res.status(404).json({ success: false, message: 'Post not found' });
+    }
+
+    const user = await User.findById(userId).select('savedPosts');
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    const savedIndex = (user.savedPosts || []).findIndex((item) => {
+      const savedPostId = item?.post?._id || item?.post;
+      return savedPostId && savedPostId.toString() === postId.toString();
+    });
+
+    let isSaved;
+    if (savedIndex > -1) {
+      user.savedPosts.splice(savedIndex, 1);
+      isSaved = false;
+    } else {
+      user.savedPosts.push({ post: postId, savedAt: new Date() });
+      isSaved = true;
+    }
+    await user.save();
+
+    await recordEngagementEvent({
+      userId,
+      postId,
+      authorId: post.author,
+      eventType: isSaved ? 'save' : 'unsave',
+      context: req.body?.context || 'feed'
+    });
+
+    res.status(200).json({
+      success: true,
+      message: isSaved ? 'Post saved' : 'Post unsaved',
+      data: {
+        isSaved,
+        savedCount: user.savedPosts.length
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to toggle saved post',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
@@ -784,59 +859,15 @@ const reportPost = async (req, res) => {
 // Get personalized feed using recommendation engine
 const getPersonalizedFeed = async (req, res) => {
   try {
-    // Fallback to regular feed since recommendation engine is not available
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
-    
-    const { postType, author, tags, visibility } = req.query;
-
-    // Build filter object
-    const filter = { isActive: true };
-    
-    if (postType) filter.postType = postType;
-    if (author) filter.author = author;
-    if (tags) filter.tags = { $in: tags.split(',') };
-    if (visibility) filter.visibility = visibility;
-
-    // If user is not authenticated, only show public posts
-    if (!req.user) {
-      filter.visibility = 'public';
-    } else {
-      // If user is authenticated, show public posts and their own posts
-      if (!visibility) {
-        filter.$or = [
-          { visibility: 'public' },
-          { author: req.user._id },
-          { 
-            visibility: 'followers',
-            author: { $in: req.user.following }
-          }
-        ];
-      }
-    }
-
-    const posts = await Post.find(filter)
-      .populate('author', 'username profile.displayName profile.avatar userType')
-      .populate('likes.user', 'username profile.displayName profile.avatar')
-      .populate('comments.user', 'username profile.displayName profile.avatar')
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit);
-
-    const total = await Post.countDocuments(filter);
+    const result = await getRecommendedPosts({
+      user: req.user,
+      query: req.query,
+      mode: 'feed'
+    });
 
     res.status(200).json({
       success: true,
-      data: {
-        posts,
-        pagination: {
-          current: page,
-          total: Math.ceil(total / limit),
-          count: posts.length,
-          totalPosts: total
-        }
-      }
+      data: result
     });
   } catch (error) {
     res.status(500).json({
@@ -850,11 +881,11 @@ const getPersonalizedFeed = async (req, res) => {
 // Track user interaction with post
 const trackInteraction = async (req, res) => {
   try {
-    const { postId, interactionType, dwellTime, clickedElement, context } = req.body;
+    const { postId, interactionType, dwellTime, clickedElement, context, durationMs, completionRate } = req.body;
     const userId = req.user._id;
 
     // Validate interaction type
-    const validTypes = ['view', 'like', 'comment', 'share', 'click', 'dwell_time', 'skip'];
+    const validTypes = ['view', 'watch', 'like', 'comment', 'share', 'save', 'click', 'dwell_time', 'skip'];
     if (!validTypes.includes(interactionType)) {
       return res.status(400).json({
         success: false,
@@ -871,10 +902,20 @@ const trackInteraction = async (req, res) => {
       });
     }
 
-    // Simple interaction tracking without recommendation engine
-    // Just log the interaction for now
-    if (process.env.NODE_ENV === 'development') { console.log(`User ${userId} ${interactionType} on post ${postId}`);
-}
+    const normalizedType = interactionType === 'dwell_time' || interactionType === 'click'
+      ? 'dwell'
+      : interactionType;
+    await recordEngagementEvent({
+      userId,
+      postId,
+      authorId: post.author,
+      eventType: normalizedType,
+      context: context || 'unknown',
+      durationMs: Math.max(0, parseInt(durationMs ?? dwellTime, 10) || 0),
+      completionRate: Math.min(1, Math.max(0, Number(completionRate) || 0)),
+      metadata: { clickedElement }
+    });
+
     res.status(200).json({
       success: true,
       data: {
@@ -999,6 +1040,8 @@ module.exports = {
   getPersonalizedFeed,
   toggleLike,
   addComment,
+  recordShare,
+  toggleSave,
   updatePost,
   deletePost,
   reportPost,
