@@ -20,7 +20,11 @@ const HostVerificationApplication = require('../models/HostVerificationApplicati
 const mongoose = require('mongoose');
 const { createSystemNotification } = require('../utils/notificationService');
 const { PLATFORM_DEFAULT_CPM } = require('../services/CreatorEarningsCalculationService');
-const { applyManualDeliveryProgress } = require('../services/boostService');
+const {
+  applyManualDeliveryProgress,
+  processDueManualBoostDeliveries,
+  processSingleManualBoostCampaign
+} = require('../services/boostService');
 const log = require('../utils/logger');
 
 const dayMs = 24 * 60 * 60 * 1000;
@@ -50,6 +54,45 @@ const growthSeries = async (model, match = {}, days = 14) => {
 
 const normalizeLimit = (value, fallback = 20, max = 100) => Math.min(max, Math.max(1, parseInt(value, 10) || fallback));
 
+const getAdminActor = (req) => ({
+  username: req.user?.username || 'admin',
+  role: req.user?.adminRole || 'admin'
+});
+
+const parsePositiveInt = (value, fallback = 0) => {
+  const parsed = parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const normalizeDurationMinutes = ({ durationMinutes, durationHours, fallback = 360 } = {}) => {
+  const fromMinutes = parsePositiveInt(durationMinutes, 0);
+  const fromHours = Number(durationHours);
+  const minutes = fromMinutes || (Number.isFinite(fromHours) && fromHours > 0 ? Math.round(fromHours * 60) : fallback);
+  return Math.min(43200, Math.max(30, minutes));
+};
+
+const buildDeliveryTimelineEntry = (type, {
+  views = 0,
+  campaign,
+  reason = '',
+  message = '',
+  previousValue = null,
+  newValue = null,
+  actor
+} = {}) => ({
+  type,
+  views,
+  deliveredViews: Number(campaign?.manualDelivery?.deliveredViews || 0),
+  remainingViews: Number(campaign?.manualDelivery?.remainingViews ?? campaign?.remainingReach ?? 0),
+  progress: Number(campaign?.manualDelivery?.deliveryPercent || 0),
+  reason: String(reason || '').slice(0, 500),
+  message,
+  previousValue,
+  newValue,
+  actor: actor || { username: 'system', role: 'system' },
+  createdAt: new Date()
+});
+
 // Get dashboard stats
 const getDashboardStats = async (req, res) => {
   try {
@@ -57,7 +100,7 @@ const getDashboardStats = async (req, res) => {
     const since24h = new Date(now - dayMs);
     const since30d = new Date(now - (30 * dayMs));
 
-    await Promise.all((await BoostCampaign.find({ deliveryMode: 'manual', status: 'running' }).limit(50)).map(applyManualDeliveryProgress));
+    await processDueManualBoostDeliveries({ limit: 50 });
 
     const [
       totalUsers,
@@ -70,6 +113,7 @@ const getDashboardStats = async (req, res) => {
       pendingHostRequests,
       liveTournaments,
       totalRecruitments,
+      totalTournaments,
       totalPosts,
       clips,
       stories,
@@ -101,6 +145,7 @@ const getDashboardStats = async (req, res) => {
       countSafe(HostVerificationApplication, { status: 'pending' }),
       countSafe(Tournament, { status: { $in: ['Ongoing', 'ongoing', 'active', 'live'] } }),
       countSafe(TeamRecruitment, { isActive: true }),
+      countSafe(Tournament),
       countSafe(Post, { isActive: { $ne: false } }),
       countSafe(Post, { isActive: { $ne: false }, 'content.media.type': 'video' }),
       countSafe(Story),
@@ -1688,13 +1733,12 @@ const getBoostCampaigns = async (req, res) => {
     if (userId && mongoose.Types.ObjectId.isValid(userId)) query.user = userId;
     if (postId && mongoose.Types.ObjectId.isValid(postId)) query.post = postId;
 
-    const campaignsToProgress = await BoostCampaign.find({ ...query, deliveryMode: 'manual', status: 'running' }).limit(limit);
-    await Promise.all(campaignsToProgress.map(applyManualDeliveryProgress));
+    await processDueManualBoostDeliveries({ limit: 100 });
 
     const [campaigns, total] = await Promise.all([
       BoostCampaign.find(query)
         .populate('user', 'username profile.displayName profile.avatar email')
-        .populate('post', 'content.text content.media metrics views')
+        .populate('post', 'content.text content.media metrics views postType boostMeta')
         .sort({ createdAt: -1 })
         .skip((page - 1) * limit)
         .limit(limit)
@@ -1722,56 +1766,103 @@ const getBoostCampaigns = async (req, res) => {
 const configureBoostDelivery = async (req, res) => {
   try {
     const { campaignId } = req.params;
-    const { durationHours = 6, targetViews } = req.body || {};
-    const duration = Math.min(720, Math.max(1, Number(durationHours) || 6));
+    const {
+      durationHours,
+      durationMinutes,
+      targetViews,
+      totalReach,
+      startImmediately = true,
+      scheduledStartAt,
+      reason = ''
+    } = req.body || {};
+    const duration = normalizeDurationMinutes({ durationMinutes, durationHours, fallback: 360 });
     const campaign = await BoostCampaign.findById(campaignId);
     if (!campaign) return res.status(404).json({ success: false, message: 'Boost campaign not found' });
     if (campaign.status === 'cancelled' || campaign.status === 'rejected') {
       return res.status(400).json({ success: false, message: `Cannot deliver a ${campaign.status} campaign` });
     }
 
-    const purchased = Number(campaign.purchasedReach) || Number(campaign.estimatedReach) || Number(targetViews) || 0;
-    const requestedTarget = Number(targetViews) || purchased;
-    const target = Math.max(1, Math.min(requestedTarget, purchased || requestedTarget));
+    const before = campaign.toObject();
+    const purchased = Number(campaign.purchasedReach) || Number(campaign.estimatedReach) || Number(targetViews) || Number(totalReach) || 0;
+    const requestedTarget = Number(totalReach || targetViews) || purchased;
+    const deliveredViews = Math.max(0, Number(campaign.manualDelivery?.deliveredViews || 0));
+    const target = Math.max(deliveredViews, Math.min(Math.max(1, requestedTarget), Math.max(purchased, requestedTarget)));
     const now = new Date();
-    const endsAt = new Date(now.getTime() + (duration * 60 * 60 * 1000));
+    const scheduled = startImmediately
+      ? now
+      : (scheduledStartAt ? new Date(scheduledStartAt) : now);
+    if (!startImmediately && (!Number.isFinite(scheduled.getTime()) || scheduled.getTime() < now.getTime() - 60000)) {
+      return res.status(400).json({ success: false, message: 'Scheduled start time must be in the future' });
+    }
+    const endsAt = new Date(scheduled.getTime() + (duration * 60 * 1000));
+    const nextStatus = scheduled.getTime() > now.getTime() ? 'scheduled' : 'running';
+    const remainingViews = Math.max(0, target - deliveredViews);
+    const deliveryPercent = target > 0 ? Math.min(100, Math.round((deliveredViews / target) * 10000) / 100) : 0;
+    const actor = getAdminActor(req);
 
     campaign.deliveryMode = 'manual';
-    campaign.status = 'running';
-    campaign.startTime = campaign.startTime || now;
+    campaign.status = nextStatus === 'scheduled' ? 'running' : 'running';
+    campaign.startTime = nextStatus === 'running' ? (campaign.startTime || now) : campaign.startTime;
     campaign.endTime = endsAt;
-    campaign.remainingReach = target;
+    campaign.remainingReach = remainingViews;
     campaign.manualDelivery = {
+      ...(campaign.manualDelivery?.toObject ? campaign.manualDelivery.toObject() : campaign.manualDelivery || {}),
       enabled: true,
-      durationHours: duration,
-      startedAt: now,
+      status: nextStatus,
+      durationHours: Math.round((duration / 60) * 100) / 100,
+      durationMinutes: duration,
+      scheduledStartAt: scheduled,
+      startedAt: nextStatus === 'running' ? (campaign.manualDelivery?.startedAt || now) : null,
       endsAt,
+      actualCompletedAt: null,
+      pausedAt: null,
       lastAppliedAt: now,
-      deliveredViews: 0,
+      lastDeliveryBucket: undefined,
+      deliveredViews,
       targetViews: target,
-      remainingViews: target,
-      deliveryPercent: 0,
-      estimatedCompletionAt: endsAt
+      remainingViews,
+      deliveryPercent,
+      deliverySpeedPerHour: 0,
+      estimatedCompletionAt: endsAt,
+      timeline: [
+        ...(campaign.manualDelivery?.timeline || []),
+        buildDeliveryTimelineEntry(nextStatus === 'scheduled' ? 'scheduled' : 'configured', {
+          campaign,
+          reason,
+          message: nextStatus === 'scheduled' ? 'Manual delivery scheduled.' : 'Manual delivery configured.',
+          previousValue: {
+            targetViews: before.manualDelivery?.targetViews,
+            durationMinutes: before.manualDelivery?.durationMinutes,
+            scheduledStartAt: before.manualDelivery?.scheduledStartAt,
+            status: before.manualDelivery?.status
+          },
+          newValue: { targetViews: target, durationMinutes: duration, scheduledStartAt: scheduled, status: nextStatus },
+          actor
+        })
+      ].slice(-200)
     };
     await campaign.save();
 
     await Post.findByIdAndUpdate(campaign.post, {
-      boostedAt: now,
+      boostedAt: nextStatus === 'running' ? now : campaign.boostedAt,
       boostExpiresAt: endsAt,
       boostMeta: {
         activeCampaign: campaign._id,
-        status: 'running',
+        status: nextStatus,
         budget: campaign.budget,
         estimatedReach: campaign.estimatedReach,
         purchasedReach: campaign.purchasedReach,
-        remainingReach: target,
+        remainingReach: remainingViews,
         dailySpend: campaign.dailySpend,
         totalSpend: campaign.totalSpend,
-        startTime: campaign.startTime,
+        startTime: nextStatus === 'running' ? (campaign.startTime || now) : scheduled,
         endTime: endsAt,
         targetAudience: campaign.targetAudience
       }
     });
+
+    res.locals.auditBefore = before;
+    res.locals.auditAfter = campaign.toObject();
 
     res.json({
       success: true,
@@ -1824,6 +1915,200 @@ const updateBoostCampaignStatus = async (req, res) => {
   }
 };
 
+const controlBoostDelivery = async (req, res) => {
+  try {
+    const { campaignId } = req.params;
+    const { action, reason = '', durationMinutes, durationHours } = req.body || {};
+    const allowed = ['pause', 'resume', 'stop', 'restart', 'cancel', 'complete'];
+    if (!allowed.includes(action)) {
+      return res.status(400).json({ success: false, message: 'Invalid delivery action' });
+    }
+
+    let campaign = await BoostCampaign.findById(campaignId);
+    if (!campaign) return res.status(404).json({ success: false, message: 'Boost campaign not found' });
+    campaign = await processSingleManualBoostCampaign(campaign, { actor: getAdminActor(req) });
+    campaign = await BoostCampaign.findById(campaignId);
+    if (!campaign) return res.status(404).json({ success: false, message: 'Boost campaign not found' });
+
+    const before = campaign.toObject();
+    const now = new Date();
+    const actor = getAdminActor(req);
+    const update = { $set: {}, $push: { 'manualDelivery.timeline': { $each: [], $slice: -200 } } };
+    const remainingViews = Math.max(0, Number(campaign.manualDelivery?.remainingViews ?? campaign.remainingReach ?? 0));
+    const deliveredViews = Math.max(0, Number(campaign.manualDelivery?.deliveredViews || 0));
+    const targetViews = Math.max(deliveredViews, Number(campaign.manualDelivery?.targetViews || campaign.purchasedReach || deliveredViews));
+
+    if (action === 'pause') {
+      if (!['running', 'scheduled'].includes(campaign.manualDelivery?.status)) {
+        return res.status(400).json({ success: false, message: 'Only running or scheduled delivery can be paused' });
+      }
+      update.$set.status = 'paused';
+      update.$set['manualDelivery.status'] = 'paused';
+      update.$set['manualDelivery.pausedAt'] = now;
+      update.$set['manualDelivery.lastAppliedAt'] = now;
+      update.$push['manualDelivery.timeline'].$each.push(buildDeliveryTimelineEntry('paused', { campaign, reason, message: 'Delivery paused.', actor }));
+    } else if (action === 'resume') {
+      if (campaign.manualDelivery?.status !== 'paused') {
+        return res.status(400).json({ success: false, message: 'Only paused delivery can be resumed' });
+      }
+      const pausedAt = campaign.manualDelivery?.pausedAt ? new Date(campaign.manualDelivery.pausedAt).getTime() : now.getTime();
+      const pausedMs = Math.max(0, now.getTime() - pausedAt);
+      const previousEnd = campaign.manualDelivery?.endsAt ? new Date(campaign.manualDelivery.endsAt) : now;
+      const nextEnd = new Date(previousEnd.getTime() + pausedMs);
+      update.$set.status = 'running';
+      update.$set['manualDelivery.status'] = 'running';
+      update.$set['manualDelivery.pausedAt'] = null;
+      update.$set['manualDelivery.pausedAccumulatedMs'] = Number(campaign.manualDelivery?.pausedAccumulatedMs || 0) + pausedMs;
+      update.$set['manualDelivery.endsAt'] = nextEnd;
+      update.$set['manualDelivery.estimatedCompletionAt'] = nextEnd;
+      update.$set.endTime = nextEnd;
+      update.$push['manualDelivery.timeline'].$each.push(buildDeliveryTimelineEntry('resumed', { campaign, reason, message: 'Delivery resumed.', previousValue: { endsAt: previousEnd }, newValue: { endsAt: nextEnd }, actor }));
+    } else if (action === 'stop') {
+      update.$set.status = 'paused';
+      update.$set['manualDelivery.status'] = 'stopped';
+      update.$set['manualDelivery.lastAppliedAt'] = now;
+      update.$push['manualDelivery.timeline'].$each.push(buildDeliveryTimelineEntry('stopped', { campaign, reason, message: 'Delivery stopped by admin.', actor }));
+    } else if (action === 'cancel') {
+      update.$set.status = 'cancelled';
+      update.$set.remainingReach = 0;
+      update.$set['manualDelivery.status'] = 'cancelled';
+      update.$set['manualDelivery.remainingViews'] = 0;
+      update.$set['manualDelivery.actualCompletedAt'] = now;
+      update.$push['manualDelivery.timeline'].$each.push(buildDeliveryTimelineEntry('cancelled', { campaign, reason, message: 'Delivery cancelled by admin.', actor }));
+    } else if (action === 'complete') {
+      const delta = remainingViews;
+      update.$set.status = 'completed';
+      update.$set.remainingReach = 0;
+      update.$set['manualDelivery.status'] = 'completed';
+      update.$set['manualDelivery.deliveredViews'] = targetViews;
+      update.$set['manualDelivery.remainingViews'] = 0;
+      update.$set['manualDelivery.deliveryPercent'] = 100;
+      update.$set['manualDelivery.actualCompletedAt'] = now;
+      update.$set['analytics.boostViews'] = targetViews;
+      update.$set['analytics.boostReach'] = Math.max(Number(campaign.analytics?.boostReach || 0), targetViews);
+      update.$push['manualDelivery.timeline'].$each.push(buildDeliveryTimelineEntry('completed', { campaign, reason, views: delta, message: 'Delivery completed early by admin.', newValue: { deliveredViews: targetViews }, actor }));
+      if (delta > 0) {
+        await Post.updateOne(
+          { _id: campaign.post },
+          {
+            $inc: { views: delta, 'metrics.boostViews': delta, 'metrics.boostReach': delta },
+            $set: { 'boostMeta.remainingReach': 0, 'boostMeta.status': 'completed' }
+          }
+        );
+      }
+    } else if (action === 'restart') {
+      const duration = normalizeDurationMinutes({ durationMinutes, durationHours, fallback: campaign.manualDelivery?.durationMinutes || 360 });
+      const endsAt = new Date(now.getTime() + (duration * 60000));
+      update.$set.status = 'running';
+      update.$set.remainingReach = remainingViews;
+      update.$set.startTime = now;
+      update.$set.endTime = endsAt;
+      update.$set['manualDelivery.status'] = 'running';
+      update.$set['manualDelivery.scheduledStartAt'] = now;
+      update.$set['manualDelivery.startedAt'] = now;
+      update.$set['manualDelivery.endsAt'] = endsAt;
+      update.$set['manualDelivery.durationMinutes'] = duration;
+      update.$set['manualDelivery.durationHours'] = Math.round((duration / 60) * 100) / 100;
+      update.$set['manualDelivery.lastDeliveryBucket'] = null;
+      update.$set['manualDelivery.actualCompletedAt'] = null;
+      update.$set['manualDelivery.estimatedCompletionAt'] = endsAt;
+      update.$push['manualDelivery.timeline'].$each.push(buildDeliveryTimelineEntry('restarted', { campaign, reason, message: 'Delivery restarted by admin.', newValue: { durationMinutes: duration, endsAt }, actor }));
+    }
+
+    const updated = await BoostCampaign.findByIdAndUpdate(campaignId, update, { new: true });
+    await Post.updateOne(
+      { _id: campaign.post, 'boostMeta.activeCampaign': campaign._id },
+      {
+        $set: {
+          'boostMeta.status': updated.manualDelivery?.status || updated.status,
+          'boostMeta.remainingReach': updated.remainingReach,
+          'boostMeta.endTime': updated.endTime,
+          boostExpiresAt: updated.endTime
+        }
+      }
+    );
+
+    res.locals.auditBefore = before;
+    res.locals.auditAfter = updated.toObject();
+    res.json({ success: true, message: 'Boost delivery updated', data: { campaign: updated } });
+  } catch (error) {
+    log.error('Control boost delivery error:', { error: String(error) });
+    res.status(500).json({ success: false, message: 'Failed to update boost delivery' });
+  }
+};
+
+const adjustBoostDelivery = async (req, res) => {
+  try {
+    const { campaignId } = req.params;
+    const { remainingDelta = 0, targetReach, durationDeltaMinutes = 0, reason = '' } = req.body || {};
+    let campaign = await BoostCampaign.findById(campaignId);
+    if (!campaign) return res.status(404).json({ success: false, message: 'Boost campaign not found' });
+    campaign = await processSingleManualBoostCampaign(campaign, { actor: getAdminActor(req) });
+    campaign = await BoostCampaign.findById(campaignId);
+    if (!campaign) return res.status(404).json({ success: false, message: 'Boost campaign not found' });
+
+    const before = campaign.toObject();
+    const deliveredViews = Math.max(0, Number(campaign.manualDelivery?.deliveredViews || 0));
+    const currentTarget = Math.max(deliveredViews, Number(campaign.manualDelivery?.targetViews || campaign.purchasedReach || deliveredViews));
+    const explicitTarget = Number(targetReach);
+    const nextTarget = Number.isFinite(explicitTarget) && explicitTarget > 0
+      ? Math.max(deliveredViews, Math.floor(explicitTarget))
+      : Math.max(deliveredViews, currentTarget + Math.floor(Number(remainingDelta) || 0));
+    const nextRemaining = Math.max(0, nextTarget - deliveredViews);
+    const progress = nextTarget > 0 ? Math.min(100, Math.round((deliveredViews / nextTarget) * 10000) / 100) : 0;
+    const durationDelta = Math.floor(Number(durationDeltaMinutes) || 0);
+    const currentEndsAt = campaign.manualDelivery?.endsAt ? new Date(campaign.manualDelivery.endsAt) : (campaign.endTime || new Date());
+    const nextEndsAt = durationDelta ? new Date(currentEndsAt.getTime() + (durationDelta * 60000)) : currentEndsAt;
+
+    const update = {
+      $set: {
+        remainingReach: nextRemaining,
+        endTime: nextEndsAt,
+        'manualDelivery.targetViews': nextTarget,
+        'manualDelivery.remainingViews': nextRemaining,
+        'manualDelivery.deliveryPercent': progress,
+        'manualDelivery.endsAt': nextEndsAt,
+        'manualDelivery.estimatedCompletionAt': nextEndsAt,
+        'manualDelivery.lastDeliveryBucket': null
+      },
+      $push: {
+        'manualDelivery.timeline': {
+          $each: [
+            buildDeliveryTimelineEntry('adjusted', {
+              campaign,
+              reason,
+              message: 'Delivery configuration adjusted by admin.',
+              previousValue: { targetViews: currentTarget, remainingViews: currentTarget - deliveredViews, endsAt: currentEndsAt },
+              newValue: { targetViews: nextTarget, remainingViews: nextRemaining, endsAt: nextEndsAt },
+              actor: getAdminActor(req)
+            })
+          ],
+          $slice: -200
+        }
+      }
+    };
+
+    const updated = await BoostCampaign.findByIdAndUpdate(campaignId, update, { new: true });
+    await Post.updateOne(
+      { _id: campaign.post, 'boostMeta.activeCampaign': campaign._id },
+      {
+        $set: {
+          'boostMeta.remainingReach': nextRemaining,
+          'boostMeta.endTime': nextEndsAt,
+          boostExpiresAt: nextEndsAt
+        }
+      }
+    );
+
+    res.locals.auditBefore = before;
+    res.locals.auditAfter = updated.toObject();
+    res.json({ success: true, message: 'Boost delivery adjusted', data: { campaign: updated } });
+  } catch (error) {
+    log.error('Adjust boost delivery error:', { error: String(error) });
+    res.status(500).json({ success: false, message: 'Failed to adjust boost delivery' });
+  }
+};
+
 module.exports = {
   getDashboardStats,
   getUserAnalytics,
@@ -1864,5 +2149,7 @@ module.exports = {
   removePremium,
   getBoostCampaigns,
   configureBoostDelivery,
+  controlBoostDelivery,
+  adjustBoostDelivery,
   updateBoostCampaignStatus
 };

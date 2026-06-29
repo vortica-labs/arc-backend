@@ -27,9 +27,13 @@ router.get("/tournaments", auditLog("VIEW_TOURNAMENTS"), requireAdminPermission(
 router.delete("/tournaments/:tournamentId", auditLog("DELETE_TOURNAMENT"), requireAdminPermission("tournaments:manage"), adminController.deleteTournament);
 router.get("/reports", auditLog("VIEW_REPORTS"), requireAdminPermission("reports:manage"), adminController.getReports);
 router.put("/reports/:reportId", auditLog("UPDATE_REPORT"), requireAdminPermission("reports:manage"), adminController.updateReport);
-router.get("/boost-campaigns", auditLog("VIEW_BOOST_CAMPAIGNS"), requireAdminPermission("boosts:read"), adminController.getBoostCampaigns);
-router.post("/boost-campaigns/:campaignId/manual-delivery", auditLog("CONFIGURE_BOOST_DELIVERY"), requireAdminPermission("boosts:manage"), adminController.configureBoostDelivery);
-router.put("/boost-campaigns/:campaignId/status", auditLog("UPDATE_BOOST_STATUS"), requireAdminPermission("boosts:manage"), adminController.updateBoostCampaignStatus);
+router.get("/boost-campaigns", auditLog("VIEW_BOOST_CAMPAIGNS"), requireAdminPermission("boost_delivery:read"), adminController.getBoostCampaigns);
+router.get("/boost-delivery", auditLog("VIEW_BOOST_DELIVERY"), requireAdminPermission("boost_delivery:read"), adminController.getBoostCampaigns);
+router.post("/boost-campaigns/:campaignId/manual-delivery", auditLog("CONFIGURE_BOOST_DELIVERY"), requireAdminPermission("boost_delivery:manage"), adminController.configureBoostDelivery);
+router.post("/boost-campaigns/:campaignId/delivery/configure", auditLog("CONFIGURE_BOOST_DELIVERY"), requireAdminPermission("boost_delivery:manage"), adminController.configureBoostDelivery);
+router.post("/boost-campaigns/:campaignId/delivery/control", auditLog("CONTROL_BOOST_DELIVERY"), requireAdminPermission("boost_delivery:manage"), adminController.controlBoostDelivery);
+router.patch("/boost-campaigns/:campaignId/delivery/adjust", auditLog("ADJUST_BOOST_DELIVERY"), requireAdminPermission("boost_delivery:manage"), adminController.adjustBoostDelivery);
+router.put("/boost-campaigns/:campaignId/status", auditLog("UPDATE_BOOST_STATUS"), requireAdminPermission("boost_delivery:manage"), adminController.updateBoostCampaignStatus);
 router.get("/monetization/applications", auditLog("VIEW_MONETIZATION_APPLICATIONS"), requireAdminPermission("monetization:manage"), adminController.getMonetizationApplications);
 router.post("/monetization/applications/:applicationId/approve", auditLog("APPROVE_MONETIZATION"), requireAdminPermission("monetization:manage"), adminController.approveMonetizationApplication);
 router.post("/monetization/applications/:applicationId/reject", auditLog("REJECT_MONETIZATION"), requireAdminPermission("monetization:manage"), adminController.rejectMonetizationApplication);

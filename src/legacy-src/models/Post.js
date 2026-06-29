@@ -165,7 +165,7 @@ const postSchema = new mongoose.Schema({
     },
     status: {
       type: String,
-      enum: ['pending', 'running', 'paused', 'completed', 'cancelled', 'rejected'],
+      enum: ['pending', 'scheduled', 'running', 'paused', 'stopped', 'completed', 'cancelled', 'rejected'],
       default: undefined
     },
     budget: { type: Number, default: 0 },

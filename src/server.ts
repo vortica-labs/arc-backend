@@ -63,6 +63,11 @@ const bootstrap = async () => {
   const payoutCron = safeRequire<{ startPayoutCrons?: () => void }>(path.join(backendRootPath, "jobs", "payoutCron.js"));
   payoutCron?.startPayoutCrons?.();
 
+  const boostDeliveryCron = safeRequire<{ startBoostDeliveryCron?: () => void }>(
+    path.join(backendRootPath, "jobs", "boostDeliveryCron.js")
+  );
+  boostDeliveryCron?.startBoostDeliveryCron?.();
+
   httpServer.listen(env.PORT, () => {
     logger.info("Server started", {
       port: env.PORT,

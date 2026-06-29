@@ -3,10 +3,10 @@ const AdminAuditLog = require('../models/AdminAuditLog');
 
 const ROLE_PERMISSIONS = {
   super_admin: ['*'],
-  admin: ['dashboard:read', 'users:manage', 'content:manage', 'reports:manage', 'hosts:manage', 'boosts:manage', 'monetization:manage', 'analytics:read', 'audit:read'],
+  admin: ['dashboard:read', 'users:manage', 'content:manage', 'reports:manage', 'hosts:manage', 'boosts:manage', 'boost_delivery:manage', 'monetization:manage', 'analytics:read', 'audit:read'],
   moderator: ['dashboard:read', 'content:manage', 'reports:manage', 'users:read'],
   support: ['dashboard:read', 'users:read', 'reports:read', 'feedback:manage'],
-  finance: ['dashboard:read', 'payments:read', 'boosts:read', 'monetization:manage'],
+  finance: ['dashboard:read', 'payments:read', 'boosts:read', 'boost_delivery:manage', 'monetization:manage'],
   tournament_manager: ['dashboard:read', 'tournaments:manage', 'hosts:read'],
   content_moderator: ['dashboard:read', 'content:manage', 'reports:manage'],
   creator_manager: ['dashboard:read', 'monetization:manage', 'analytics:read']
