@@ -1,12 +1,15 @@
 const Tournament = require('../models/Tournament');
 const User = require('../models/User');
 const Notification = require('../models/Notification');
+const TournamentHostActiveLock = require('../models/TournamentHostActiveLock');
 const { emitNotification } = require('../utils/notificationEmitter');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const log = require('../utils/logger');
 const { normalizeQuerySearch, buildPrefixRegex } = require('../utils/searchQuery');
+const { getRedisClient } = require('../utils/redisCache');
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
@@ -100,9 +103,84 @@ const checkAndMarkCompletedTournaments = async (tournament) => {
       { $set: { status: 'Completed' } }
     );
     tournament.status = 'Completed';
+    await releaseHostActiveTournament(tournament.host, tournament._id);
   }
   
   return tournament;
+};
+
+const ACTIVE_TOURNAMENT_STATUSES = ['Upcoming', 'Registration Open', 'Ongoing'];
+
+const normalizePrizePoolType = (value) => (
+  value === 'no_prize' ? 'without_prize' : (value || 'without_prize')
+);
+
+const getFreshHostPermissions = async (hostId) => {
+  const host = await User.findById(hostId).select('isVerifiedHost').lean();
+  return {
+    exists: Boolean(host),
+    isVerifiedHost: host?.isVerifiedHost === true
+  };
+};
+
+const getActiveTournamentForHost = async (hostId, excludeTournamentId = null) => {
+  const query = {
+    host: hostId,
+    status: { $in: ACTIVE_TOURNAMENT_STATUSES }
+  };
+  if (excludeTournamentId) query._id = { $ne: excludeTournamentId };
+  return Tournament.findOne(query).select('_id name status').lean();
+};
+
+const releaseHostActiveTournament = async (hostId, tournamentId) => {
+  if (!hostId || !tournamentId) return;
+  await TournamentHostActiveLock.deleteOne({ host: hostId, tournament: tournamentId });
+};
+
+const reserveHostActiveTournament = async (hostId, tournamentId) => {
+  try {
+    await TournamentHostActiveLock.create({ host: hostId, tournament: tournamentId });
+    return { ok: true };
+  } catch (error) {
+    if (error?.code !== 11000) throw error;
+
+    const existingLock = await TournamentHostActiveLock.findOne({ host: hostId }).lean();
+    if (!existingLock?.tournament) {
+      await TournamentHostActiveLock.deleteOne({ host: hostId });
+      return reserveHostActiveTournament(hostId, tournamentId);
+    }
+
+    const lockedTournament = await Tournament.findById(existingLock.tournament).select('_id name status').lean();
+    if (!lockedTournament || !ACTIVE_TOURNAMENT_STATUSES.includes(lockedTournament.status)) {
+      await TournamentHostActiveLock.deleteOne({ host: hostId, tournament: existingLock.tournament });
+      return reserveHostActiveTournament(hostId, tournamentId);
+    }
+
+    return { ok: false, activeTournament: lockedTournament };
+  }
+};
+
+const acquireHostTournamentCreateLock = async (hostId) => {
+  const redis = getRedisClient();
+  if (!redis) return null;
+  const key = `lock:tournament:create:${hostId}`;
+  const token = crypto.randomBytes(12).toString('hex');
+  try {
+    const result = await redis.set(key, token, { NX: true, EX: 20 });
+    return result === 'OK' ? { key, token } : false;
+  } catch {
+    return null;
+  }
+};
+
+const releaseHostTournamentCreateLock = async (lock) => {
+  if (!lock) return;
+  const redis = getRedisClient();
+  if (!redis) return;
+  try {
+    const current = await redis.get(lock.key);
+    if (current === lock.token) await redis.del(lock.key);
+  } catch {}
 };
 
 // ─── Tournament History Helper Functions ────────────────────────────────────
@@ -329,7 +407,6 @@ const createTournament = async (req, res) => {
         location,
         timezone,
         prizePool,
-        entryFee,
         totalSlots,
         teamsPerGroup,
         numberOfGroups,
@@ -344,12 +421,9 @@ const createTournament = async (req, res) => {
     const validGames = ['BGMI', 'Valorant', 'Free Fire', 'Call of Duty Mobile'];
     const validModes = ['Battle Royale', 'Deathmatch', '5v5', 'Solo'];
     const validFormats = ['Solo', 'Duo', 'Squad', '5v5'];
-    const normalizedPrizePoolType = prizePoolType === 'no_prize' ? 'without_prize' : (prizePoolType || 'without_prize');
+    const normalizedPrizePoolType = normalizePrizePoolType(prizePoolType);
     const parsedPrizePool = prizePool !== undefined && String(prizePool).trim() !== ''
       ? parseFloat(prizePool)
-      : 0;
-    const parsedEntryFee = entryFee !== undefined && String(entryFee).trim() !== ''
-      ? parseFloat(entryFee)
       : 0;
     const parsedTotalSlots = parseInt(totalSlots, 10);
     const parsedTeamsPerGroup = parseInt(teamsPerGroup, 10);
@@ -404,10 +478,6 @@ const createTournament = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid tournament prize type' });
     }
 
-    if (Number.isNaN(parsedEntryFee) || parsedEntryFee < 0) {
-      return res.status(400).json({ success: false, message: 'Entry fee cannot be negative' });
-    }
-
     // Validate dates
     const now = new Date();
     
@@ -450,29 +520,43 @@ const createTournament = async (req, res) => {
       });
     }
 
-    // Enforce isVerifiedHost for prize pool tournaments
-    if (normalizedPrizePoolType === 'with_prize' && req.user.isVerifiedHost !== true) {
+    const hostPermissions = await getFreshHostPermissions(hostId);
+    if (!hostPermissions.exists) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authenticated user not found'
+      });
+    }
+
+    const createLock = hostPermissions.isVerifiedHost
+      ? null
+      : await acquireHostTournamentCreateLock(hostId);
+    if (createLock === false) {
+      return res.status(409).json({
+        success: false,
+        message: 'A tournament creation request is already in progress. Please wait a moment and try again.'
+      });
+    }
+
+    // Enforce isVerifiedHost for prize pool tournaments using fresh DB state.
+    if (normalizedPrizePoolType === 'with_prize' && hostPermissions.isVerifiedHost !== true) {
+      await releaseHostTournamentCreateLock(createLock);
       return res.status(403).json({
         success: false,
         message: 'You are not authorized to host prize pool tournaments. Please apply for Verified Host status.'
       });
     }
 
-    // ── Weekly limit for unverified hosts (1 tournament per 7 days) ──
-    if (!req.user.isVerifiedHost) {
-      const oneWeekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-      const recentTournament = await Tournament.findOne({
-        host: hostId,
-        createdAt: { $gte: oneWeekAgo }
-      }).sort({ createdAt: -1 }).select('createdAt').lean();
-
-      if (recentTournament) {
-        const nextAllowed = new Date(recentTournament.createdAt.getTime() + 7 * 24 * 60 * 60 * 1000);
-        return res.status(429).json({
+    // Normal users can host only one active fun tournament at a time.
+    if (!hostPermissions.isVerifiedHost) {
+      const activeTournament = await getActiveTournamentForHost(hostId);
+      if (activeTournament) {
+        await releaseHostTournamentCreateLock(createLock);
+        return res.status(409).json({
           success: false,
-          message: 'Weekly tournament limit reached.',
-          limitType: 'tournament_weekly',
-          nextAllowedAt: nextAllowed.toISOString(),
+          message: 'You already have an active tournament. Complete or cancel it before creating another one.',
+          limitType: 'active_tournament',
+          activeTournamentId: activeTournament._id,
           upgradeMessage: 'Get Verified Host status to host unlimited tournaments.'
         });
       }
@@ -480,6 +564,7 @@ const createTournament = async (req, res) => {
 
     // Validate prize pool for prize tournaments
     if (normalizedPrizePoolType === 'with_prize' && (Number.isNaN(parsedPrizePool) || parsedPrizePool < 100)) {
+      await releaseHostTournamentCreateLock(createLock);
       return res.status(400).json({
         success: false,
         message: 'Prize pool must be at least ₹100 for prize tournaments'
@@ -503,7 +588,6 @@ const createTournament = async (req, res) => {
       location: location || 'Online',
       timezone: timezone || 'UTC',
       prizePool: normalizedPrizePoolType === 'with_prize' ? parsedPrizePool : 0,
-      entryFee: parsedEntryFee,
       totalSlots: parsedTotalSlots,
       teamsPerGroup: parsedTeamsPerGroup,
       numberOfGroups: parsedNumberOfGroups,
@@ -518,7 +602,22 @@ const createTournament = async (req, res) => {
       status: 'Upcoming'
     };
 
-    const tournament = await Tournament.create(tournamentData);
+    const tournament = new Tournament(tournamentData);
+    let activeTournamentReserved = false;
+    if (!hostPermissions.isVerifiedHost) {
+      const reservation = await reserveHostActiveTournament(hostId, tournament._id);
+      if (!reservation.ok) {
+        await releaseHostTournamentCreateLock(createLock);
+        return res.status(409).json({
+          success: false,
+          message: 'You already have an active tournament. Complete or cancel it before creating another one.',
+          limitType: 'active_tournament',
+          activeTournamentId: reservation.activeTournament?._id,
+          upgradeMessage: 'Get Verified Host status to host unlimited tournaments.'
+        });
+      }
+      activeTournamentReserved = true;
+    }
     
     // Calculate number of groups based on totalSlots and teamsPerGroup
     const calculatedGroups = parsedNumberOfGroups;
@@ -555,7 +654,16 @@ const createTournament = async (req, res) => {
     // Update tournament with groups and broadcast channels
     tournament.groups = groups;
     tournament.broadcastChannels = broadcastChannels;
-    await tournament.save();
+    try {
+      await tournament.save();
+    } catch (saveError) {
+      if (activeTournamentReserved) {
+        await releaseHostActiveTournament(hostId, tournament._id);
+      }
+      throw saveError;
+    } finally {
+      await releaseHostTournamentCreateLock(createLock);
+    }
     if (process.env.NODE_ENV === 'development') { console.log('Tournament saved with groups and channels');
     }
     // Populate host info
@@ -1057,7 +1165,7 @@ const updateTournament = async (req, res) => {
           'name', 'description', 'game', 'format', 'mode', 'status',
           'registrationStartDate', 'registrationEndDate', 'tournamentStartDate', 'tournamentEndDate',
           'startDate', 'endDate', 'registrationDeadline', 'location', 'timezone',
-          'prizePool', 'entryFee', 'prizePoolCurrency', 'totalSlots', 'teamsPerGroup',
+          'prizePool', 'prizePoolCurrency', 'totalSlots', 'teamsPerGroup',
           'numberOfGroups', 'totalRounds', 'prizePoolType', 'prizeDistribution', 'specialPrizes', 'rules', 'banner'
         ];
         const updateData = {};
@@ -1117,29 +1225,22 @@ const updateTournament = async (req, res) => {
         if (Number.isNaN(nextTotalRounds) || nextTotalRounds < 1 || nextTotalRounds > 10) {
           return res.status(400).json({ success: false, message: 'Total rounds must be between 1 and 10' });
         }
-        const nextEntryFee = updateData.entryFee !== undefined
-          ? parseFloat(updateData.entryFee)
-          : (tournament.entryFee || 0);
         const nextPrizePool = updateData.prizePool !== undefined
           ? parseFloat(updateData.prizePool)
           : (tournament.prizePool || 0);
         const nextNumberOfGroups = updateData.numberOfGroups !== undefined
           ? parseInt(updateData.numberOfGroups, 10)
           : Math.ceil(nextTotalSlots / nextTeamsPerGroup);
-        if (Number.isNaN(nextEntryFee) || nextEntryFee < 0) {
-          return res.status(400).json({ success: false, message: 'Entry fee cannot be negative' });
-        }
         if (Number.isNaN(nextNumberOfGroups) || nextNumberOfGroups < 1) {
           return res.status(400).json({ success: false, message: 'At least one group is required' });
         }
-        const nextPrizePoolType = updateData.prizePoolType === 'no_prize'
-          ? 'without_prize'
-          : updateData.prizePoolType || tournament.prizePoolType;
+        const nextPrizePoolType = normalizePrizePoolType(updateData.prizePoolType || tournament.prizePoolType);
         if (!['with_prize', 'without_prize'].includes(nextPrizePoolType)) {
           return res.status(400).json({ success: false, message: 'Invalid tournament prize type' });
         }
         updateData.prizePoolType = nextPrizePoolType;
-        if (nextPrizePoolType === 'with_prize' && req.user.isVerifiedHost !== true) {
+        const hostPermissions = await getFreshHostPermissions(req.user._id);
+        if (nextPrizePoolType === 'with_prize' && hostPermissions.isVerifiedHost !== true) {
           return res.status(403).json({
             success: false,
             message: 'You are not authorized to host prize pool tournaments. Please apply for Verified Host status.'
@@ -1169,10 +1270,13 @@ const updateTournament = async (req, res) => {
         updateData.teamsPerGroup = nextTeamsPerGroup;
         updateData.numberOfGroups = nextNumberOfGroups;
         updateData.totalRounds = nextTotalRounds;
-        updateData.entryFee = nextEntryFee;
         updateData.prizePool = nextPrizePoolType === 'with_prize'
           ? nextPrizePool
           : 0;
+        if (nextPrizePoolType !== 'with_prize') {
+          updateData.prizeDistribution = [];
+          updateData.specialPrizes = [];
+        }
 
         // Capture original values before update for history propagation
         const originalName = tournament.name;
@@ -1185,6 +1289,10 @@ const updateTournament = async (req, res) => {
           updateData,
           { new: true, runValidators: true }
         ).populate('host', 'username profile.displayName profile.avatar');
+
+        if (!ACTIVE_TOURNAMENT_STATUSES.includes(updatedTournament.status)) {
+          await releaseHostActiveTournament(tournament.host, tournament._id);
+        }
 
         // Propagate relevant field changes to player history (non-blocking)
         try {
@@ -2048,6 +2156,7 @@ const cancelTournament = async (req, res) => {
     // Update tournament status to cancelled
     tournament.status = 'Cancelled';
     await tournament.save();
+    await releaseHostActiveTournament(tournament.host, tournament._id);
 
     res.status(200).json({
       success: true,
@@ -4034,6 +4143,7 @@ const generateFinalResult = async (req, res) => {
     }
 
     await tournament.save();
+    await releaseHostActiveTournament(tournament.host, tournament._id);
 
     // Propagate final results and status to player history (non-blocking)
     try {
@@ -4109,7 +4219,7 @@ const assignSpecialPrize = async (req, res) => {
 const getHostingLimits = async (req, res) => {
   try {
     const hostId = req.user._id;
-    const isVerified = req.user.isVerifiedHost === true;
+    const { isVerifiedHost: isVerified } = await getFreshHostPermissions(hostId);
 
     if (isVerified) {
       return res.json({
@@ -4121,17 +4231,9 @@ const getHostingLimits = async (req, res) => {
       });
     }
 
-    // Tournament: 1 per week
-    const oneWeekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    const recentTournament = await Tournament.findOne({
-      host: hostId,
-      createdAt: { $gte: oneWeekAgo }
-    }).sort({ createdAt: -1 }).select('createdAt').lean();
-
-    const tournamentAllowed = !recentTournament;
-    const tournamentNextAt = recentTournament
-      ? new Date(recentTournament.createdAt.getTime() + 7 * 24 * 60 * 60 * 1000)
-      : null;
+    // Tournament: one active fun tournament at a time for unverified hosts.
+    const activeTournament = await getActiveTournamentForHost(hostId);
+    const tournamentAllowed = !activeTournament;
 
     // Scrim: 5 per day
     const Scrim = require('../models/Scrim');
@@ -4150,10 +4252,12 @@ const getHostingLimits = async (req, res) => {
         tournament: {
           allowed: tournamentAllowed,
           isVerified: false,
-          used: recentTournament ? 1 : 0,
+          used: activeTournament ? 1 : 0,
           limit: 1,
-          period: 'week',
-          nextAllowedAt: tournamentNextAt
+          period: 'active_tournament',
+          activeTournamentId: activeTournament?._id || null,
+          activeTournamentName: activeTournament?.name || null,
+          nextAllowedAt: null
         },
         scrim: {
           allowed: scrimAllowed,

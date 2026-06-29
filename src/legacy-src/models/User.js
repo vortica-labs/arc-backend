@@ -536,6 +536,7 @@ const userSchema = new mongoose.Schema({
   appleId: {
     type: String,
     index: true,
+    unique: true,
     sparse: true
   },
   needsProfileCompletion: {
@@ -559,6 +560,20 @@ const userSchema = new mongoose.Schema({
     deviceName: {
       type: String,
       default: ''
+    },
+    projectId: {
+      type: String,
+      default: ''
+    },
+    nativeToken: {
+      type: {
+        type: String,
+        default: ''
+      },
+      data: {
+        type: String,
+        default: ''
+      }
     },
     lastUsedAt: {
       type: Date,

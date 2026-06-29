@@ -11,6 +11,7 @@ type NotificationModelType = {
 };
 type UserModelType = {
   updateOne: (...args: unknown[]) => Promise<unknown>;
+  updateMany: (...args: unknown[]) => Promise<unknown>;
 };
 
 const loadModule = <T>(modulePath: string): T => {

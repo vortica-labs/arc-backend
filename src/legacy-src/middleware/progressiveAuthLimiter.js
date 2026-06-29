@@ -1,4 +1,5 @@
-const { getJson, setJson, del } = require('../utils/redisCache');
+const { getJson, setJson, del, getRedisClient } = require('../utils/redisCache');
+const { randomUUID } = require('crypto');
 
 function toSafeLower(v) {
   return typeof v === 'string' ? v.trim().toLowerCase() : '';
@@ -17,12 +18,12 @@ function getIdentifier(req, kind) {
 
 function computeCooldownSeconds(fails, kind = 'password') {
   if (kind === 'password') {
-    if (fails <= 2) return 0;          // 2 normal invalid-credential responses
-    if (fails <= 5) return 30;         // 3-5 failures -> 30 sec
-    if (fails <= 8) return 2 * 60;     // 6-8 failures -> 2 min
-    if (fails <= 12) return 10 * 60;   // 9-12 failures -> 10 min
-    if (fails <= 16) return 30 * 60;   // 13-16 failures -> 30 min
-    return 60 * 60;                    // 17+ failures -> 60 min
+    if (fails <= 3) return 0;          // 3 normal invalid-credential responses
+    if (fails <= 6) return 30;         // 4-6 failures -> 30 sec
+    if (fails <= 9) return 2 * 60;     // 7-9 failures -> 2 min
+    if (fails <= 13) return 10 * 60;   // 10-13 failures -> 10 min
+    if (fails <= 17) return 30 * 60;   // 14-17 failures -> 30 min
+    return 60 * 60;                    // 18+ failures -> 60 min
   }
 
   if (fails <= 5) return 0;          // 5 free attempts before any lock
@@ -55,6 +56,7 @@ function sendRateLimitResponse(res, kind, retryAfterSec) {
 
 // In-memory fallback when Redis is unavailable
 const localStore = new Map();
+const localLocks = new Map();
 
 function createEmptyEntry() {
   return {
@@ -143,28 +145,88 @@ async function resetEntries(keys) {
   await Promise.all(keys.map(delEntry));
 }
 
+async function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withLocalLock(key, fn) {
+  const previous = localLocks.get(key) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => {
+    release = resolve;
+  });
+  const queued = previous.then(() => current);
+  localLocks.set(key, queued);
+
+  try {
+    await previous.catch(() => undefined);
+    return await fn();
+  } finally {
+    release();
+    if (localLocks.get(key) === queued) {
+      localLocks.delete(key);
+    }
+  }
+}
+
+async function withEntryLock(key, fn) {
+  const client = getRedisClient();
+  if (!client) return withLocalLock(key, fn);
+
+  const lockKey = `pal:lock:${key}`;
+  const token = randomUUID();
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < 1000) {
+    try {
+      const acquired = await client.set(lockKey, token, { NX: true, PX: 1000 });
+      if (acquired) {
+        try {
+          return await fn();
+        } finally {
+          try {
+            await client.eval(
+              "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end",
+              { keys: [lockKey], arguments: [token] }
+            );
+          } catch {
+            // Lock expiry is short; release failure should not fail auth flow.
+          }
+        }
+      }
+    } catch {
+      return withLocalLock(key, fn);
+    }
+    await sleep(25);
+  }
+
+  return withLocalLock(key, fn);
+}
+
 async function recordFailureForKeys(keys, kind) {
   const now = Date.now();
   const blockedUntilValues = await Promise.all(keys.map(async (key) => {
-    const current = (await getActiveEntry(key, now)) || createEmptyEntry();
+    return withEntryLock(key, async () => {
+      const current = (await getActiveEntry(key, now)) || createEmptyEntry();
 
-    if (current.blockedUntilMs && current.blockedUntilMs > now) {
+      if (current.blockedUntilMs && current.blockedUntilMs > now) {
+        current.lastSeenAtMs = now;
+        await setEntry(key, current);
+        return current.blockedUntilMs;
+      }
+
+      current.fails += 1;
+      current.lastFailAtMs = now;
       current.lastSeenAtMs = now;
+
+      const cooldownSec = computeCooldownSeconds(current.fails, kind);
+      if (cooldownSec > 0) {
+        current.blockedUntilMs = now + cooldownSec * 1000;
+      }
+
       await setEntry(key, current);
-      return current.blockedUntilMs;
-    }
-
-    current.fails += 1;
-    current.lastFailAtMs = now;
-    current.lastSeenAtMs = now;
-
-    const cooldownSec = computeCooldownSeconds(current.fails, kind);
-    if (cooldownSec > 0) {
-      current.blockedUntilMs = now + cooldownSec * 1000;
-    }
-
-    await setEntry(key, current);
-    return current.blockedUntilMs || 0;
+      return current.blockedUntilMs || 0;
+    });
   }));
 
   const blockedUntilMs = Math.max(0, ...blockedUntilValues);

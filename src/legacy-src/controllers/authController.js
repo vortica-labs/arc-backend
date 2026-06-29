@@ -1274,12 +1274,16 @@ const verifyAppleIdentityToken = async (identityToken) => {
 
 const appleMobileLogin = async (req, res) => {
   try {
-    const { identityToken, displayName } = req.body;
+    const { identityToken, displayName, nonce } = req.body;
     if (!identityToken) {
       return res.status(400).json({ success: false, message: 'identityToken is required' });
     }
 
     const profile = await verifyAppleIdentityToken(identityToken);
+    if (nonce && profile.nonce !== nonce) {
+      return res.status(401).json({ success: false, message: 'Apple login failed' });
+    }
+
     const appleId = profile.sub;
     const tokenEmail = typeof profile.email === 'string' ? profile.email.toLowerCase() : '';
     const emailVerified = profile.email_verified === true || profile.email_verified === 'true' || !tokenEmail;
@@ -1317,19 +1321,41 @@ const appleMobileLogin = async (req, res) => {
         counter++;
       }
 
-      user = await User.create({
-        email: tokenEmail,
-        appleId,
-        username: finalUsername,
-        password: require('crypto').randomBytes(32).toString('hex'),
-        userType: 'player',
-        profile: {
-          displayName: displayName || tokenEmail.split('@')[0],
-          avatar: ''
-        },
-        needsProfileCompletion: true,
-        isActive: true
-      });
+      try {
+        user = await User.create({
+          email: tokenEmail,
+          appleId,
+          username: finalUsername,
+          password: require('crypto').randomBytes(32).toString('hex'),
+          userType: 'player',
+          profile: {
+            displayName: displayName || tokenEmail.split('@')[0],
+            avatar: ''
+          },
+          needsProfileCompletion: true,
+          isActive: true
+        });
+      } catch (createError) {
+        const duplicateAppleOrEmail =
+          createError?.code === 11000 &&
+          (createError?.keyPattern?.appleId ||
+            createError?.keyPattern?.email ||
+            createError?.keyValue?.appleId ||
+            createError?.keyValue?.email);
+
+        if (!duplicateAppleOrEmail) throw createError;
+
+        user = await User.findOne({
+          $or: [
+            { appleId },
+            ...(tokenEmail ? [{ email: tokenEmail }] : [])
+          ]
+        });
+        if (!user) throw createError;
+        if (!user.appleId) user.appleId = appleId;
+        user.lastSeen = new Date();
+        await user.save();
+      }
     } else {
       if (!user.appleId) user.appleId = appleId;
       user.lastSeen = new Date();

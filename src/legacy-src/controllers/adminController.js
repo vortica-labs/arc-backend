@@ -19,6 +19,7 @@ const WithdrawalRequest = require('../models/WithdrawalRequest');
 const HostVerificationApplication = require('../models/HostVerificationApplication');
 const mongoose = require('mongoose');
 const { createSystemNotification } = require('../utils/notificationService');
+const { invalidateUserCache } = require('../middleware/auth');
 const { PLATFORM_DEFAULT_CPM } = require('../services/CreatorEarningsCalculationService');
 const {
   applyManualDeliveryProgress,
@@ -1397,8 +1398,9 @@ const approveHostVerificationApplication = async (req, res) => {
     application.reviewedBy = adminId;
     await application.save();
 
-    // Set user.isVerifiedHost = true
+    // Set user.isVerifiedHost = true and invalidate auth cache so authorization updates immediately.
     await User.findByIdAndUpdate(application.user, { isVerifiedHost: true });
+    await invalidateUserCache(application.user);
 
     // Send system notification with approval message from Requirement 6.6
     await createSystemNotification(
@@ -1550,8 +1552,9 @@ const revokeHostVerification = async (req, res) => {
       return res.status(400).json({ success: false, message: 'User is not a verified host' });
     }
 
-    // Revoke verification
+    // Revoke verification and invalidate auth cache so authorization updates immediately.
     await User.findByIdAndUpdate(userId, { isVerifiedHost: false });
+    await invalidateUserCache(userId);
 
     // Also update their approved application status back to pending (optional — mark as revoked)
     await HostVerificationApplication.findOneAndUpdate(

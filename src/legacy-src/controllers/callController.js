@@ -18,6 +18,7 @@
 const { generateToken04 } = require('../utils/zegoTokenGenerator');
 const User = require('../models/User');
 const Message = require('../models/Message');
+const Notification = require('../models/Notification');
 const log = require('../utils/logger');
 
 // ── Config ──
@@ -199,6 +200,24 @@ const initiateCall = async (req, res) => {
     if (global._arcSocketIO) {
       global._arcSocketIO.to(`user-${targetUserId}`).emit('call:offer', callData);
     }
+
+    Notification.createNotification({
+      recipient: targetUserId,
+      sender: callerId,
+      type: 'call',
+      title: `${callerUser?.profile?.displayName || callerUser?.username || 'Someone'} is calling`,
+      message: `Incoming ${callType === 'video' ? 'video' : 'voice'} call`,
+      data: {
+        customData: {
+          roomId,
+          callType,
+          callerId,
+          url: `/conversation/direct_${callerId}`
+        }
+      }
+    }).catch((notificationError) => {
+      log.warn('Failed to create call push notification', { error: String(notificationError), targetUserId, roomId });
+    });
 
     res.status(200).json({
       success: true,
