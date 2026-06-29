@@ -25,7 +25,10 @@ router.put("/player-profiles/:id", protect, recruitmentController.updatePlayerPr
 router.delete("/player-profiles/:id", protect, recruitmentController.deletePlayerProfile);
 
 router.post("/team-recruitments/:recruitmentId/apply", protect, ...validateApplication, recruitmentController.applyToRecruitment);
+router.delete("/team-recruitments/:recruitmentId/apply", protect, recruitmentController.withdrawApplication);
+router.post("/team-recruitments/:recruitmentId/withdraw", protect, recruitmentController.withdrawApplication);
 router.post("/recruitment/:recruitmentId/apply", protect, ...validateApplication, recruitmentController.applyToRecruitment);
+router.post("/recruitment/:recruitmentId/withdraw", protect, recruitmentController.withdrawApplication);
 router.post("/player-profiles/:profileId/interest", protect, recruitmentController.showInterestInProfile);
 router.post("/profile/:profileId/interest", protect, recruitmentController.showInterestInProfile);
 router.get("/applications/my", protect, recruitmentController.getUserApplications);

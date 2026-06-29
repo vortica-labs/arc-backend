@@ -54,13 +54,35 @@ const validateRecruitment = [
     .withMessage('Staff role is required for staff recruitment')
     .isIn(ALLOWED_STAFF_ROLES)
     .withMessage('Invalid staff role'),
-  body('requirements.salary')
+  body('requirements.additionalRequirements')
+    .optional()
+    .isLength({ max: 1500 })
+    .withMessage('Additional requirements cannot exceed 1500 characters'),
+  body('requirements.requiredSkills')
+    .optional()
+    .isLength({ max: 1500 })
+    .withMessage('Required skills cannot exceed 1500 characters'),
+  body('requirements.portfolioRequirements')
+    .optional()
+    .isLength({ max: 800 })
+    .withMessage('Portfolio requirements cannot exceed 800 characters'),
+  body('benefits.salary')
     .optional()
     .isLength({ max: 200 })
     .withMessage('Salary description cannot exceed 200 characters'),
+  body('benefits.location')
+    .optional()
+    .isLength({ max: 120 })
+    .withMessage('Location cannot exceed 120 characters'),
+  body('benefits.benefitsAndPerks')
+    .optional()
+    .isLength({ max: 1000 })
+    .withMessage('Benefits and perks cannot exceed 1000 characters'),
   body('benefits.contactInformation')
     .notEmpty()
-    .withMessage('Contact information is required'),
+    .withMessage('Contact information is required')
+    .isLength({ max: 300 })
+    .withMessage('Contact information cannot exceed 300 characters'),
   handleValidationErrors
 ];
 
@@ -87,7 +109,25 @@ const validatePlayerProfile = [
     .withMessage('Invalid staff role'),
   body('expectations.contactInformation')
     .notEmpty()
-    .withMessage('Contact information is required'),
+    .withMessage('Contact information is required')
+    .isLength({ max: 300 })
+    .withMessage('Contact information cannot exceed 300 characters'),
+  body('playerInfo.achievements')
+    .optional()
+    .isLength({ max: 1500 })
+    .withMessage('Achievements cannot exceed 1500 characters'),
+  body('playerInfo.additionalInfo')
+    .optional()
+    .isLength({ max: 1000 })
+    .withMessage('Additional information cannot exceed 1000 characters'),
+  body('professionalInfo.skillsAndExpertise')
+    .optional()
+    .isLength({ max: 1500 })
+    .withMessage('Skills and expertise cannot exceed 1500 characters'),
+  body('professionalInfo.portfolio')
+    .optional()
+    .isLength({ max: 800 })
+    .withMessage('Portfolio cannot exceed 800 characters'),
   handleValidationErrors
 ];
 

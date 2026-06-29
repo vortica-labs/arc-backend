@@ -22,6 +22,7 @@ const {
   leaveGroup,
   createCallSummary,
   toggleMuteChat,
+  toggleMuteGroup,
   togglePinChat,
   togglePinGroup,
   getChatPreferences,
@@ -133,6 +134,7 @@ router.post('/:messageId/invite-response', protect, handleInviteResponse);
 // Chat preferences (mute/pin)
 router.get('/preferences', protect, getChatPreferences);
 router.post('/chat/:userId/mute', protect, toggleMuteChat);
+router.post('/rooms/:chatRoomId/mute', protect, toggleMuteGroup);
 router.post('/chat/:userId/pin', protect, togglePinChat);
 router.post('/group/:chatRoomId/pin', protect, togglePinGroup);
 // Report a message

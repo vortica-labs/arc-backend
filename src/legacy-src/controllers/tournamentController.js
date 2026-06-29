@@ -341,6 +341,72 @@ const createTournament = async (req, res) => {
       } = req.body;
 
     const hostId = req.user._id;
+    const validGames = ['BGMI', 'Valorant', 'Free Fire', 'Call of Duty Mobile'];
+    const validModes = ['Battle Royale', 'Deathmatch', '5v5', 'Solo'];
+    const validFormats = ['Solo', 'Duo', 'Squad', '5v5'];
+    const normalizedPrizePoolType = prizePoolType === 'no_prize' ? 'without_prize' : (prizePoolType || 'without_prize');
+    const parsedPrizePool = prizePool !== undefined && String(prizePool).trim() !== ''
+      ? parseFloat(prizePool)
+      : 0;
+    const parsedEntryFee = entryFee !== undefined && String(entryFee).trim() !== ''
+      ? parseFloat(entryFee)
+      : 0;
+    const parsedTotalSlots = parseInt(totalSlots, 10);
+    const parsedTeamsPerGroup = parseInt(teamsPerGroup, 10);
+    const parsedNumberOfGroups = numberOfGroups !== undefined && String(numberOfGroups).trim() !== ''
+      ? parseInt(numberOfGroups, 10)
+      : Math.ceil(parsedTotalSlots / parsedTeamsPerGroup);
+    const totalRounds = req.body.totalRounds !== undefined && String(req.body.totalRounds).trim() !== ''
+      ? parseInt(req.body.totalRounds, 10)
+      : 1;
+
+    if (!name || String(name).trim().length < 3) {
+      return res.status(400).json({ success: false, message: 'Tournament name must be at least 3 characters' });
+    }
+
+    if (!description || String(description).trim().length < 10) {
+      return res.status(400).json({ success: false, message: 'Tournament description must be at least 10 characters' });
+    }
+
+    if (!validGames.includes(game)) {
+      return res.status(400).json({ success: false, message: 'Invalid tournament game' });
+    }
+
+    if (mode && !validModes.includes(mode)) {
+      return res.status(400).json({ success: false, message: 'Invalid tournament mode' });
+    }
+
+    if (!validFormats.includes(format)) {
+      return res.status(400).json({ success: false, message: 'Invalid tournament format' });
+    }
+
+    if (Number.isNaN(parsedTotalSlots) || parsedTotalSlots < 4 || parsedTotalSlots > 128) {
+      return res.status(400).json({ success: false, message: 'Total slots must be between 4 and 128' });
+    }
+
+    if (Number.isNaN(parsedTeamsPerGroup) || parsedTeamsPerGroup < 2 || parsedTeamsPerGroup > 100) {
+      return res.status(400).json({ success: false, message: 'Teams per group must be between 2 and 100' });
+    }
+
+    if (parsedTeamsPerGroup > parsedTotalSlots) {
+      return res.status(400).json({ success: false, message: 'Teams per group cannot exceed total slots' });
+    }
+
+    if (Number.isNaN(parsedNumberOfGroups) || parsedNumberOfGroups < 1) {
+      return res.status(400).json({ success: false, message: 'At least one group is required' });
+    }
+
+    if (Number.isNaN(totalRounds) || totalRounds < 1 || totalRounds > 10) {
+      return res.status(400).json({ success: false, message: 'Total rounds must be between 1 and 10' });
+    }
+
+    if (!['with_prize', 'without_prize'].includes(normalizedPrizePoolType)) {
+      return res.status(400).json({ success: false, message: 'Invalid tournament prize type' });
+    }
+
+    if (Number.isNaN(parsedEntryFee) || parsedEntryFee < 0) {
+      return res.status(400).json({ success: false, message: 'Entry fee cannot be negative' });
+    }
 
     // Validate dates
     const now = new Date();
@@ -355,6 +421,13 @@ const createTournament = async (req, res) => {
     const regEnd = new Date(regEndStr);
     const tourStart = new Date(tourStartStr);
     const tourEnd = new Date(tourEndStr);
+
+    if ([regStart, regEnd, tourStart, tourEnd].some(date => Number.isNaN(date.getTime()))) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid tournament date'
+      });
+    }
 
     if (regEnd <= regStart) {
       return res.status(400).json({
@@ -378,7 +451,7 @@ const createTournament = async (req, res) => {
     }
 
     // Enforce isVerifiedHost for prize pool tournaments
-    if (prizePoolType === 'with_prize' && req.user.isVerifiedHost !== true) {
+    if (normalizedPrizePoolType === 'with_prize' && req.user.isVerifiedHost !== true) {
       return res.status(403).json({
         success: false,
         message: 'You are not authorized to host prize pool tournaments. Please apply for Verified Host status.'
@@ -406,23 +479,12 @@ const createTournament = async (req, res) => {
     }
 
     // Validate prize pool for prize tournaments
-    if (prizePoolType === 'with_prize' && (!prizePool || prizePool < 100)) {
+    if (normalizedPrizePoolType === 'with_prize' && (Number.isNaN(parsedPrizePool) || parsedPrizePool < 100)) {
       return res.status(400).json({
         success: false,
         message: 'Prize pool must be at least ₹100 for prize tournaments'
       });
     }
-
-    // Get total rounds
-    const totalRounds = parseInt(req.body.totalRounds) || 1;
-
-    // Normalize prizePoolType: mobile sends 'no_prize', schema expects 'without_prize'
-    const normalizedPrizePoolType = prizePoolType === 'no_prize' ? 'without_prize' : (prizePoolType || 'without_prize');
-
-    // Compute teamsPerGroup / numberOfGroups with sane fallbacks
-    const parsedTotalSlots = parseInt(totalSlots) || 16;
-    const parsedTeamsPerGroup = parseInt(teamsPerGroup) || parsedTotalSlots;
-    const parsedNumberOfGroups = parseInt(numberOfGroups) || Math.ceil(parsedTotalSlots / parsedTeamsPerGroup);
 
     // Create tournament
     const tournamentData = {
@@ -440,8 +502,8 @@ const createTournament = async (req, res) => {
       registrationDeadline: regEnd,
       location: location || 'Online',
       timezone: timezone || 'UTC',
-      prizePool: normalizedPrizePoolType === 'with_prize' ? (prizePool || 0) : 0,
-      entryFee: entryFee || 0,
+      prizePool: normalizedPrizePoolType === 'with_prize' ? parsedPrizePool : 0,
+      entryFee: parsedEntryFee,
       totalSlots: parsedTotalSlots,
       teamsPerGroup: parsedTeamsPerGroup,
       numberOfGroups: parsedNumberOfGroups,
@@ -994,9 +1056,9 @@ const updateTournament = async (req, res) => {
         const allowedUpdateFields = [
           'name', 'description', 'game', 'format', 'mode', 'status',
           'registrationStartDate', 'registrationEndDate', 'tournamentStartDate', 'tournamentEndDate',
-          'startDate', 'endDate', 'registrationDeadline',
+          'startDate', 'endDate', 'registrationDeadline', 'location', 'timezone',
           'prizePool', 'entryFee', 'prizePoolCurrency', 'totalSlots', 'teamsPerGroup',
-          'numberOfGroups', 'prizePoolType', 'prizeDistribution', 'specialPrizes', 'rules', 'banner'
+          'numberOfGroups', 'totalRounds', 'prizePoolType', 'prizeDistribution', 'specialPrizes', 'rules', 'banner'
         ];
         const updateData = {};
         allowedUpdateFields.forEach(field => {
@@ -1021,6 +1083,96 @@ const updateTournament = async (req, res) => {
         if (updateData.rules && typeof updateData.rules === 'string') {
           updateData.rules = updateData.rules.split(',').map(rule => rule.trim()).filter(rule => rule);
         }
+
+        const validGames = ['BGMI', 'Valorant', 'Free Fire', 'Call of Duty Mobile'];
+        const validModes = ['Battle Royale', 'Deathmatch', '5v5', 'Solo'];
+        const validFormats = ['Solo', 'Duo', 'Squad', '5v5'];
+        if (updateData.name !== undefined && String(updateData.name).trim().length < 3) {
+          return res.status(400).json({ success: false, message: 'Tournament name must be at least 3 characters' });
+        }
+        if (updateData.description !== undefined && String(updateData.description).trim().length < 10) {
+          return res.status(400).json({ success: false, message: 'Tournament description must be at least 10 characters' });
+        }
+        if (updateData.game !== undefined && !validGames.includes(updateData.game)) {
+          return res.status(400).json({ success: false, message: 'Invalid tournament game' });
+        }
+        if (updateData.mode !== undefined && updateData.mode && !validModes.includes(updateData.mode)) {
+          return res.status(400).json({ success: false, message: 'Invalid tournament mode' });
+        }
+        if (updateData.format !== undefined && !validFormats.includes(updateData.format)) {
+          return res.status(400).json({ success: false, message: 'Invalid tournament format' });
+        }
+        const nextTotalSlots = updateData.totalSlots !== undefined ? parseInt(updateData.totalSlots) : tournament.totalSlots;
+        const nextTeamsPerGroup = updateData.teamsPerGroup !== undefined ? parseInt(updateData.teamsPerGroup) : tournament.teamsPerGroup;
+        const nextTotalRounds = updateData.totalRounds !== undefined ? parseInt(updateData.totalRounds) : tournament.totalRounds;
+        if (Number.isNaN(nextTotalSlots) || nextTotalSlots < 4 || nextTotalSlots > 128) {
+          return res.status(400).json({ success: false, message: 'Total slots must be between 4 and 128' });
+        }
+        if (Number.isNaN(nextTeamsPerGroup) || nextTeamsPerGroup < 2 || nextTeamsPerGroup > 100) {
+          return res.status(400).json({ success: false, message: 'Teams per group must be between 2 and 100' });
+        }
+        if (nextTeamsPerGroup > nextTotalSlots) {
+          return res.status(400).json({ success: false, message: 'Teams per group cannot exceed total slots' });
+        }
+        if (Number.isNaN(nextTotalRounds) || nextTotalRounds < 1 || nextTotalRounds > 10) {
+          return res.status(400).json({ success: false, message: 'Total rounds must be between 1 and 10' });
+        }
+        const nextEntryFee = updateData.entryFee !== undefined
+          ? parseFloat(updateData.entryFee)
+          : (tournament.entryFee || 0);
+        const nextPrizePool = updateData.prizePool !== undefined
+          ? parseFloat(updateData.prizePool)
+          : (tournament.prizePool || 0);
+        const nextNumberOfGroups = updateData.numberOfGroups !== undefined
+          ? parseInt(updateData.numberOfGroups, 10)
+          : Math.ceil(nextTotalSlots / nextTeamsPerGroup);
+        if (Number.isNaN(nextEntryFee) || nextEntryFee < 0) {
+          return res.status(400).json({ success: false, message: 'Entry fee cannot be negative' });
+        }
+        if (Number.isNaN(nextNumberOfGroups) || nextNumberOfGroups < 1) {
+          return res.status(400).json({ success: false, message: 'At least one group is required' });
+        }
+        const nextPrizePoolType = updateData.prizePoolType === 'no_prize'
+          ? 'without_prize'
+          : updateData.prizePoolType || tournament.prizePoolType;
+        if (!['with_prize', 'without_prize'].includes(nextPrizePoolType)) {
+          return res.status(400).json({ success: false, message: 'Invalid tournament prize type' });
+        }
+        updateData.prizePoolType = nextPrizePoolType;
+        if (nextPrizePoolType === 'with_prize' && req.user.isVerifiedHost !== true) {
+          return res.status(403).json({
+            success: false,
+            message: 'You are not authorized to host prize pool tournaments. Please apply for Verified Host status.'
+          });
+        }
+        if (nextPrizePoolType === 'with_prize' && (Number.isNaN(nextPrizePool) || nextPrizePool < 100)) {
+          return res.status(400).json({ success: false, message: 'Prize pool must be at least ₹100 for prize tournaments' });
+        }
+
+        const nextRegStart = new Date(updateData.registrationStartDate || updateData.startDate || tournament.registrationStartDate || tournament.startDate);
+        const nextRegEnd = new Date(updateData.registrationEndDate || updateData.registrationDeadline || tournament.registrationEndDate || tournament.registrationDeadline);
+        const nextTourStart = new Date(updateData.tournamentStartDate || updateData.startDate || tournament.tournamentStartDate || tournament.startDate);
+        const nextTourEnd = new Date(updateData.tournamentEndDate || updateData.endDate || tournament.tournamentEndDate || tournament.endDate);
+        if ([nextRegStart, nextRegEnd, nextTourStart, nextTourEnd].some(date => Number.isNaN(date.getTime()))) {
+          return res.status(400).json({ success: false, message: 'Invalid tournament date' });
+        }
+        if (nextRegEnd <= nextRegStart) {
+          return res.status(400).json({ success: false, message: 'Registration end date must be after registration start date' });
+        }
+        if (nextTourStart < nextRegEnd) {
+          return res.status(400).json({ success: false, message: 'Tournament start date must be after registration ends' });
+        }
+        if (nextTourEnd <= nextTourStart) {
+          return res.status(400).json({ success: false, message: 'Tournament end date must be after start date' });
+        }
+        updateData.totalSlots = nextTotalSlots;
+        updateData.teamsPerGroup = nextTeamsPerGroup;
+        updateData.numberOfGroups = nextNumberOfGroups;
+        updateData.totalRounds = nextTotalRounds;
+        updateData.entryFee = nextEntryFee;
+        updateData.prizePool = nextPrizePoolType === 'with_prize'
+          ? nextPrizePool
+          : 0;
 
         // Capture original values before update for history propagation
         const originalName = tournament.name;

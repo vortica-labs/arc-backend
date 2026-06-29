@@ -6,6 +6,45 @@ const { uploadAvatar, uploadImage } = require('../utils/cloudinary');
 const { sendOTPEmail } = require('../utils/email');
 const log = require('../utils/logger');
 
+const INVALID_LOGIN_MESSAGE = 'Invalid email or password.';
+
+const sendAuthRateLimit = (res, limit) => {
+  res.setHeader('Retry-After', String(limit.retryAfter));
+  return res.status(429).json({
+    success: false,
+    message: limit.message,
+    error: 'RATE_LIMIT_EXCEEDED',
+    retryAfter: limit.retryAfter
+  });
+};
+
+const sendInvalidLoginResponse = async (res) => {
+  try {
+    const limiter = res.locals?.progressiveAuthLimiter;
+    if (limiter?.recordFailure) {
+      const limit = await limiter.recordFailure();
+      if (limit) {
+        return sendAuthRateLimit(res, limit);
+      }
+    }
+  } catch (error) {
+    log.error('Login rate-limit failure tracking error:', { error: String(error) });
+  }
+
+  return res.status(401).json({
+    success: false,
+    message: INVALID_LOGIN_MESSAGE
+  });
+};
+
+const resetLoginFailureCounters = async (res) => {
+  try {
+    await res.locals?.progressiveAuthLimiter?.reset?.();
+  } catch (error) {
+    log.error('Login rate-limit reset error:', { error: String(error) });
+  }
+};
+
 // Check username availability
 const checkUsernameAvailability = async (req, res) => {
   try {
@@ -401,10 +440,7 @@ const login = async (req, res) => {
     const user = await User.findOne(query).select('+password');
 
     if (!user) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid credentials'
-      });
+      return sendInvalidLoginResponse(res);
     }
 
     // Check if user is active
@@ -419,11 +455,10 @@ const login = async (req, res) => {
     const isPasswordValid = await user.comparePassword(password);
 
     if (!isPasswordValid) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid credentials'
-      });
+      return sendInvalidLoginResponse(res);
     }
+
+    await resetLoginFailureCounters(res);
 
     // Update last seen
     user.lastSeen = new Date();
@@ -492,6 +527,15 @@ const updateProfile = async (req, res) => {
   try {
     const updates = req.body;
     const userId = req.user._id;
+
+    ['gamingPreferences', 'socialLinks', 'playerInfo', 'teamInfo'].forEach((key) => {
+      if (typeof updates[key] !== 'string') return;
+      try {
+        updates[key] = JSON.parse(updates[key]);
+      } catch {
+        // Keep the original scalar value so existing clients are not broken.
+      }
+    });
     
     // Remove spaces from username if provided
     if (updates.username) {
