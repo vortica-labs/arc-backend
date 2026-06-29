@@ -1,11 +1,40 @@
 const Post = require('../models/Post');
 const User = require('../models/User');
 const Notification = require('../models/Notification');
+const BoostCampaign = require('../models/BoostCampaign');
 const { uploadMultipleFiles } = require('../utils/cloudinary');
 const { createLikeNotification, createCommentNotification, createMentionNotification } = require('../utils/notificationService');
 const { formatPostDTO } = require('../utils/dto');
 const { getRecommendedPosts, recordEngagementEvent } = require('../services/recommendationService');
+const { isActiveBoost } = require('../services/boostService');
 const log = require('../utils/logger');
+
+function getRequestSource(req, post) {
+  const requested = req.body?.source || req.query?.source || req.body?.deliverySource || req.query?.deliverySource;
+  return requested === 'boost' && isActiveBoost(post) ? 'boost' : 'organic';
+}
+
+function getBoostCampaignId(post, source) {
+  return source === 'boost' ? (post?.boostMeta?.activeCampaign || null) : null;
+}
+
+async function incrementAttributionMetric({ postId, source, campaignId, metric, amount = 1 }) {
+  const safeSource = source === 'boost' ? 'boost' : 'organic';
+  const safeAmount = Number(amount) || 0;
+  if (!postId || !metric || safeAmount === 0) return;
+
+  await Post.updateOne(
+    { _id: postId },
+    { $inc: { [`metrics.${safeSource}${metric}`]: safeAmount } }
+  );
+
+  if (safeSource === 'boost' && campaignId) {
+    await BoostCampaign.updateOne(
+      { _id: campaignId },
+      { $inc: { [`analytics.${safeSource}${metric}`]: safeAmount } }
+    );
+  }
+}
 
 // Create new post
 const createPost = async (req, res) => {
@@ -149,6 +178,13 @@ const createPost = async (req, res) => {
       }
     }
 
+    const rawTags = tags !== undefined ? tags : req.body['tags[]'];
+    const parsedTags = Array.isArray(rawTags)
+      ? rawTags.map(tag => String(tag).trim()).filter(Boolean)
+      : typeof rawTags === 'string'
+        ? rawTags.split(',').map(tag => tag.trim()).filter(Boolean)
+        : [];
+
     // Create post data (allow post with only media, no caption)
     const postData = {
       author: authorId,
@@ -157,7 +193,7 @@ const createPost = async (req, res) => {
         media: mediaData
       },
       postType: postType || 'general',
-      tags: tags ? tags.split(',').map(tag => tag.trim()) : [],
+      tags: parsedTags,
       mentions: mentionedUserIds,
       visibility: visibility || 'public'
     };
@@ -288,31 +324,20 @@ const getPosts = async (req, res) => {
   }
 };
 
-// Boost post (demo: no payment, just set boost duration)
+// Boost post must go through verified payment. Kept only to prevent old clients
+// from activating unpaid boosts.
 const boostPost = async (req, res) => {
   try {
-    const postId = req.params.id;
-    const userId = req.user._id;
-    const durationHours = parseInt(req.body.durationHours) || 24;
-
-    const post = await Post.findById(postId);
+    const post = await Post.findById(req.params.id).select('author');
     if (!post) {
       return res.status(404).json({ success: false, message: 'Post not found' });
     }
-    if (post.author.toString() !== userId.toString()) {
+    if (post.author.toString() !== req.user._id.toString()) {
       return res.status(403).json({ success: false, message: 'You can only boost your own posts' });
     }
-
-    const now = new Date();
-    const boostExpiresAt = new Date(now.getTime() + durationHours * 60 * 60 * 1000);
-    post.boostedAt = now;
-    post.boostExpiresAt = boostExpiresAt;
-    await post.save();
-
-    res.status(200).json({
-      success: true,
-      message: `Post boosted for ${durationHours} hours`,
-      data: { post: { _id: post._id, boostedAt: post.boostedAt, boostExpiresAt: post.boostExpiresAt } }
+    res.status(402).json({
+      success: false,
+      message: 'Boosts require verified payment. Use /api/payments/boost/create-order first.'
     });
   } catch (error) {
     log.error('Boost post error:', { error: String(error) });
@@ -330,6 +355,20 @@ const recordClipView = async (req, res) => {
     const completionRate = Math.min(1, Math.max(0, Number(req.body?.completionRate) || 0));
 
     const now = new Date();
+    const basePost = await Post.findById(postId).select('author isActive boostMeta boostExpiresAt');
+    if (!basePost || basePost.isActive === false) {
+      return res.status(404).json({ success: false, message: 'Post not found' });
+    }
+    const source = getRequestSource(req, basePost);
+    const campaignId = getBoostCampaignId(basePost, source);
+    const metricsInc = {
+      views: 1,
+      [`metrics.${source}Views`]: 1
+    };
+    if (durationMs > 0) {
+      metricsInc[`metrics.${source}WatchTimeMs`] = durationMs;
+    }
+
     const updatedPost = await Post.findOneAndUpdate(
       {
         _id: postId,
@@ -338,10 +377,22 @@ const recordClipView = async (req, res) => {
       },
       {
         $push: { viewedBy: { user: userId, viewedAt: now } },
-        $inc: { views: 1 }
+        $inc: metricsInc
       },
       { new: true }
     ).select('author views viewedBy');
+
+    if (updatedPost && source === 'boost' && campaignId) {
+      await BoostCampaign.updateOne(
+        { _id: campaignId },
+        {
+          $inc: {
+            'analytics.boostViews': 1,
+            'analytics.boostWatchTimeMs': durationMs
+          }
+        }
+      );
+    }
 
     const post = updatedPost || await Post.findById(postId).select('author views viewedBy isActive');
     if (!post || post.isActive === false) {
@@ -355,7 +406,9 @@ const recordClipView = async (req, res) => {
       eventType: 'view',
       context,
       durationMs,
-      completionRate
+      completionRate,
+      source,
+      boostCampaign: campaignId
     });
 
     res.status(200).json({
@@ -412,22 +465,35 @@ const getPost = async (req, res) => {
     const viewerId = req.user?._id;
     const isGuest = req.user && req.user.userType === 'guest';
     if (viewerId && !isGuest) {
-      await Post.updateOne(
+      const source = getRequestSource(req, post);
+      const campaignId = getBoostCampaignId(post, source);
+      const viewUpdate = await Post.updateOne(
         {
           _id: postId,
           viewedBy: { $not: { $elemMatch: { user: viewerId } } }
         },
         {
           $push: { viewedBy: { user: viewerId, viewedAt: new Date() } },
-          $inc: { views: 1 }
+          $inc: {
+            views: 1,
+            [`metrics.${source}Views`]: 1
+          }
         }
       );
+      if (viewUpdate.modifiedCount > 0 && source === 'boost' && campaignId) {
+        await BoostCampaign.updateOne(
+          { _id: campaignId },
+          { $inc: { 'analytics.boostViews': 1 } }
+        );
+      }
       await recordEngagementEvent({
         userId: viewerId,
         postId,
         authorId: post.author?._id || post.author,
         eventType: 'view',
-        context: 'post'
+        context: 'post',
+        source,
+        boostCampaign: campaignId
       });
     }
 
@@ -455,7 +521,7 @@ const toggleLike = async (req, res) => {
     const postId = req.params.id;
     const userId = req.user._id;
 
-    const existingPost = await Post.findById(postId).select('author likes isActive');
+    const existingPost = await Post.findById(postId).select('author likes isActive boostMeta boostExpiresAt');
     if (!existingPost || existingPost.isActive === false) {
       return res.status(404).json({
         success: false,
@@ -468,6 +534,8 @@ const toggleLike = async (req, res) => {
       if (!likeUser) return false;
       return likeUser.toString() === userId.toString();
     }) > -1;
+    const source = getRequestSource(req, existingPost);
+    const campaignId = getBoostCampaignId(existingPost, source);
 
     if (alreadyLiked) {
       await Post.updateOne(
@@ -483,6 +551,7 @@ const toggleLike = async (req, res) => {
         },
         { $push: { likes: { user: userId, likedAt: new Date() } } }
       );
+      await incrementAttributionMetric({ postId, source, campaignId, metric: 'Likes' });
     }
 
     const finalPost = await Post.findById(postId)
@@ -513,7 +582,9 @@ const toggleLike = async (req, res) => {
       postId,
       authorId,
       eventType: isLiked ? 'like' : 'unlike',
-      context: req.body?.context || 'feed'
+      context: req.body?.context || 'feed',
+      source,
+      boostCampaign: campaignId
     });
 
     // Create notification for post author (if not liking own post)
@@ -568,7 +639,7 @@ const addComment = async (req, res) => {
       { new: true }
     )
       .populate('comments.user', 'username profile.displayName profile.avatar')
-      .select('author comments');
+      .select('author comments boostMeta boostExpiresAt');
 
     if (!post) {
       return res.status(404).json({
@@ -576,6 +647,9 @@ const addComment = async (req, res) => {
         message: 'Post not found'
       });
     }
+    const source = getRequestSource(req, post);
+    const campaignId = getBoostCampaignId(post, source);
+    await incrementAttributionMetric({ postId, source, campaignId, metric: 'Comments' });
 
     // Create notification for post author (if not commenting on own post)
     if (post.author.toString() !== userId.toString()) {
@@ -588,6 +662,8 @@ const addComment = async (req, res) => {
       authorId: post.author,
       eventType: 'comment',
       context: req.body?.context || 'feed',
+      source,
+      boostCampaign: campaignId,
       metadata: { length: text.trim().length }
     });
 
@@ -630,9 +706,14 @@ const recordShare = async (req, res) => {
       { new: true }
     ).select('author shares');
 
-    const finalPost = post || await Post.findById(postId).select('author shares isActive');
+    const finalPost = post || await Post.findById(postId).select('author shares isActive boostMeta boostExpiresAt');
     if (!finalPost || finalPost.isActive === false) {
       return res.status(404).json({ success: false, message: 'Post not found' });
+    }
+    const source = getRequestSource(req, finalPost);
+    const campaignId = getBoostCampaignId(finalPost, source);
+    if (post) {
+      await incrementAttributionMetric({ postId, source, campaignId, metric: 'Shares' });
     }
 
     await recordEngagementEvent({
@@ -641,6 +722,8 @@ const recordShare = async (req, res) => {
       authorId: finalPost.author,
       eventType: 'share',
       context: req.body?.context || 'feed',
+      source,
+      boostCampaign: campaignId,
       metadata: { channel: req.body?.channel || 'unknown' }
     });
 
@@ -667,7 +750,7 @@ const toggleSave = async (req, res) => {
     const postId = req.params.id;
     const userId = req.user._id;
 
-    const post = await Post.findOne({ _id: postId, isActive: true }).select('author');
+    const post = await Post.findOne({ _id: postId, isActive: true }).select('author boostMeta boostExpiresAt');
     if (!post) {
       return res.status(404).json({ success: false, message: 'Post not found' });
     }
@@ -691,13 +774,20 @@ const toggleSave = async (req, res) => {
       isSaved = true;
     }
     await user.save();
+    const source = getRequestSource(req, post);
+    const campaignId = getBoostCampaignId(post, source);
+    if (isSaved) {
+      await incrementAttributionMetric({ postId, source, campaignId, metric: 'Saves' });
+    }
 
     await recordEngagementEvent({
       userId,
       postId,
       authorId: post.author,
       eventType: isSaved ? 'save' : 'unsave',
-      context: req.body?.context || 'feed'
+      context: req.body?.context || 'feed',
+      source,
+      boostCampaign: campaignId
     });
 
     res.status(200).json({
@@ -724,7 +814,7 @@ const updatePost = async (req, res) => {
     const { text, tags, visibility, recruitmentInfo } = req.body;
     const userId = req.user._id;
 
-    const post = await Post.findById(postId);
+    const post = await Post.findById(postId).select('author boostMeta boostExpiresAt isActive');
 
     if (!post) {
       return res.status(404).json({
@@ -926,14 +1016,22 @@ const trackInteraction = async (req, res) => {
     const normalizedType = interactionType === 'dwell_time' || interactionType === 'click'
       ? 'dwell'
       : interactionType;
+    const source = getRequestSource(req, post);
+    const campaignId = getBoostCampaignId(post, source);
+    const trackedDuration = Math.max(0, parseInt(durationMs ?? dwellTime, 10) || 0);
+    if (['watch', 'dwell'].includes(normalizedType) && trackedDuration > 0) {
+      await incrementAttributionMetric({ postId, source, campaignId, metric: 'WatchTimeMs', amount: trackedDuration });
+    }
     await recordEngagementEvent({
       userId,
       postId,
       authorId: post.author,
       eventType: normalizedType,
       context: context || 'unknown',
-      durationMs: Math.max(0, parseInt(durationMs ?? dwellTime, 10) || 0),
+      durationMs: trackedDuration,
       completionRate: Math.min(1, Math.max(0, Number(completionRate) || 0)),
+      source,
+      boostCampaign: campaignId,
       metadata: { clickedElement }
     });
 

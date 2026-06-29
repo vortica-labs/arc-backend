@@ -84,7 +84,13 @@ const createMessageNotification = async (recipientId, senderId, messageId) => {
       { $set: { 'data.messageId': messageId, updatedAt: new Date() } },
       { new: true }
     );
-    if (existing) return existing;
+    if (existing) {
+      const { sendPushNotification } = require('./pushNotificationService');
+      sendPushNotification(recipientId, existing).catch((pushError) => {
+        log.error('Message push notification error', { error: String(pushError) });
+      });
+      return existing;
+    }
 
     const notificationData = {
       recipient: recipientId,

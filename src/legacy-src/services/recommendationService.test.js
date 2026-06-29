@@ -6,6 +6,7 @@ const {
   scorePost,
   selectDiversePosts
 } = require('./recommendationService');
+const { getOrganicViewCount } = require('./boostService');
 
 const basePost = {
   _id: '507f1f77bcf86cd799439011',
@@ -54,6 +55,30 @@ const reportedScore = scorePost({
   reports: [{ user: 'u9' }, { user: 'u10' }]
 }, context);
 assert(highEngagementScore > reportedScore, 'engagement should outrank reported content');
+
+const boostedScore = scorePost({
+  ...basePost,
+  boostMeta: {
+    status: 'running',
+    budget: 499,
+    purchasedReach: 6000,
+    remainingReach: 4000,
+    totalSpend: 499,
+    endTime: new Date(Date.now() + 24 * 60 * 60 * 1000)
+  }
+}, context);
+const unboostedScore = scorePost(basePost, context);
+assert(boostedScore > unboostedScore, 'active boost campaigns should improve ranking score');
+
+assert.strictEqual(getOrganicViewCount({
+  views: 5000,
+  viewedBy: new Array(5000).fill({ user: 'u' }),
+  boostedAt: new Date()
+}), 0, 'legacy boosted view totals must not count as organic monetization views');
+assert.strictEqual(getOrganicViewCount({
+  metrics: { organicViews: 3200, boostViews: 10000 },
+  boostedAt: new Date()
+}), 3200, 'explicit organic views must remain monetizable even if a campaign exists');
 
 const diverse = selectDiversePosts([
   { post: { ...basePost, _id: '507f1f77bcf86cd799439001', author: { _id: 'a1' }, tags: ['x'] }, score: 100 },

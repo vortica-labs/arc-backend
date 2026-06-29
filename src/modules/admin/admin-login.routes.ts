@@ -57,7 +57,7 @@ router.post("/login", loginLimiter, async (req: Request, res: Response): Promise
   }
 
   const token = jwt.sign(
-    { isHardcodedAdmin: true, username: env.ADMIN_USERNAME },
+    { isHardcodedAdmin: true, username: env.ADMIN_USERNAME, adminRole: "super_admin", adminPermissions: ["*"] },
     env.JWT_SECRET,
     { expiresIn: "8h" }
   );

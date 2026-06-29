@@ -41,6 +41,17 @@ const postEngagementSchema = new mongoose.Schema({
     default: 'unknown',
     index: true
   },
+  source: {
+    type: String,
+    enum: ['organic', 'boost'],
+    default: 'organic',
+    index: true
+  },
+  boostCampaign: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'BoostCampaign',
+    index: true
+  },
   durationMs: {
     type: Number,
     default: 0,

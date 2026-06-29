@@ -30,6 +30,9 @@ const getUsers = async (req, res) => {
     const search = normalizeQuerySearch(
       req.query.search !== undefined ? req.query.search : req.query.q
     );
+    const viewerId = req.user?._id;
+    const isGuest = req.user && req.user.userType === 'guest';
+    const excludeFollowing = req.query.excludeFollowing === 'true' || req.query.suggestions === 'true';
 
     // Build filter object
     const filter = {
@@ -45,6 +48,21 @@ const getUsers = async (req, res) => {
     if (skillLevel) filter['playerInfo.skillLevel'] = skillLevel;
     if (lookingForTeam === 'true') filter['playerInfo.lookingForTeam'] = true;
     if (recruiting === 'true') filter['teamInfo.recruitingFor.0'] = { $exists: true };
+
+    if (excludeFollowing && viewerId && !isGuest) {
+      const [followedIds, currentUser, usersBlockingViewer] = await Promise.all([
+        Follow.find({ follower: viewerId }).distinct('following'),
+        User.findById(viewerId).select('blockedUsers').lean(),
+        User.find({ blockedUsers: viewerId }).select('_id').lean(),
+      ]);
+      const excludedIds = [
+        viewerId,
+        ...followedIds,
+        ...(currentUser?.blockedUsers || []),
+        ...usersBlockingViewer.map(user => user._id),
+      ];
+      andConditions.push({ _id: { $nin: excludedIds } });
+    }
 
     // If searching for followers, filter to only show users that the current user follows
     if (followers === 'true' && req.user) {
@@ -90,8 +108,6 @@ const getUsers = async (req, res) => {
 
     const total = await User.countDocuments(filter);
 
-    const isGuest = req.user && req.user.userType === 'guest';
-    const viewerId = req.user?._id;
     const userIds = users.map(u => u._id);
     const [viewerFollows, followerCounts, followingCounts] = await Promise.all([
       viewerId && !isGuest

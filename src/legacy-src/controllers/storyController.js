@@ -7,8 +7,51 @@ const log = require('../utils/logger');
 const mongoose = require('mongoose');
 
 const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
+const MAX_CLIENT_UPLOAD_ID_LENGTH = 96;
 
 const toIdStr = (v) => (v == null ? '' : typeof v === 'string' ? v : (v.toString && v.toString()) || String(v));
+
+const validStoryMediaMatch = {
+  'media.type': { $in: ['image', 'video'] },
+  'media.url': { $type: 'string', $ne: '' },
+  'media.publicId': { $type: 'string', $ne: '' }
+};
+
+const buildActiveStoryQuery = (extra = {}) => ({
+  ...extra,
+  ...validStoryMediaMatch
+});
+
+const normalizeClientUploadId = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw || raw.length > MAX_CLIENT_UPLOAD_ID_LENGTH) return '';
+  return raw;
+};
+
+const isDuplicateClientUploadError = (err) => (
+  err?.code === 11000 && (
+    err?.keyPattern?.clientUploadId ||
+    String(err?.message || '').includes('clientUploadId')
+  )
+);
+
+const populateStoryAuthor = (story) => story.populate('author', 'username profile.displayName profile.avatar profilePicture');
+
+const respondWithStory = async (res, story, statusCode = 201) => {
+  await populateStoryAuthor(story);
+  const plain = story.toObject();
+  return res.status(statusCode).json({
+    success: true,
+    data: { story: { ...plain, viewCount: 0 } }
+  });
+};
+
+const findStoryByClientUploadId = async (authorId, clientUploadId) => {
+  if (!clientUploadId) return null;
+  return Story.findOne({ author: authorId, clientUploadId })
+    .select('+clientUploadId')
+    .populate('author', 'username profile.displayName profile.avatar profilePicture');
+};
 
 const getStoryViewCountMap = async (storyIds) => {
   const objectIds = storyIds
@@ -50,7 +93,29 @@ const mapViewer = (view) => {
 
 // Create story (single image or video, max 30s for video; optional music)
 const createStory = async (req, res) => {
+  const clientUploadId = normalizeClientUploadId(
+    req.get?.('x-idempotency-key') || req.body?.clientUploadId
+  );
+
   try {
+    if (clientUploadId) {
+      const existingStory = await findStoryByClientUploadId(req.user._id, clientUploadId);
+      if (existingStory) {
+        const counts = await getStoryViewCountMap([existingStory._id]);
+        const storyObject = existingStory.toObject();
+        return res.status(200).json({
+          success: true,
+          data: {
+            story: {
+              ...storyObject,
+              viewCount: counts.get(toIdStr(existingStory._id)) || 0
+            },
+            duplicate: true
+          }
+        });
+      }
+    }
+
     const mediaFile = req.files?.media?.[0] || req.file;
     if (!mediaFile) {
       return res.status(400).json({ success: false, message: 'Image or video is required' });
@@ -64,11 +129,18 @@ const createStory = async (req, res) => {
     const isVideo = mediaFile.mimetype.startsWith('video/');
     const uploadFile = isVideo ? await processStoryVideo(mediaFile) : mediaFile;
     const results = await uploadMultipleFiles([uploadFile], 'gaming-social/stories');
-    const mediaUrl = results[0].url;
+    const mediaUrl = results?.[0]?.url;
+    const mediaPublicId = results?.[0]?.publicId;
+    if (!mediaUrl || !mediaPublicId) {
+      return res.status(502).json({
+        success: false,
+        message: 'Story media upload did not complete. Please try again.'
+      });
+    }
     const media = {
       type: isVideo ? 'video' : 'image',
       url: mediaUrl,
-      publicId: results[0].publicId
+      publicId: mediaPublicId
     };
     const duration = isVideo ? STORY_MAX_SECONDS : 30;
     let musicData;
@@ -82,15 +154,18 @@ const createStory = async (req, res) => {
       author: req.user._id,
       media,
       duration,
+      ...(clientUploadId && { clientUploadId }),
       ...(musicData && { music: musicData })
     });
-    await story.populate('author', 'username profile.displayName profile.avatar');
-    return res.status(201).json({
-      success: true,
-      data: { story: { ...story.toObject(), viewCount: 0 } }
-    });
+    return respondWithStory(res, story, 201);
   } catch (err) {
-    return res.status(500).json({
+    if (clientUploadId && isDuplicateClientUploadError(err)) {
+      const existingStory = await findStoryByClientUploadId(req.user._id, clientUploadId);
+      if (existingStory) {
+        return respondWithStory(res, existingStory, 200);
+      }
+    }
+    return res.status(err.statusCode || 500).json({
       success: false,
       message: err.message || 'Failed to create story'
     });
@@ -119,7 +194,7 @@ const getStoriesFeed = async (req, res) => {
     const allowedObjectIds = allowedIds.map((id) => new mongoose.Types.ObjectId(id));
 
     const usersWithStories = await Story.aggregate([
-      { $match: { createdAt: { $gte: since } } },
+      { $match: buildActiveStoryQuery({ createdAt: { $gte: since } }) },
       { $sort: { createdAt: -1 } },
       {
         $group: {
@@ -151,7 +226,7 @@ const getStoriesFeed = async (req, res) => {
     ]);
 
     // Ensure current user's story is included and first, with string _id (only remove+replace when we have their story)
-    const myLatest = await Story.findOne({ author: myId, createdAt: { $gte: since } })
+    const myLatest = await Story.findOne(buildActiveStoryQuery({ author: myId, createdAt: { $gte: since } }))
       .sort({ createdAt: -1 })
       .limit(1)
       .lean();
@@ -160,7 +235,7 @@ const getStoriesFeed = async (req, res) => {
       const me = await User.findById(myId).select('username profile').lean();
       const myEntry = {
         _id: myIdStr,
-        count: await Story.countDocuments({ author: myId, createdAt: { $gte: since } }),
+        count: await Story.countDocuments(buildActiveStoryQuery({ author: myId, createdAt: { $gte: since } })),
         latestStoryId: myLatest._id,
         latestMedia: myLatest.media,
         latestCreatedAt: myLatest.createdAt,
@@ -207,10 +282,13 @@ const getUserStories = async (req, res) => {
   try {
     const { userId } = req.params;
     const since = new Date(Date.now() - TWENTY_FOUR_HOURS_MS);
-    const stories = await Story.find({
+    const isOwnStoryList = toIdStr(userId) === toIdStr(req.user._id);
+    const query = Story.find(buildActiveStoryQuery({
       author: userId,
       createdAt: { $gte: since }
-    })
+    }));
+    if (isOwnStoryList) query.select('+clientUploadId');
+    const stories = await query
       .sort({ createdAt: 1 })
       .populate('author', 'username profile.displayName profile.avatar profilePicture')
       .lean();
@@ -234,7 +312,7 @@ const viewStory = async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(storyId)) {
       return res.status(400).json({ success: false, message: 'Invalid story id' });
     }
-    const story = await Story.findById(storyId).select('author').lean();
+    const story = await Story.findOne(buildActiveStoryQuery({ _id: storyId })).select('author').lean();
     if (!story) {
       return res.status(404).json({ success: false, message: 'Story not found' });
     }
@@ -279,7 +357,7 @@ const getStoryViewers = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid story id' });
     }
 
-    const story = await Story.findById(storyId).select('author').lean();
+    const story = await Story.findOne(buildActiveStoryQuery({ _id: storyId })).select('author').lean();
     if (!story) {
       return res.status(404).json({ success: false, message: 'Story not found' });
     }

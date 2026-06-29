@@ -62,6 +62,8 @@ export const notificationWorker = new Worker(
       const legacyRoot = path.resolve(__dirname, "..", "..", "legacy-src");
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const Notification = require(path.join(legacyRoot, "models", "Notification.js"));
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { sendBulkPushNotification } = require(path.join(legacyRoot, "utils", "pushNotificationService.js"));
 
       // Batch insert
       const docs = (recipientIds as string[]).map((recipientId: string) => ({
@@ -81,6 +83,12 @@ export const notificationWorker = new Worker(
 
       if (docs.length > 0) {
         await Notification.bulkWrite(docs, { ordered: false });
+        await sendBulkPushNotification(recipientIds, {
+          type: type || "system",
+          title,
+          message,
+          data: data || {}
+        });
       }
 
       logger.info("Bulk notifications created", { count: recipientIds.length, type });

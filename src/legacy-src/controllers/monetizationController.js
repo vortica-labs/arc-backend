@@ -193,7 +193,13 @@ async function getDashboard(req, res) {
           cycleLabel: estimated.cycleLabel,
           cycleEndDate: estimated.cycleEndDate,
           isEstimate: estimated.isEstimate,
-          held: estimated.held
+          held: estimated.held,
+          inputs: estimated.inputs
+        },
+        organicAnalytics: {
+          totalOrganicClipViews: estimated.inputs?.totalOrganicClipViews || estimated.inputs?.totalClipViews || 0,
+          cpm: estimated.inputs?.cpm || cpm,
+          boostedViewsExcluded: true
         },
         cpm,
         nextPayoutDate: cycle.endDate,

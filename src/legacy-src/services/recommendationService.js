@@ -5,6 +5,7 @@ const Follow = require('../models/Follow');
 const PostEngagement = require('../models/PostEngagement');
 const { formatPostDTO } = require('../utils/dto');
 const log = require('../utils/logger');
+const { getBoostScore, getDeliverySource, recordBoostDelivery } = require('./boostService');
 
 const DEFAULT_LIMIT = 15;
 const MAX_LIMIT = 30;
@@ -283,7 +284,7 @@ function scorePost(post, { mode, relationship, interestProfile, seed }) {
     return sum + (interestProfile.tagWeights.get(String(tag).toLowerCase()) || 0);
   }, 0);
   const mediaBoost = postHasVideo(post) ? (mode === 'clips' ? 18 : 4) : 2;
-  const boostActive = post.boostExpiresAt && new Date(post.boostExpiresAt).getTime() > now ? 30 : 0;
+  const boostScore = getBoostScore(post, { mode, now });
   const qualityPenalty = reports * 25;
   const exploration = stableNoise(seed, post._id) * (mode === 'clips' ? 16 : 10);
   const viralVelocity = engagementRate > 0 ? Math.min(35, engagementRate * 28) : 0;
@@ -297,7 +298,7 @@ function scorePost(post, { mode, relationship, interestProfile, seed }) {
     + postTypeAffinity
     + tagAffinity
     + mediaBoost
-    + boostActive
+    + boostScore
     + exploration
     + ownPostPenalty
     - qualityPenalty;
@@ -428,6 +429,9 @@ async function getRecommendedPosts({ user, query = {}, mode = 'feed' }) {
 
   const selected = selectDiversePosts(scored, limit, mode);
   const selectedPosts = selected.map((item) => item.post);
+  await recordBoostDelivery(selectedPosts, mode).catch((error) => {
+    log.warn('Failed to record boost delivery', { error: String(error), mode });
+  });
   const lastCandidate = candidates[candidates.length - 1] || selectedPosts[selectedPosts.length - 1] || null;
   const nextCursor = candidates.length >= limit ? encodeCursor(lastCandidate) : null;
   const total = !query.cursor
@@ -436,11 +440,15 @@ async function getRecommendedPosts({ user, query = {}, mode = 'feed' }) {
   const isGuest = user && user.userType === 'guest';
 
   return {
-    posts: selectedPosts.map((post) => formatPostDTO(
-      post,
-      isGuest,
-      Boolean(relationship.currentUserId && normalizeId(post.author) === relationship.currentUserId)
-    )),
+    posts: selectedPosts.map((post) => {
+      const dto = formatPostDTO(
+        post,
+        isGuest,
+        Boolean(relationship.currentUserId && normalizeId(post.author) === relationship.currentUserId)
+      );
+      if (dto) dto.deliverySource = getDeliverySource(post);
+      return dto;
+    }),
     pagination: {
       current: page,
       total: total !== null ? Math.ceil(total / limit) : undefined,
@@ -464,6 +472,7 @@ async function getRecommendedPosts({ user, query = {}, mode = 'feed' }) {
         'quality_penalty',
         'diversity',
         'exploration',
+        'boost_campaign_score',
         mode === 'clips' ? 'watched_exclusion' : 'fresh_content'
       ],
       exhaustedFreshClips
@@ -479,7 +488,9 @@ async function recordEngagementEvent({
   context = 'unknown',
   durationMs = 0,
   completionRate = 0,
-  metadata = {}
+  metadata = {},
+  source = 'organic',
+  boostCampaign = null
 }) {
   if (!userId || !postId || !eventType) return;
   const payload = {
@@ -490,6 +501,8 @@ async function recordEngagementEvent({
     context,
     durationMs,
     completionRate,
+    source: source === 'boost' ? 'boost' : 'organic',
+    boostCampaign,
     metadata
   };
 

@@ -12,45 +12,6 @@ const emitNotification = (userId, notification) => {
   }
 };
 
-const sendExpoPushNotifications = async (userId, notification) => {
-  try {
-    const User = require('../models/User');
-    const user = await User.findById(userId).select('pushTokens').lean();
-    const tokens = Array.from(new Set((user?.pushTokens || []).map((entry) => entry.token).filter(Boolean)));
-    if (tokens.length === 0) return;
-
-    const messages = tokens.map((token) => ({
-      to: token,
-      sound: 'default',
-      title: notification.title || 'SquadHunt',
-      body: notification.message || '',
-      data: {
-        notificationId: String(notification._id || ''),
-        type: notification.type,
-        postId: notification.data?.postId ? String(notification.data.postId) : undefined,
-        tournamentId: notification.data?.tournamentId ? String(notification.data.tournamentId) : undefined,
-        chatId: notification.data?.chatId ? String(notification.data.chatId) : undefined,
-        userId: notification.sender ? String(notification.sender) : undefined
-      },
-      channelId: 'default',
-      priority: 'high'
-    }));
-
-    await fetch('https://exp.host/--/api/v2/push/send', {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Accept-Encoding': 'gzip, deflate',
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(messages)
-    });
-  } catch (error) {
-    const log = require('./logger');
-    log.error('Expo push notification error', { error: String(error) });
-  }
-};
-
 const NOTIFICATION_SETTING_DEFAULTS = {
   likes: true,
   comments: true,
@@ -105,7 +66,6 @@ const createAndEmitNotification = async (notificationData) => {
     
     // Emit real-time notification
     emitNotification(notification.recipient, notification);
-    sendExpoPushNotifications(notification.recipient, notification).catch(() => {});
     
     // Send email via background job queue (non-blocking)
     if (process.env.SMTP_USER && process.env.SMTP_PASS) {

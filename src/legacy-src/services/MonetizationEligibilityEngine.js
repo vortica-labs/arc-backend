@@ -7,6 +7,7 @@ const User = require('../models/User');
 const Post = require('../models/Post');
 const Report = require('../models/Report');
 const MonetizationEligibility = require('../models/MonetizationEligibility');
+const { getOrganicViewCount } = require('./boostService');
 
 // Configurable thresholds (short-form clip creator monetization)
 const THRESHOLDS = {
@@ -47,14 +48,13 @@ async function calculateEligibility(userId) {
     author: userId,
     isActive: true,
     hiddenByAdmin: { $ne: true },
-    boostedAt: { $exists: false },
     createdAt: { $gte: sinceDate },
     'content.media': { $elemMatch: { type: 'video' } }
   })
-    .select('content.text viewedBy views createdAt')
+    .select('content.text viewedBy views metrics boostMeta boostedAt createdAt')
     .lean();
 
-  const viewCounts = clips.map((clip) => (clip.viewedBy && clip.viewedBy.length) || (clip.views || 0));
+  const viewCounts = clips.map(getOrganicViewCount);
   const totalClipViews45d = viewCounts.reduce((sum, val) => sum + val, 0);
   const clipsWith3kViews45d = viewCounts.filter((v) => v >= 3000).length;
 
@@ -112,8 +112,10 @@ async function calculateEligibility(userId) {
   const metrics = {
     followersCount,
     hasActivePremiumMembership,
+    totalOrganicClipViews45d: totalClipViews45d,
     totalClipViews45d,
     clipsWith3kViews45d,
+    clipsWith3kOrganicViews45d: clipsWith3kViews45d,
     activeDays45d,
     creatorHealthScore,
     suspiciousViewSpike,
