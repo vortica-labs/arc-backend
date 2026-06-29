@@ -6,8 +6,12 @@ const router = Router();
 
 // All admin routes are protected by the hardcoded-admin JWT check
 router.use(requireHardcodedAdminAuth);
+router.use((_, res, next) => {
+  res.setHeader("X-Robots-Tag", "noindex, nofollow");
+  next();
+});
 
-router.get("/dashboard", auditLog("VIEW_DASHBOARD"), adminController.getDashboardStats);
+router.get("/dashboard", auditLog("VIEW_DASHBOARD"), requireAdminPermission("dashboard:read"), adminController.getDashboardStats);
 router.get("/search", auditLog("GLOBAL_SEARCH"), requireAdminPermission("dashboard:read"), adminController.globalSearch);
 router.get("/analytics/users", auditLog("VIEW_USER_ANALYTICS"), adminController.getUserAnalytics);
 router.get("/health", auditLog("VIEW_SYSTEM_HEALTH"), adminController.getSystemHealth);
@@ -61,10 +65,5 @@ router.post(
 );
 router.get("/host-verification/verified-hosts", auditLog("VIEW_VERIFIED_HOSTS"), requireAdminPermission("hosts:read"), adminController.getVerifiedHosts);
 router.post("/host-verification/revoke/:userId", auditLog("REVOKE_HOST_VERIFICATION"), requireAdminPermission("hosts:manage"), adminController.revokeHostVerification);
-
-router.use((_, res, next) => {
-  res.setHeader("X-Robots-Tag", "noindex, nofollow");
-  next();
-});
 
 export default router;

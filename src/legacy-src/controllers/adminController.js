@@ -29,16 +29,53 @@ const log = require('../utils/logger');
 
 const dayMs = 24 * 60 * 60 * 1000;
 
-const countSafe = (model, query = {}) => model.countDocuments(query).catch(() => 0);
-const sumSafe = async (model, match, field) => {
-  const result = await model.aggregate([
-    { $match: match },
-    { $group: { _id: null, total: { $sum: field } } }
-  ]).catch(() => []);
-  return result[0]?.total || 0;
+const getDashboardRequestId = () => `admindash_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+const getModelName = (model) => model?.modelName || model?.collection?.name || 'unknown_model';
+
+const recordDashboardFailure = (failures, requestId, widget, error) => {
+  const message = error?.message || String(error);
+  if (Array.isArray(failures)) failures.push({ widget, message });
+  log.error('Admin dashboard widget failed', {
+    requestId,
+    widget,
+    error: message,
+    stack: error?.stack
+  });
+};
+
+const countSafe = async (model, query = {}, widget = 'count', failures = [], requestId = '') => {
+  try {
+    if (!model || typeof model.countDocuments !== 'function') {
+      throw new Error(`Dashboard model "${getModelName(model)}" does not support countDocuments`);
+    }
+    return await model.countDocuments(query);
+  } catch (error) {
+    recordDashboardFailure(failures, requestId, widget, error);
+    return 0;
+  }
+};
+
+const sumSafe = async (model, match, field, widget = 'sum', failures = [], requestId = '') => {
+  try {
+    if (!model || typeof model.aggregate !== 'function') {
+      throw new Error(`Dashboard model "${getModelName(model)}" does not support aggregate`);
+    }
+    const result = await model.aggregate([
+      { $match: match },
+      { $group: { _id: null, total: { $sum: field } } }
+    ]);
+    return result[0]?.total || 0;
+  } catch (error) {
+    recordDashboardFailure(failures, requestId, widget, error);
+    return 0;
+  }
 };
 
 const growthSeries = async (model, match = {}, days = 14) => {
+  if (!model || typeof model.aggregate !== 'function') {
+    throw new Error(`Dashboard model "${getModelName(model)}" does not support aggregate`);
+  }
   const startDate = new Date(Date.now() - ((days - 1) * dayMs));
   return model.aggregate([
     { $match: { ...match, createdAt: { $gte: startDate } } },
@@ -49,7 +86,7 @@ const growthSeries = async (model, match = {}, days = 14) => {
       }
     },
     { $sort: { _id: 1 } }
-  ]).catch(() => []);
+  ]);
 };
 
 const normalizeLimit = (value, fallback = 20, max = 100) => Math.min(max, Math.max(1, parseInt(value, 10) || fallback));
@@ -93,14 +130,31 @@ const buildDeliveryTimelineEntry = (type, {
   createdAt: new Date()
 });
 
+const safeDashboardValue = async (widget, operation, fallback, failures, requestId) => {
+  try {
+    return await operation();
+  } catch (error) {
+    recordDashboardFailure(failures, requestId, widget, error);
+    return fallback;
+  }
+};
+
 // Get dashboard stats
 const getDashboardStats = async (req, res) => {
+  const requestId = getDashboardRequestId();
+  const failures = [];
   try {
     const now = Date.now();
     const since24h = new Date(now - dayMs);
     const since30d = new Date(now - (30 * dayMs));
 
-    await processDueManualBoostDeliveries({ limit: 50 });
+    const manualBoostDelivery = await safeDashboardValue(
+      'manualBoostDeliveryProcessing',
+      () => processDueManualBoostDeliveries({ limit: 50 }),
+      { scanned: 0, processed: 0, failed: 0 },
+      failures,
+      requestId
+    );
 
     const [
       totalUsers,
@@ -135,73 +189,131 @@ const getDashboardStats = async (req, res) => {
       creatorPayouts,
       pendingCreatorPayouts
     ] = await Promise.all([
-      countSafe(User, { isActive: true }),
-      countSafe(User, { isActive: true, lastSeen: { $gte: since24h } }),
-      countSafe(User, { isActive: true, lastSeen: { $gte: since30d } }),
-      countSafe(User, { isActive: true, $or: [{ isPremium: true }, { 'membership.tier': { $ne: 'free' } }] }),
-      countSafe(User, { isActive: true, userType: 'team' }),
-      countSafe(User, { isActive: true, isCreator: true }),
-      countSafe(User, { isActive: true, isVerifiedHost: true }),
-      countSafe(HostVerificationApplication, { status: 'pending' }),
-      countSafe(Tournament, { status: { $in: ['Ongoing', 'ongoing', 'active', 'live'] } }),
-      countSafe(TeamRecruitment, { isActive: true }),
-      countSafe(Tournament),
-      countSafe(Post, { isActive: { $ne: false } }),
-      countSafe(Post, { isActive: { $ne: false }, 'content.media.type': 'video' }),
-      countSafe(Story),
-      countSafe(Message, { isDeleted: { $ne: true } }),
-      countSafe(RandomConnection),
-      countSafe(RandomConnection, { status: { $in: ['active', 'waiting'] } }),
-      countSafe(Notification),
-      countSafe(Report),
-      countSafe(Feedback, { status: { $in: ['pending', 'reviewed'] } }),
-      countSafe(BoostCampaign),
-      countSafe(BoostCampaign, { status: 'running' }),
-      countSafe(MonetizationApplication),
-      countSafe(MonetizationApplication, { status: 'pending' }),
-      countSafe(User, { isActive: true, createdAt: { $gte: since24h } }),
-      countSafe(Post, { createdAt: { $gte: since24h } }),
-      countSafe(Tournament, { createdAt: { $gte: since24h } }),
-      sumSafe(PaymentTransaction, { status: 'completed' }, '$amount'),
-      sumSafe(PaymentTransaction, { status: 'completed', type: 'boost' }, '$amount'),
-      sumSafe(CreatorPayout, { status: { $in: ['paid', 'pending', 'held'] } }, '$amount'),
-      sumSafe(CreatorPayout, { status: { $in: ['pending', 'held'] } }, '$amount')
+      countSafe(User, { isActive: true }, 'totalUsers', failures, requestId),
+      countSafe(User, { isActive: true, lastSeen: { $gte: since24h } }, 'dailyActiveUsers', failures, requestId),
+      countSafe(User, { isActive: true, lastSeen: { $gte: since30d } }, 'monthlyActiveUsers', failures, requestId),
+      countSafe(User, { isActive: true, $or: [{ isPremium: true }, { 'membership.tier': { $ne: 'free' } }] }, 'premiumUsers', failures, requestId),
+      countSafe(User, { isActive: true, userType: 'team' }, 'teams', failures, requestId),
+      countSafe(User, { isActive: true, isCreator: true }, 'creators', failures, requestId),
+      countSafe(User, { isActive: true, isVerifiedHost: true }, 'verifiedHosts', failures, requestId),
+      countSafe(HostVerificationApplication, { status: 'pending' }, 'pendingHostRequests', failures, requestId),
+      countSafe(Tournament, { status: { $in: ['Ongoing', 'ongoing', 'active', 'live'] } }, 'liveTournaments', failures, requestId),
+      countSafe(TeamRecruitment, { isActive: true }, 'totalRecruitments', failures, requestId),
+      countSafe(Tournament, {}, 'totalTournaments', failures, requestId),
+      countSafe(Post, { isActive: { $ne: false } }, 'totalPosts', failures, requestId),
+      countSafe(Post, { isActive: { $ne: false }, 'content.media.type': 'video' }, 'clips', failures, requestId),
+      countSafe(Story, {}, 'stories', failures, requestId),
+      countSafe(Message, { isDeleted: { $ne: true } }, 'totalMessages', failures, requestId),
+      countSafe(RandomConnection, {}, 'calls', failures, requestId),
+      countSafe(RandomConnection, { status: { $in: ['active', 'waiting'] } }, 'randomConnectSessions', failures, requestId),
+      countSafe(Notification, {}, 'totalNotifications', failures, requestId),
+      countSafe(Report, {}, 'reports', failures, requestId),
+      countSafe(Feedback, { status: { $in: ['pending', 'reviewed'] } }, 'openTickets', failures, requestId),
+      countSafe(BoostCampaign, {}, 'boostCampaigns', failures, requestId),
+      countSafe(BoostCampaign, { status: 'running' }, 'runningBoostCampaigns', failures, requestId),
+      countSafe(MonetizationApplication, {}, 'creatorApplications', failures, requestId),
+      countSafe(MonetizationApplication, { status: 'pending' }, 'pendingCreatorApplications', failures, requestId),
+      countSafe(User, { isActive: true, createdAt: { $gte: since24h } }, 'newUsersToday', failures, requestId),
+      countSafe(Post, { createdAt: { $gte: since24h } }, 'newPostsToday', failures, requestId),
+      countSafe(Tournament, { createdAt: { $gte: since24h } }, 'newTournamentsToday', failures, requestId),
+      sumSafe(PaymentTransaction, { status: 'completed' }, '$amount', 'revenue', failures, requestId),
+      sumSafe(PaymentTransaction, { status: 'completed', type: 'boost' }, '$amount', 'boostRevenue', failures, requestId),
+      sumSafe(CreatorPayout, { status: { $in: ['paid', 'pending', 'held'] } }, '$amount', 'creatorPayouts', failures, requestId),
+      sumSafe(CreatorPayout, { status: { $in: ['pending', 'held'] } }, '$amount', 'pendingCreatorPayouts', failures, requestId)
     ]);
 
-    const userTypeStats = await User.aggregate([
-      { $match: { isActive: true } },
-      { $group: { _id: '$userType', count: { $sum: 1 } } }
-    ]).catch(() => []);
+    const userTypeStats = await safeDashboardValue(
+      'userTypeBreakdown',
+      () => User.aggregate([
+        { $match: { isActive: true } },
+        { $group: { _id: '$userType', count: { $sum: 1 } } }
+      ]),
+      [],
+      failures,
+      requestId
+    );
 
-    const postTypeStats = await Post.aggregate([
-      { $group: { _id: '$postType', count: { $sum: 1 } } }
-    ]).catch(() => []);
+    const postTypeStats = await safeDashboardValue(
+      'postTypeBreakdown',
+      () => Post.aggregate([
+        { $group: { _id: '$postType', count: { $sum: 1 } } }
+      ]),
+      [],
+      failures,
+      requestId
+    );
 
-    const tournamentStats = await Tournament.aggregate([
-      { $group: { _id: '$status', count: { $sum: 1 } } }
-    ]).catch(() => []);
+    const tournamentStats = await safeDashboardValue(
+      'tournamentStatusBreakdown',
+      () => Tournament.aggregate([
+        { $group: { _id: '$status', count: { $sum: 1 } } }
+      ]),
+      [],
+      failures,
+      requestId
+    );
 
-    const revenueByDay = await PaymentTransaction.aggregate([
-      { $match: { status: 'completed', createdAt: { $gte: new Date(now - (13 * dayMs)) } } },
-      {
-        $group: {
-          _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
-          revenue: { $sum: '$amount' },
-          transactions: { $sum: 1 }
-        }
-      },
-      { $sort: { _id: 1 } }
-    ]).catch(() => []);
+    const revenueByDay = await safeDashboardValue(
+      'revenueGrowth',
+      () => PaymentTransaction.aggregate([
+        { $match: { status: 'completed', createdAt: { $gte: new Date(now - (13 * dayMs)) } } },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+            revenue: { $sum: '$amount' },
+            transactions: { $sum: 1 }
+          }
+        },
+        { $sort: { _id: 1 } }
+      ]),
+      [],
+      failures,
+      requestId
+    );
 
-    const recentActivity = await Promise.all([
-      User.find({ username: { $not: /^duo_/ } }).sort({ createdAt: -1 }).limit(5).select('username profile.displayName createdAt userType isActive').lean(),
-      Post.find().sort({ createdAt: -1 }).limit(5).populate('author', 'username profile.displayName').select('content postType createdAt author').lean(),
-      AdminAuditLog.find().sort({ createdAt: -1 }).limit(8).select('actor action resourceType resourceId statusCode createdAt').lean()
+    const [recentUsers, recentPosts, recentAuditLogs] = await Promise.all([
+      safeDashboardValue(
+        'recentUsers',
+        () => User.find({ username: { $not: /^duo_/ } }).sort({ createdAt: -1 }).limit(5).select('username profile.displayName createdAt userType isActive').lean(),
+        [],
+        failures,
+        requestId
+      ),
+      safeDashboardValue(
+        'recentPosts',
+        () => Post.find().sort({ createdAt: -1 }).limit(5).populate('author', 'username profile.displayName').select('content postType createdAt author').lean(),
+        [],
+        failures,
+        requestId
+      ),
+      safeDashboardValue(
+        'recentAuditLogs',
+        () => AdminAuditLog.find().sort({ createdAt: -1 }).limit(8).select('actor action resourceType resourceId statusCode createdAt').lean(),
+        [],
+        failures,
+        requestId
+      )
+    ]);
+
+    const [userGrowth, postGrowth] = await Promise.all([
+      safeDashboardValue('userGrowth', () => growthSeries(User, { isActive: true }), [], failures, requestId),
+      safeDashboardValue('postGrowth', () => growthSeries(Post, {}), [], failures, requestId)
     ]);
 
     res.json({
       success: true,
+      partial: failures.length > 0,
+      requestId,
       data: {
+        diagnostics: {
+          requestId,
+          partial: failures.length > 0,
+          failedWidgets: failures.map(({ widget, message }) => ({
+            widget,
+            message: process.env.NODE_ENV === 'production' ? 'Dashboard widget unavailable' : message
+          })),
+          manualBoostDelivery
+        },
         overview: {
           totalUsers,
           dailyActiveUsers,
@@ -266,14 +378,14 @@ const getDashboardStats = async (req, res) => {
           tournamentStatuses: tournamentStats
         },
         growth: {
-          users: await growthSeries(User, { isActive: true }),
-          posts: await growthSeries(Post, {}),
+          users: userGrowth,
+          posts: postGrowth,
           revenue: revenueByDay
         },
         recentActivity: {
-          users: recentActivity[0],
-          posts: recentActivity[1],
-          auditLogs: recentActivity[2]
+          users: recentUsers,
+          posts: recentPosts,
+          auditLogs: recentAuditLogs
         },
         server: {
           status: 'healthy',
@@ -288,10 +400,16 @@ const getDashboardStats = async (req, res) => {
       }
     });
   } catch (error) {
-    log.error('Admin dashboard stats error:', { error: String(error) });
+    log.error('Admin dashboard stats fatal error:', {
+      requestId,
+      error: error?.message || String(error),
+      stack: error?.stack,
+      failedWidgets: failures
+    });
     res.status(500).json({ 
       success: false, 
       message: 'Failed to fetch dashboard stats',
+      requestId,
       error: process.env.NODE_ENV === 'development' ? error.message : undefined 
     });
   }
