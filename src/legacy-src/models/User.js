@@ -30,7 +30,8 @@ const userSchema = new mongoose.Schema({
     unique: true,
     trim: true,
     minlength: [3, 'Username must be at least 3 characters'],
-    maxlength: [20, 'Username cannot exceed 20 characters']
+    maxlength: [20, 'Username cannot exceed 20 characters'],
+    match: [/^[a-zA-Z0-9_]+$/, 'Username can only contain letters, numbers and underscores']
   },
   email: {
     type: String,
@@ -54,6 +55,40 @@ const userSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
+  adminRole: {
+    type: String,
+    enum: ['super_admin', 'admin', 'moderator', 'support', 'finance', 'tournament_manager', 'content_moderator', 'creator_manager'],
+    default: undefined,
+    index: true
+  },
+  adminPermissions: [{
+    type: String,
+    trim: true
+  }],
+  adminControls: {
+    loginDisabled: { type: Boolean, default: false },
+    postingDisabled: { type: Boolean, default: false },
+    messagingDisabled: { type: Boolean, default: false },
+    callsDisabled: { type: Boolean, default: false },
+    storiesDisabled: { type: Boolean, default: false },
+    clipsDisabled: { type: Boolean, default: false },
+    commentsDisabled: { type: Boolean, default: false },
+    liveFeaturesDisabled: { type: Boolean, default: false },
+    reason: { type: String, default: '', maxlength: 500 },
+    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    updatedAt: { type: Date, default: null }
+  },
+  moderationStatus: {
+    type: String,
+    enum: ['active', 'suspended', 'banned', 'soft_deleted'],
+    default: 'active',
+    index: true
+  },
+  adminWarnings: [{
+    reason: { type: String, default: '', maxlength: 1000 },
+    issuedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    issuedAt: { type: Date, default: Date.now }
+  }],
   isCreator: {
     type: Boolean,
     default: false

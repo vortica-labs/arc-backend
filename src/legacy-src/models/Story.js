@@ -12,8 +12,13 @@ const storySchema = new mongoose.Schema({
       enum: ['image', 'video'],
       required: true
     },
-    url: { type: String, required: true },
-    publicId: { type: String, required: true }
+    url: { type: String, required: true, trim: true },
+    publicId: { type: String, required: true, trim: true }
+  },
+  clientUploadId: {
+    type: String,
+    trim: true,
+    select: false
   },
   duration: {
     type: Number,
@@ -33,5 +38,9 @@ const storySchema = new mongoose.Schema({
 
 storySchema.index({ createdAt: 1 }, { expireAfterSeconds: 24 * 60 * 60 }); // TTL: delete after 24 hours
 storySchema.index({ author: 1, createdAt: -1 });
+storySchema.index(
+  { author: 1, clientUploadId: 1 },
+  { unique: true, sparse: true, partialFilterExpression: { clientUploadId: { $type: 'string' } } }
+);
 
 module.exports = mongoose.model('Story', storySchema);

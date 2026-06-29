@@ -5,6 +5,7 @@ import { backendControllerPath, backendMiddlewarePath } from "../legacy/legacy.p
 type AdminController = Record<string, RequestHandler>;
 type AdminAuthMiddleware = {
   requireSuperAdmin: RequestHandler;
+  requireAdminPermission: (permission: string) => RequestHandler;
   auditLog: (eventName: string) => RequestHandler;
 };
 
@@ -14,6 +15,6 @@ const loadModule = <T>(modulePath: string): T => {
 };
 
 export const adminController = loadModule<AdminController>(path.join(backendControllerPath, "adminController.js"));
-export const { requireSuperAdmin, auditLog } = loadModule<AdminAuthMiddleware>(
+export const { requireSuperAdmin, requireAdminPermission, auditLog } = loadModule<AdminAuthMiddleware>(
   path.join(backendMiddlewarePath, "adminAuth.js")
 );

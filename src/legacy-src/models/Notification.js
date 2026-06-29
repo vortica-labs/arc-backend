@@ -77,6 +77,17 @@ notificationSchema.statics.createNotification = async function(data) {
         console.warn('Could not populate sender info:', populateError.message);
       }
     }
+
+    if (data.sendPush !== false) {
+      try {
+        const { sendPushNotification } = require('../utils/pushNotificationService');
+        sendPushNotification(notification.recipient, notification).catch((pushError) => {
+          console.error('Push notification delivery failed:', pushError.message);
+        });
+      } catch (pushError) {
+        console.error('Could not enqueue push notification:', pushError.message);
+      }
+    }
     
     return notification;
   } catch (error) {

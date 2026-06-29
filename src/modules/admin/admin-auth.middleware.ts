@@ -5,6 +5,8 @@ import { env } from "../../config/env";
 interface AdminJwtPayload {
   isHardcodedAdmin?: boolean;
   username?: string;
+  adminRole?: string;
+  adminPermissions?: string[];
 }
 
 /**
@@ -43,6 +45,8 @@ export const requireHardcodedAdminAuth = (
       username: decoded.username ?? "admin",
       userType: "admin",
       isSuperUser: true,
+      adminRole: decoded.adminRole ?? "super_admin",
+      adminPermissions: decoded.adminPermissions ?? ["*"],
     };
 
     return next();

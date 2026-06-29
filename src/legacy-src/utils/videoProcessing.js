@@ -62,8 +62,14 @@ const processStoryVideo = async (file) => {
       optimized: true,
     };
   } catch (err) {
-    log.warn('Story video optimization failed; uploading original video', { error: String(err) });
-    return file;
+    if (String(file.mimetype || '').toLowerCase() === 'video/mp4') {
+      log.warn('Story video optimization failed; uploading original MP4 video', { error: String(err) });
+      return file;
+    }
+    const error = new Error('Could not process this video. Please upload an MP4 video or try a shorter clip.');
+    error.statusCode = 422;
+    error.cause = err;
+    throw error;
   } finally {
     await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
   }

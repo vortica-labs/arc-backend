@@ -4,6 +4,13 @@ const Report = require('../models/Report');
 const { Message } = require('../models/Message');
 const Tournament = require('../models/Tournament');
 const Notification = require('../models/Notification');
+const Story = require('../models/Story');
+const TeamRecruitment = require('../models/TeamRecruitment');
+const RandomConnection = require('../models/RandomConnection');
+const Feedback = require('../models/Feedback');
+const BoostCampaign = require('../models/BoostCampaign');
+const PaymentTransaction = require('../models/PaymentTransaction');
+const AdminAuditLog = require('../models/AdminAuditLog');
 const MonetizationApplication = require('../models/MonetizationApplication');
 const CreatorBankDetails = require('../models/CreatorBankDetails');
 const CreatorPayout = require('../models/CreatorPayout');
@@ -13,97 +20,224 @@ const HostVerificationApplication = require('../models/HostVerificationApplicati
 const mongoose = require('mongoose');
 const { createSystemNotification } = require('../utils/notificationService');
 const { PLATFORM_DEFAULT_CPM } = require('../services/CreatorEarningsCalculationService');
+const { applyManualDeliveryProgress } = require('../services/boostService');
 const log = require('../utils/logger');
+
+const dayMs = 24 * 60 * 60 * 1000;
+
+const countSafe = (model, query = {}) => model.countDocuments(query).catch(() => 0);
+const sumSafe = async (model, match, field) => {
+  const result = await model.aggregate([
+    { $match: match },
+    { $group: { _id: null, total: { $sum: field } } }
+  ]).catch(() => []);
+  return result[0]?.total || 0;
+};
+
+const growthSeries = async (model, match = {}, days = 14) => {
+  const startDate = new Date(Date.now() - ((days - 1) * dayMs));
+  return model.aggregate([
+    { $match: { ...match, createdAt: { $gte: startDate } } },
+    {
+      $group: {
+        _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+        count: { $sum: 1 }
+      }
+    },
+    { $sort: { _id: 1 } }
+  ]).catch(() => []);
+};
+
+const normalizeLimit = (value, fallback = 20, max = 100) => Math.min(max, Math.max(1, parseInt(value, 10) || fallback));
 
 // Get dashboard stats
 const getDashboardStats = async (req, res) => {
   try {
-    if (process.env.NODE_ENV === 'development') { console.log('Getting dashboard stats...');
-    }
-    // Get basic counts with error handling (excluding deleted items)
-    // Only count users with isActive: true (treating isActive: false as deleted for all types)
-    const totalUsers = await User.countDocuments({ isActive: true }).catch(() => 0);
-    
-    const totalPosts = await Post.countDocuments().catch(() => 0);
-    const totalMessages = await Message.countDocuments({ isDeleted: { $ne: true } }).catch(() => 0);
-    const totalTournaments = await Tournament.countDocuments().catch(() => 0);
-    const totalNotifications = await Notification.countDocuments().catch(() => 0);
-    
-    // Get active users (last 24 hours, excluding deleted users)
-    const activeUsers = await User.countDocuments({ 
-      isActive: true,
-      lastSeen: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } 
-    }).catch(() => 0);
-    
-    // Get new items today (excluding deleted users)
-    const newUsersToday = await User.countDocuments({ 
-      isActive: true,
-      createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } 
-    }).catch(() => 0);
-    
-    const newPostsToday = await Post.countDocuments({ 
-      createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } 
-    }).catch(() => 0);
-    
-    const newTournamentsToday = await Tournament.countDocuments({ 
-      createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } 
-    }).catch(() => 0);
+    const now = Date.now();
+    const since24h = new Date(now - dayMs);
+    const since30d = new Date(now - (30 * dayMs));
 
-    // Get user type breakdown (excluding deleted users)
+    await Promise.all((await BoostCampaign.find({ deliveryMode: 'manual', status: 'running' }).limit(50)).map(applyManualDeliveryProgress));
+
+    const [
+      totalUsers,
+      dailyActiveUsers,
+      monthlyActiveUsers,
+      premiumUsers,
+      teams,
+      creators,
+      verifiedHosts,
+      pendingHostRequests,
+      liveTournaments,
+      totalRecruitments,
+      totalPosts,
+      clips,
+      stories,
+      totalMessages,
+      calls,
+      randomConnectSessions,
+      totalNotifications,
+      reports,
+      openTickets,
+      boostCampaigns,
+      runningBoostCampaigns,
+      creatorApplications,
+      pendingCreatorApplications,
+      newUsersToday,
+      newPostsToday,
+      newTournamentsToday,
+      revenue,
+      boostRevenue,
+      creatorPayouts,
+      pendingCreatorPayouts
+    ] = await Promise.all([
+      countSafe(User, { isActive: true }),
+      countSafe(User, { isActive: true, lastSeen: { $gte: since24h } }),
+      countSafe(User, { isActive: true, lastSeen: { $gte: since30d } }),
+      countSafe(User, { isActive: true, $or: [{ isPremium: true }, { 'membership.tier': { $ne: 'free' } }] }),
+      countSafe(User, { isActive: true, userType: 'team' }),
+      countSafe(User, { isActive: true, isCreator: true }),
+      countSafe(User, { isActive: true, isVerifiedHost: true }),
+      countSafe(HostVerificationApplication, { status: 'pending' }),
+      countSafe(Tournament, { status: { $in: ['Ongoing', 'ongoing', 'active', 'live'] } }),
+      countSafe(TeamRecruitment, { isActive: true }),
+      countSafe(Post, { isActive: { $ne: false } }),
+      countSafe(Post, { isActive: { $ne: false }, 'content.media.type': 'video' }),
+      countSafe(Story),
+      countSafe(Message, { isDeleted: { $ne: true } }),
+      countSafe(RandomConnection),
+      countSafe(RandomConnection, { status: { $in: ['active', 'waiting'] } }),
+      countSafe(Notification),
+      countSafe(Report),
+      countSafe(Feedback, { status: { $in: ['pending', 'reviewed'] } }),
+      countSafe(BoostCampaign),
+      countSafe(BoostCampaign, { status: 'running' }),
+      countSafe(MonetizationApplication),
+      countSafe(MonetizationApplication, { status: 'pending' }),
+      countSafe(User, { isActive: true, createdAt: { $gte: since24h } }),
+      countSafe(Post, { createdAt: { $gte: since24h } }),
+      countSafe(Tournament, { createdAt: { $gte: since24h } }),
+      sumSafe(PaymentTransaction, { status: 'completed' }, '$amount'),
+      sumSafe(PaymentTransaction, { status: 'completed', type: 'boost' }, '$amount'),
+      sumSafe(CreatorPayout, { status: { $in: ['paid', 'pending', 'held'] } }, '$amount'),
+      sumSafe(CreatorPayout, { status: { $in: ['pending', 'held'] } }, '$amount')
+    ]);
+
     const userTypeStats = await User.aggregate([
-      {
-        $match: { isActive: true }
-      },
-      {
-        $group: {
-          _id: '$userType',
-          count: { $sum: 1 }
-        }
-      }
+      { $match: { isActive: true } },
+      { $group: { _id: '$userType', count: { $sum: 1 } } }
     ]).catch(() => []);
 
-    // Get post type breakdown
     const postTypeStats = await Post.aggregate([
-      {
-        $group: {
-          _id: '$type',
-          count: { $sum: 1 }
-        }
-      }
+      { $group: { _id: '$postType', count: { $sum: 1 } } }
     ]).catch(() => []);
 
-    // Get tournament status breakdown
     const tournamentStats = await Tournament.aggregate([
+      { $group: { _id: '$status', count: { $sum: 1 } } }
+    ]).catch(() => []);
+
+    const revenueByDay = await PaymentTransaction.aggregate([
+      { $match: { status: 'completed', createdAt: { $gte: new Date(now - (13 * dayMs)) } } },
       {
         $group: {
-          _id: '$status',
-          count: { $sum: 1 }
+          _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+          revenue: { $sum: '$amount' },
+          transactions: { $sum: 1 }
         }
-      }
+      },
+      { $sort: { _id: 1 } }
     ]).catch(() => []);
+
+    const recentActivity = await Promise.all([
+      User.find({ username: { $not: /^duo_/ } }).sort({ createdAt: -1 }).limit(5).select('username profile.displayName createdAt userType isActive').lean(),
+      Post.find().sort({ createdAt: -1 }).limit(5).populate('author', 'username profile.displayName').select('content postType createdAt author').lean(),
+      AdminAuditLog.find().sort({ createdAt: -1 }).limit(8).select('actor action resourceType resourceId statusCode createdAt').lean()
+    ]);
 
     res.json({
       success: true,
       data: {
         overview: {
           totalUsers,
+          dailyActiveUsers,
+          monthlyActiveUsers,
+          premiumUsers,
+          teams,
+          users: totalUsers,
+          creators,
+          verifiedHosts,
+          pendingHostRequests,
+          liveTournaments,
+          recruitments: totalRecruitments,
           totalPosts,
+          clips,
+          stories,
           totalMessages,
+          calls,
+          randomConnectSessions,
           totalTournaments,
           totalNotifications,
-          activeUsers,
+          activeUsers: dailyActiveUsers,
+          reports,
+          openTickets,
+          boostCampaigns,
+          runningBoostCampaigns,
+          creatorApplications,
+          pendingCreatorApplications,
+          revenue,
+          boostRevenue,
+          creatorPayouts,
+          pendingCreatorPayouts,
           newUsersToday,
           newPostsToday,
           newTournamentsToday
         },
+        metrics: [
+          { key: 'totalUsers', label: 'Total Users', value: totalUsers, trend: newUsersToday },
+          { key: 'dailyActiveUsers', label: 'Daily Active Users', value: dailyActiveUsers },
+          { key: 'monthlyActiveUsers', label: 'Monthly Active Users', value: monthlyActiveUsers },
+          { key: 'premiumUsers', label: 'Premium Users', value: premiumUsers },
+          { key: 'teams', label: 'Teams', value: teams },
+          { key: 'creators', label: 'Creators', value: creators },
+          { key: 'verifiedHosts', label: 'Verified Hosts', value: verifiedHosts },
+          { key: 'pendingHostRequests', label: 'Pending Host Requests', value: pendingHostRequests },
+          { key: 'liveTournaments', label: 'Live Tournaments', value: liveTournaments },
+          { key: 'recruitments', label: 'Recruitments', value: totalRecruitments },
+          { key: 'posts', label: 'Posts', value: totalPosts, trend: newPostsToday },
+          { key: 'clips', label: 'Clips', value: clips },
+          { key: 'stories', label: 'Stories', value: stories },
+          { key: 'messages', label: 'Messages', value: totalMessages },
+          { key: 'calls', label: 'Calls', value: calls },
+          { key: 'randomConnectSessions', label: 'Random Connect Sessions', value: randomConnectSessions },
+          { key: 'revenue', label: 'Revenue', value: revenue, currency: 'INR' },
+          { key: 'boostRevenue', label: 'Boost Revenue', value: boostRevenue, currency: 'INR' },
+          { key: 'creatorPayouts', label: 'Creator Payouts', value: creatorPayouts, currency: 'INR' },
+          { key: 'reports', label: 'Reports', value: reports },
+          { key: 'openTickets', label: 'Open Tickets', value: openTickets }
+        ],
         breakdowns: {
           userTypes: userTypeStats,
           postTypes: postTypeStats,
           tournamentStatuses: tournamentStats
         },
+        growth: {
+          users: await growthSeries(User, { isActive: true }),
+          posts: await growthSeries(Post, {}),
+          revenue: revenueByDay
+        },
+        recentActivity: {
+          users: recentActivity[0],
+          posts: recentActivity[1],
+          auditLogs: recentActivity[2]
+        },
         server: {
+          status: 'healthy',
           uptime: process.uptime(),
           memoryUsage: process.memoryUsage(),
+          database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+          api: 'running',
+          storageUsage: null,
+          databaseUsage: null,
           timestamp: new Date()
         }
       }
@@ -1272,6 +1406,424 @@ const revokeHostVerification = async (req, res) => {
   }
 };
 
+const getAuditLogs = async (req, res) => {
+  try {
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = normalizeLimit(req.query.limit, 25, 100);
+    const { action, actor, resourceType, statusCode } = req.query;
+    const query = {};
+
+    if (action) query.action = { $regex: String(action), $options: 'i' };
+    if (actor) query['actor.username'] = { $regex: String(actor), $options: 'i' };
+    if (resourceType && resourceType !== 'all') query.resourceType = resourceType;
+    if (statusCode) query.statusCode = parseInt(statusCode, 10);
+
+    const [logs, total] = await Promise.all([
+      AdminAuditLog.find(query)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      AdminAuditLog.countDocuments(query)
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        logs,
+        pagination: {
+          current: page,
+          pages: Math.ceil(total / limit),
+          total
+        }
+      }
+    });
+  } catch (error) {
+    log.error('Get audit logs error:', { error: String(error) });
+    res.status(500).json({ success: false, message: 'Failed to fetch audit logs' });
+  }
+};
+
+const globalSearch = async (req, res) => {
+  try {
+    const query = String(req.query.q || '').trim();
+    const limit = normalizeLimit(req.query.limit, 8, 20);
+
+    if (query.length < 2) {
+      return res.json({ success: true, data: { query, results: {} } });
+    }
+
+    const text = { $regex: query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
+    const objectId = mongoose.Types.ObjectId.isValid(query) ? new mongoose.Types.ObjectId(query) : null;
+
+    const [
+      users,
+      teams,
+      posts,
+      clips,
+      stories,
+      reports,
+      boosts,
+      payments,
+      hosts,
+      recruitments,
+      tournaments
+    ] = await Promise.all([
+      User.find({ $or: [{ username: text }, { email: text }, { 'profile.displayName': text }, ...(objectId ? [{ _id: objectId }] : [])] })
+        .select('username email profile.displayName profile.avatar userType isActive isPremium isCreator isVerifiedHost createdAt')
+        .limit(limit)
+        .lean(),
+      User.find({ userType: 'team', $or: [{ username: text }, { email: text }, { 'profile.displayName': text }, ...(objectId ? [{ _id: objectId }] : [])] })
+        .select('username email profile.displayName profile.avatar isActive isVerifiedHost createdAt')
+        .limit(limit)
+        .lean(),
+      Post.find({ $or: [{ 'content.text': text }, { tags: text }, ...(objectId ? [{ _id: objectId }] : [])] })
+        .select('content.text postType author createdAt isActive hiddenByAdmin metrics views')
+        .populate('author', 'username profile.displayName')
+        .limit(limit)
+        .lean(),
+      Post.find({ 'content.media.type': 'video', $or: [{ 'content.text': text }, { tags: text }, ...(objectId ? [{ _id: objectId }] : [])] })
+        .select('content.text author createdAt metrics views')
+        .populate('author', 'username profile.displayName')
+        .limit(limit)
+        .lean(),
+      objectId
+        ? Story.find({ $or: [{ _id: objectId }, { author: objectId }] })
+          .select('author media.type createdAt')
+          .populate('author', 'username profile.displayName')
+          .limit(limit)
+          .lean()
+        : Promise.resolve([]),
+      Report.find({ $or: [{ reason: text }, { details: text }, { targetType: text }, ...(objectId ? [{ _id: objectId }, { targetId: query }] : [])] })
+        .select('targetType targetId reason status createdAt reporter')
+        .populate('reporter', 'username profile.displayName')
+        .limit(limit)
+        .lean(),
+      BoostCampaign.find({ $or: [{ status: text }, ...(objectId ? [{ _id: objectId }, { user: objectId }, { post: objectId }] : [])] })
+        .populate('user', 'username profile.displayName')
+        .populate('post', 'content.text')
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean(),
+      PaymentTransaction.find({ $or: [{ type: text }, { status: text }, { paymentId: text }, { orderId: text }, ...(objectId ? [{ _id: objectId }, { user: objectId }] : [])] })
+        .populate('user', 'username profile.displayName')
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean(),
+      HostVerificationApplication.find({ $or: [{ fullName: text }, { contactNumber: text }, { status: text }, ...(objectId ? [{ _id: objectId }, { user: objectId }] : [])] })
+        .populate('user', 'username profile.displayName email')
+        .sort({ appliedAt: -1 })
+        .limit(limit)
+        .lean(),
+      TeamRecruitment.find({ $or: [{ recruitmentCode: text }, { game: text }, { role: text }, { staffRole: text }, ...(objectId ? [{ _id: objectId }, { team: objectId }] : [])] })
+        .populate('team', 'username profile.displayName')
+        .limit(limit)
+        .lean(),
+      Tournament.find({ $or: [{ name: text }, { game: text }, { status: text }, ...(objectId ? [{ _id: objectId }, { host: objectId }] : [])] })
+        .select('name game status host startDate endDate createdAt')
+        .populate('host', 'username profile.displayName')
+        .limit(limit)
+        .lean()
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        query,
+        results: { users, teams, posts, clips, stories, reports, boosts, payments, hosts, recruitments, tournaments }
+      }
+    });
+  } catch (error) {
+    log.error('Admin global search error:', { error: String(error) });
+    res.status(500).json({ success: false, message: 'Search failed' });
+  }
+};
+
+const getUserInspection = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const user = await User.findById(userId).select('-password').lean();
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const [
+      posts,
+      clips,
+      stories,
+      recruitments,
+      tournaments,
+      payments,
+      boosts,
+      reports,
+      warnings,
+      monetizationApplication
+    ] = await Promise.all([
+      Post.countDocuments({ author: userId }),
+      Post.countDocuments({ author: userId, 'content.media.type': 'video' }),
+      Story.countDocuments({ author: userId }),
+      TeamRecruitment.countDocuments({ team: userId }),
+      Tournament.countDocuments({ host: userId }),
+      PaymentTransaction.find({ user: userId }).sort({ createdAt: -1 }).limit(20).lean(),
+      BoostCampaign.find({ user: userId }).sort({ createdAt: -1 }).limit(20).lean(),
+      Report.find({ $or: [{ targetType: 'user', targetId: userId }] }).sort({ createdAt: -1 }).limit(20).lean(),
+      Promise.resolve(user.adminWarnings || []),
+      MonetizationApplication.findOne({ user: userId }).sort({ appliedAt: -1 }).lean()
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        user,
+        stats: {
+          followers: Array.isArray(user.followers) ? user.followers.length : 0,
+          following: Array.isArray(user.following) ? user.following.length : 0,
+          posts,
+          clips,
+          stories,
+          recruitments,
+          tournaments
+        },
+        payments,
+        boosts,
+        reports,
+        warnings,
+        monetizationApplication
+      }
+    });
+  } catch (error) {
+    log.error('Get user inspection error:', { error: String(error) });
+    res.status(500).json({ success: false, message: 'Failed to inspect user' });
+  }
+};
+
+const updateUserControls = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const allowedControls = [
+      'loginDisabled',
+      'postingDisabled',
+      'messagingDisabled',
+      'callsDisabled',
+      'storiesDisabled',
+      'clipsDisabled',
+      'commentsDisabled',
+      'liveFeaturesDisabled'
+    ];
+    const updates = {};
+    allowedControls.forEach((key) => {
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, key)) {
+        updates[`adminControls.${key}`] = Boolean(req.body[key]);
+      }
+    });
+    if (req.body?.reason != null) updates['adminControls.reason'] = String(req.body.reason).slice(0, 500);
+    updates['adminControls.updatedAt'] = new Date();
+    updates['adminControls.updatedBy'] = req.user?._id || null;
+
+    const user = await User.findByIdAndUpdate(userId, { $set: updates }, { new: true }).select('-password');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    res.locals.auditAfter = { userId, adminControls: user.adminControls };
+    res.json({ success: true, message: 'User controls updated', data: user });
+  } catch (error) {
+    log.error('Update user controls error:', { error: String(error) });
+    res.status(500).json({ success: false, message: 'Failed to update user controls' });
+  }
+};
+
+const grantPremium = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { tier = 'player_pro', days = 30 } = req.body || {};
+    const validDays = Math.min(3650, Math.max(1, parseInt(days, 10) || 30));
+    const validUntil = new Date(Date.now() + (validDays * dayMs));
+    const user = await User.findByIdAndUpdate(
+      userId,
+      {
+        $set: {
+          isPremium: true,
+          'membership.tier': tier,
+          'membership.validUntil': validUntil
+        }
+      },
+      { new: true }
+    ).select('-password');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    await createSystemNotification(userId, 'Premium Granted', `Premium access has been enabled until ${validUntil.toDateString()}.`, { type: 'premium_granted' });
+    res.json({ success: true, message: 'Premium granted', data: user });
+  } catch (error) {
+    log.error('Grant premium error:', { error: String(error) });
+    res.status(500).json({ success: false, message: 'Failed to grant premium' });
+  }
+};
+
+const removePremium = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const user = await User.findByIdAndUpdate(
+      userId,
+      {
+        $set: {
+          isPremium: false,
+          'membership.tier': 'free',
+          'membership.validUntil': null
+        }
+      },
+      { new: true }
+    ).select('-password');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    await createSystemNotification(userId, 'Premium Removed', 'Premium access has been removed by the platform.', { type: 'premium_removed' });
+    res.json({ success: true, message: 'Premium removed', data: user });
+  } catch (error) {
+    log.error('Remove premium error:', { error: String(error) });
+    res.status(500).json({ success: false, message: 'Failed to remove premium' });
+  }
+};
+
+const getBoostCampaigns = async (req, res) => {
+  try {
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = normalizeLimit(req.query.limit, 20, 100);
+    const { status, userId, postId } = req.query;
+    const query = {};
+    if (status && status !== 'all') query.status = status;
+    if (userId && mongoose.Types.ObjectId.isValid(userId)) query.user = userId;
+    if (postId && mongoose.Types.ObjectId.isValid(postId)) query.post = postId;
+
+    const campaignsToProgress = await BoostCampaign.find({ ...query, deliveryMode: 'manual', status: 'running' }).limit(limit);
+    await Promise.all(campaignsToProgress.map(applyManualDeliveryProgress));
+
+    const [campaigns, total] = await Promise.all([
+      BoostCampaign.find(query)
+        .populate('user', 'username profile.displayName profile.avatar email')
+        .populate('post', 'content.text content.media metrics views')
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      BoostCampaign.countDocuments(query)
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        campaigns,
+        pagination: {
+          current: page,
+          pages: Math.ceil(total / limit),
+          total
+        }
+      }
+    });
+  } catch (error) {
+    log.error('Get boost campaigns error:', { error: String(error) });
+    res.status(500).json({ success: false, message: 'Failed to fetch boost campaigns' });
+  }
+};
+
+const configureBoostDelivery = async (req, res) => {
+  try {
+    const { campaignId } = req.params;
+    const { durationHours = 6, targetViews } = req.body || {};
+    const duration = Math.min(720, Math.max(1, Number(durationHours) || 6));
+    const campaign = await BoostCampaign.findById(campaignId);
+    if (!campaign) return res.status(404).json({ success: false, message: 'Boost campaign not found' });
+    if (campaign.status === 'cancelled' || campaign.status === 'rejected') {
+      return res.status(400).json({ success: false, message: `Cannot deliver a ${campaign.status} campaign` });
+    }
+
+    const purchased = Number(campaign.purchasedReach) || Number(campaign.estimatedReach) || Number(targetViews) || 0;
+    const requestedTarget = Number(targetViews) || purchased;
+    const target = Math.max(1, Math.min(requestedTarget, purchased || requestedTarget));
+    const now = new Date();
+    const endsAt = new Date(now.getTime() + (duration * 60 * 60 * 1000));
+
+    campaign.deliveryMode = 'manual';
+    campaign.status = 'running';
+    campaign.startTime = campaign.startTime || now;
+    campaign.endTime = endsAt;
+    campaign.remainingReach = target;
+    campaign.manualDelivery = {
+      enabled: true,
+      durationHours: duration,
+      startedAt: now,
+      endsAt,
+      lastAppliedAt: now,
+      deliveredViews: 0,
+      targetViews: target,
+      remainingViews: target,
+      deliveryPercent: 0,
+      estimatedCompletionAt: endsAt
+    };
+    await campaign.save();
+
+    await Post.findByIdAndUpdate(campaign.post, {
+      boostedAt: now,
+      boostExpiresAt: endsAt,
+      boostMeta: {
+        activeCampaign: campaign._id,
+        status: 'running',
+        budget: campaign.budget,
+        estimatedReach: campaign.estimatedReach,
+        purchasedReach: campaign.purchasedReach,
+        remainingReach: target,
+        dailySpend: campaign.dailySpend,
+        totalSpend: campaign.totalSpend,
+        startTime: campaign.startTime,
+        endTime: endsAt,
+        targetAudience: campaign.targetAudience
+      }
+    });
+
+    res.json({
+      success: true,
+      message: 'Manual boost delivery configured',
+      data: { campaign }
+    });
+  } catch (error) {
+    log.error('Configure boost delivery error:', { error: String(error) });
+    res.status(500).json({ success: false, message: 'Failed to configure boost delivery' });
+  }
+};
+
+const updateBoostCampaignStatus = async (req, res) => {
+  try {
+    const { campaignId } = req.params;
+    const { status } = req.body || {};
+    if (!['running', 'paused', 'completed', 'cancelled', 'rejected'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'Invalid campaign status' });
+    }
+
+    const campaign = await BoostCampaign.findById(campaignId);
+    if (!campaign) return res.status(404).json({ success: false, message: 'Boost campaign not found' });
+
+    await applyManualDeliveryProgress(campaign);
+    const updated = await BoostCampaign.findByIdAndUpdate(
+      campaignId,
+      {
+        $set: {
+          status,
+          'manualDelivery.lastAppliedAt': new Date()
+        }
+      },
+      { new: true }
+    );
+
+    await Post.updateOne(
+      { _id: campaign.post, 'boostMeta.activeCampaign': campaign._id },
+      {
+        $set: {
+          'boostMeta.status': status,
+          'boostMeta.remainingReach': status === 'completed' || status === 'cancelled' || status === 'rejected' ? 0 : updated.remainingReach
+        }
+      }
+    );
+
+    res.json({ success: true, message: 'Boost campaign updated', data: { campaign: updated } });
+  } catch (error) {
+    log.error('Update boost campaign status error:', { error: String(error) });
+    res.status(500).json({ success: false, message: 'Failed to update boost campaign' });
+  }
+};
+
 module.exports = {
   getDashboardStats,
   getUserAnalytics,
@@ -1303,5 +1855,14 @@ module.exports = {
   approveHostVerificationApplication,
   rejectHostVerificationApplication,
   getVerifiedHosts,
-  revokeHostVerification
+  revokeHostVerification,
+  getAuditLogs,
+  globalSearch,
+  getUserInspection,
+  updateUserControls,
+  grantPremium,
+  removePremium,
+  getBoostCampaigns,
+  configureBoostDelivery,
+  updateBoostCampaignStatus
 };

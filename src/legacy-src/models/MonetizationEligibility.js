@@ -31,10 +31,12 @@ const monetizationEligibilitySchema = new mongoose.Schema({
   /** Snapshot of raw metrics used for eligibility (for display/debug) */
   metrics: {
     followersCount: { type: Number, default: 0 },
-    hasActiveCreatorMembership: { type: Boolean, default: false },
-    totalClipViews30d: { type: Number, default: 0 },
-    clipsWith2kViews30d: { type: Number, default: 0 },
-    activeDays30d: { type: Number, default: 0 },
+    hasActivePremiumMembership: { type: Boolean, default: false },
+    totalOrganicClipViews45d: { type: Number, default: 0 },
+    totalClipViews45d: { type: Number, default: 0 },
+    clipsWith3kOrganicViews45d: { type: Number, default: 0 },
+    clipsWith3kViews45d: { type: Number, default: 0 },
+    activeDays45d: { type: Number, default: 0 },
     creatorHealthScore: { type: Number, default: 0 },
     suspiciousViewSpike: { type: Boolean, default: false },
     policyViolations: { type: Number, default: 0 },

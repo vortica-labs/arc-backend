@@ -1,0 +1,91 @@
+const mongoose = require('mongoose');
+
+const adminAuditLogSchema = new mongoose.Schema({
+  actor: {
+    user: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null
+    },
+    username: {
+      type: String,
+      default: 'admin',
+      index: true
+    },
+    role: {
+      type: String,
+      default: 'super_admin',
+      index: true
+    },
+    permissions: [{
+      type: String
+    }]
+  },
+  action: {
+    type: String,
+    required: true,
+    index: true
+  },
+  resourceType: {
+    type: String,
+    default: 'system',
+    index: true
+  },
+  resourceId: {
+    type: String,
+    default: '',
+    index: true
+  },
+  method: {
+    type: String,
+    default: ''
+  },
+  path: {
+    type: String,
+    default: ''
+  },
+  statusCode: {
+    type: Number,
+    default: 0,
+    index: true
+  },
+  request: {
+    query: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {}
+    },
+    body: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {}
+    }
+  },
+  before: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null
+  },
+  after: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null
+  },
+  ip: {
+    type: String,
+    default: '',
+    index: true
+  },
+  userAgent: {
+    type: String,
+    default: ''
+  },
+  metadata: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {}
+  }
+}, {
+  timestamps: true
+});
+
+adminAuditLogSchema.index({ createdAt: -1 });
+adminAuditLogSchema.index({ action: 1, createdAt: -1 });
+adminAuditLogSchema.index({ resourceType: 1, resourceId: 1, createdAt: -1 });
+
+module.exports = mongoose.model('AdminAuditLog', adminAuditLogSchema);

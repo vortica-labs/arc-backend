@@ -3,8 +3,16 @@
  */
 const User = require('../models/User');
 const Tournament = require('../models/Tournament');
+const Post = require('../models/Post');
 const PaymentTransaction = require('../models/PaymentTransaction');
+const BoostCampaign = require('../models/BoostCampaign');
 const { PLAYER_PLANS, TEAM_PLANS } = require('./membershipController');
+const {
+  calculateBoostPrice,
+  createPendingBoostCampaign,
+  activateBoostCampaign,
+  normalizeFrequency
+} = require('../services/boostService');
 
 // Lazily initialise Razorpay so a missing key doesn't crash module load
 const Razorpay = require('razorpay');
@@ -456,22 +464,70 @@ async function verifyTournamentPayment(req, res) {
 async function createBoostOrder(req, res) {
   try {
     const { postId, amount, frequency, targetReach, targetPlayers, targetTeams } = req.body;
-    if (!postId || !amount || !frequency) {
-      return res.status(400).json({ success: false, message: 'postId, amount and frequency are required' });
+    if (!postId || !frequency) {
+      return res.status(400).json({ success: false, message: 'postId and frequency are required' });
     }
 
-    const amountPaise = Math.round(amount * 100);
+    const post = await Post.findById(postId).select('author isActive hiddenByAdmin');
+    if (!post || post.isActive === false || post.hiddenByAdmin === true) {
+      return res.status(404).json({ success: false, message: 'Post not found' });
+    }
+    if (post.author.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ success: false, message: 'You can only boost your own posts' });
+    }
+    if (targetPlayers === false && targetTeams === false) {
+      return res.status(400).json({ success: false, message: 'Select at least one target audience' });
+    }
+
+    const normalizedFrequency = normalizeFrequency(frequency);
+    const requiredAmount = calculateBoostPrice({
+      targetReach,
+      frequency: normalizedFrequency,
+      targetPlayers,
+      targetTeams
+    });
+    const requestedAmount = Number(amount) || 0;
+    if (requestedAmount > 0 && requestedAmount < requiredAmount) {
+      return res.status(400).json({
+        success: false,
+        message: 'Boost amount is below the required budget',
+        data: { requiredAmount }
+      });
+    }
+
+    const finalAmount = Math.max(requiredAmount, requestedAmount);
+    const amountPaise = Math.round(finalAmount * 100);
     const order = await getRazorpay().orders.create({
       amount: amountPaise,
       currency: 'INR',
       payment_capture: 1,
       receipt: `bst_${postId.toString().slice(-8)}_${Date.now().toString().slice(-8)}`,
-      notes: { postId, frequency, targetReach, targetPlayers, targetTeams }
+      notes: { postId, frequency: normalizedFrequency, targetReach, targetPlayers, targetTeams, userId: req.user._id.toString() }
+    });
+
+    const campaign = await createPendingBoostCampaign({
+      userId: req.user._id,
+      postId,
+      amount: finalAmount,
+      frequency: normalizedFrequency,
+      targetReach,
+      targetPlayers,
+      targetTeams,
+      razorpayOrderId: order.id,
+      currency: order.currency
     });
 
     res.status(200).json({
       success: true,
-      data: { orderId: order.id, amount: order.amount, currency: order.currency }
+      data: {
+        orderId: order.id,
+        campaignId: campaign._id,
+        amount: order.amount,
+        currency: order.currency,
+        requiredAmount: finalAmount,
+        estimatedReach: campaign.estimatedReach,
+        purchasedReach: campaign.purchasedReach
+      }
     });
   } catch (error) {
     console.error('Error creating boost order:', error);
@@ -503,41 +559,143 @@ async function verifyBoostPayment(req, res) {
       return res.status(400).json({ success: false, message: 'Payment not confirmed by Razorpay' });
     }
 
-    const Post = require('../models/Post');
-    const durationHours = frequency === 'daily' ? 24 : frequency === 'weekly' ? 168 : 720;
-    const boostExpiresAt = new Date(Date.now() + durationHours * 60 * 60 * 1000);
+    let campaign = await BoostCampaign.findOne({ razorpayOrderId: razorpay_order_id });
+    if (!campaign && postId) {
+      campaign = await BoostCampaign.findOne({
+        post: postId,
+        user: req.user._id,
+        status: 'pending'
+      }).sort({ createdAt: -1 });
+    }
 
-    await Post.findByIdAndUpdate(postId, {
-      boostedAt: new Date(),
-      boostExpiresAt,
-      $set: { 'boostMeta.targetReach': targetReach, 'boostMeta.targetPlayers': targetPlayers, 'boostMeta.targetTeams': targetTeams }
+    if (!campaign) {
+      return res.status(404).json({ success: false, message: 'Boost campaign not found for this payment order' });
+    }
+    if (campaign.user.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ success: false, message: 'You cannot verify another user boost payment' });
+    }
+
+    const paidAmount = amountFromRazorpayPayment(payment);
+    if (paidAmount + 0.001 < campaign.budget) {
+      campaign.status = 'rejected';
+      campaign.metadata = {
+        ...(campaign.metadata || {}),
+        rejectionReason: 'Paid amount below campaign budget',
+        paidAmount
+      };
+      await campaign.save();
+      return res.status(400).json({ success: false, message: 'Payment amount does not match boost budget' });
+    }
+
+    if (campaign.status === 'running' && campaign.razorpayPaymentId === razorpay_payment_id) {
+      return res.status(200).json({
+        success: true,
+        message: 'Boost already active',
+        data: {
+          campaignId: campaign._id,
+          boostExpiresAt: campaign.endTime,
+          remainingReach: campaign.remainingReach
+        },
+        boostExpiresAt: campaign.endTime
+      });
+    }
+
+    campaign.frequency = normalizeFrequency(frequency || campaign.frequency);
+    if (targetReach) campaign.metadata = { ...(campaign.metadata || {}), targetReach };
+    if (targetPlayers !== undefined || targetTeams !== undefined) {
+      campaign.targetAudience = {
+        ...(campaign.targetAudience || {}),
+        players: targetPlayers !== false,
+        teams: targetTeams !== false
+      };
+    }
+
+    const activatedCampaign = await activateBoostCampaign({
+      campaign,
+      paymentId: razorpay_payment_id,
+      paymentAmount: paidAmount
     });
 
     await recordPaymentTransaction({
       user: req.user._id,
       type: 'boost',
-      amount: amountFromRazorpayPayment(payment),
+      amount: paidAmount,
       currency: payment.currency || 'INR',
       status: 'completed',
-      description: `Post boost (${frequency})`,
+      description: `Post boost (${activatedCampaign.frequency})`,
       orderId: razorpay_order_id,
       paymentId: razorpay_payment_id,
-      referenceId: postId,
+      referenceId: activatedCampaign.post,
       referenceType: 'post',
       metadata: {
-        frequency,
-        targetReach,
-        targetPlayers,
-        targetTeams,
-        boostExpiresAt,
+        campaignId: activatedCampaign._id,
+        frequency: activatedCampaign.frequency,
+        targetReach: activatedCampaign.metadata?.requestedReach || targetReach,
+        targetPlayers: activatedCampaign.targetAudience?.players,
+        targetTeams: activatedCampaign.targetAudience?.teams,
+        boostExpiresAt: activatedCampaign.endTime,
+        purchasedReach: activatedCampaign.purchasedReach,
         razorpayStatus: payment.status
       }
     });
 
-    res.status(200).json({ success: true, message: 'Boost activated successfully', boostExpiresAt });
+    res.status(200).json({
+      success: true,
+      message: 'Boost activated successfully',
+      data: {
+        campaignId: activatedCampaign._id,
+        boostExpiresAt: activatedCampaign.endTime,
+        purchasedReach: activatedCampaign.purchasedReach,
+        remainingReach: activatedCampaign.remainingReach,
+        status: activatedCampaign.status
+      },
+      boostExpiresAt: activatedCampaign.endTime
+    });
   } catch (error) {
     console.error('Error verifying boost payment:', error);
     res.status(500).json({ success: false, message: 'Payment verification failed' });
+  }
+}
+
+async function getBoostCampaigns(req, res) {
+  try {
+    const query = { user: req.user._id };
+    if (req.query.postId) query.post = req.query.postId;
+    if (req.query.status) query.status = req.query.status;
+
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), 100);
+    const campaigns = await BoostCampaign.find(query)
+      .populate('post', 'content.text content.media boostedAt boostExpiresAt metrics')
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    res.status(200).json({
+      success: true,
+      data: {
+        campaigns: campaigns.map((campaign) => ({
+          _id: campaign._id,
+          post: campaign.post,
+          status: campaign.status,
+          budget: campaign.budget,
+          currency: campaign.currency,
+          frequency: campaign.frequency,
+          estimatedReach: campaign.estimatedReach,
+          purchasedReach: campaign.purchasedReach,
+          remainingReach: campaign.remainingReach,
+          dailySpend: campaign.dailySpend,
+          totalSpend: campaign.totalSpend,
+          startTime: campaign.startTime,
+          endTime: campaign.endTime,
+          targetAudience: campaign.targetAudience,
+          analytics: campaign.analytics,
+          createdAt: campaign.createdAt
+        }))
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching boost campaigns:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch boost campaigns' });
   }
 }
 
@@ -595,5 +753,6 @@ module.exports = {
   verifyTournamentPayment,
   createBoostOrder,
   verifyBoostPayment,
+  getBoostCampaigns,
   getPaymentHistory
 };

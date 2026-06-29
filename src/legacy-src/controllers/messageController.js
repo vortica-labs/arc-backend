@@ -143,9 +143,7 @@ const sendDirectMessage = async (req, res) => {
 
     // For shared post: use caption as text, or fallback to post URL (required for schema validation)
     if (sharedPostObj && !messageText.trim()) {
-      const baseUrl = req.protocol && req.get('host')
-        ? `${req.protocol}://${req.get('host')}`
-        : process.env.CLIENT_URL || 'https://arc.squadhunt.com';
+      const baseUrl = (process.env.FRONTEND_URL || process.env.CLIENT_URL || 'https://www.squadhunt.in').replace(/\/+$/, '');
       messageText = `${baseUrl}/post/${sharedPostId}`;
     }
     // Ensure content.text is never empty when we have shared post (schema requires text if no media)

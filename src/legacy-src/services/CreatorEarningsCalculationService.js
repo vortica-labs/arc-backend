@@ -9,6 +9,7 @@ const User = require('../models/User');
 const EarningsSnapshot = require('../models/EarningsSnapshot');
 const PayoutCycle = require('../models/PayoutCycle');
 const CreatorPayout = require('../models/CreatorPayout');
+const { getOrganicViewCount } = require('./boostService');
 
 // Platform keeps a share; kept for audit purposes
 const PLATFORM_REVENUE_SHARE_PERCENT = 30;
@@ -57,19 +58,18 @@ async function calculateCreatorEarnings(userId, cycle) {
   const posts = await Post.find({
     author: userId,
     isActive: true,
-    boostedAt: { $exists: false },
     createdAt: { $gte: cycle.startDate, $lte: cycle.endDate },
     'content.media': { $elemMatch: { type: 'video' } }
-  }).lean();
+  }).select('viewedBy views metrics boostMeta boostedAt').lean();
 
-  const totalClipViews = posts.reduce((sum, p) =>
-    sum + ((p.viewedBy && p.viewedBy.length) || p.views || 0), 0);
+  const totalClipViews = posts.reduce((sum, p) => sum + getOrganicViewCount(p), 0);
 
   const amount = Math.round((totalClipViews / 1000) * cpm * 100) / 100;
   return {
     amount,
     inputs: {
       totalClipViews,
+      totalOrganicClipViews: totalClipViews,
       cpm,
       platformSharePercent: PLATFORM_REVENUE_SHARE_PERCENT
     }

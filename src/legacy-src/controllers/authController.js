@@ -45,49 +45,83 @@ const resetLoginFailureCounters = async (res) => {
   }
 };
 
+const USERNAME_PATTERN = /^[a-zA-Z0-9_]+$/;
+const RESERVED_USERNAMES = new Set([
+  'admin',
+  'administrator',
+  'api',
+  'app',
+  'arc',
+  'auth',
+  'help',
+  'login',
+  'moderator',
+  'official',
+  'profile',
+  'register',
+  'root',
+  'settings',
+  'squadhunt',
+  'support',
+  'system',
+  'team',
+  'teams',
+  'user',
+  'users',
+]);
+
+const normalizeUsernameInput = (username) => String(username || '').replace(/\s/g, '').trim();
+
+const validateUsernameCandidate = (username) => {
+  if (!username) return 'Username is required';
+  if (username.length < 3 || username.length > 20) return 'Username must be between 3 and 20 characters';
+  if (!USERNAME_PATTERN.test(username)) return 'Username can only contain letters, numbers and underscores';
+  if (RESERVED_USERNAMES.has(username.toLowerCase())) return 'This username is reserved';
+  return '';
+};
+
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const buildUsernameLookup = (username, excludeUserId) => {
+  const query = {
+    username: { $regex: `^${escapeRegex(username)}$`, $options: 'i' },
+  };
+  if (excludeUserId) query._id = { $ne: excludeUserId };
+  return query;
+};
+
+const findExistingUsername = (username, excludeUserId) => {
+  return User.findOne(buildUsernameLookup(username, excludeUserId)).select('_id username');
+};
+
+const isUsernameDuplicateError = (error) => {
+  return error?.code === 11000 && (error?.keyPattern?.username || error?.keyValue?.username);
+};
+
+const sendUsernameDuplicate = (res) => {
+  return res.status(400).json({
+    success: false,
+    message: 'Username is already taken'
+  });
+};
+
 // Check username availability
 const checkUsernameAvailability = async (req, res) => {
   try {
     const { username } = req.query;
-    
-    if (!username || username.trim().length === 0) {
-      return res.status(400).json({
-        success: false,
-        available: false,
-        message: 'Username is required'
-      });
-    }
+    const cleanUsername = normalizeUsernameInput(username);
+    const validationError = validateUsernameCandidate(cleanUsername);
 
-    // Remove spaces
-    const cleanUsername = username.replace(/\s/g, '');
-    
-    // Validate format
-    if (cleanUsername.length < 3) {
+    if (validationError) {
       return res.status(400).json({
         success: false,
         available: false,
-        message: 'Username must be at least 3 characters'
-      });
-    }
-    
-    if (cleanUsername.length > 20) {
-      return res.status(400).json({
-        success: false,
-        available: false,
-        message: 'Username must be less than 20 characters'
-      });
-    }
-    
-    if (!/^[a-zA-Z0-9_]+$/.test(cleanUsername)) {
-      return res.status(400).json({
-        success: false,
-        available: false,
-        message: 'Username can only contain letters, numbers and underscores'
+        message: validationError
       });
     }
 
     // Check if username exists
-    const existingUser = await User.findOne({ username: cleanUsername });
+    const existingUser = await findExistingUsername(cleanUsername);
     
     if (existingUser) {
       return res.json({
@@ -157,14 +191,19 @@ const register = async (req, res) => {
   try {
     let { username, email, password, userType, displayName, bio, gender, dob, location, website, otp } = req.body;
     
-    // Remove spaces from username
-    if (username) {
-      username = username.replace(/\s/g, '');
+    username = normalizeUsernameInput(username);
+    email = String(email || '').trim().toLowerCase();
+    const usernameValidationError = validateUsernameCandidate(username);
+    if (usernameValidationError) {
+      return res.status(400).json({
+        success: false,
+        message: usernameValidationError
+      });
     }
 
     // Check if user already exists
     const existingUser = await User.findOne({
-      $or: [{ email }, { username }]
+      $or: [{ email }, buildUsernameLookup(username)]
     });
 
     if (existingUser) {
@@ -272,6 +311,9 @@ const register = async (req, res) => {
     });
 
   } catch (error) {
+    if (isUsernameDuplicateError(error)) {
+      return sendUsernameDuplicate(res);
+    }
     res.status(500).json({
       success: false,
       message: 'Registration failed',
@@ -537,9 +579,18 @@ const updateProfile = async (req, res) => {
       }
     });
     
-    // Remove spaces from username if provided
-    if (updates.username) {
-      updates.username = updates.username.replace(/\s/g, '');
+    // Normalize and validate username if provided.
+    if (updates.username !== undefined) {
+      updates.username = normalizeUsernameInput(updates.username);
+      if (updates.username !== req.user.username) {
+        const usernameValidationError = validateUsernameCandidate(updates.username);
+        if (usernameValidationError) {
+          return res.status(400).json({
+            success: false,
+            message: usernameValidationError
+          });
+        }
+      }
     }
 
     // Handle avatar upload if provided
@@ -562,12 +613,9 @@ const updateProfile = async (req, res) => {
     // Handle username update with uniqueness check
     if (updates.username && updates.username !== req.user.username) {
       // Check if username is already taken
-      const existingUser = await User.findOne({ username: updates.username });
+      const existingUser = await findExistingUsername(updates.username, userId);
       if (existingUser) {
-        return res.status(400).json({
-          success: false,
-          message: 'Username is already taken'
-        });
+        return sendUsernameDuplicate(res);
       }
       updateObject.username = updates.username;
     }
@@ -618,6 +666,9 @@ const updateProfile = async (req, res) => {
     });
 
   } catch (error) {
+    if (isUsernameDuplicateError(error)) {
+      return sendUsernameDuplicate(res);
+    }
     res.status(500).json({
       success: false,
       message: 'Failed to update profile',
@@ -818,11 +869,7 @@ const completeGoogleProfile = async (req, res) => {
   try {
     const userId = req.user._id;
     let { userType, username, password } = req.body;
-    
-    // Remove spaces from username
-    if (username) {
-      username = username.replace(/\s/g, '');
-    }
+    username = normalizeUsernameInput(username);
 
     // Get user
     const user = await User.findById(userId);
@@ -851,17 +898,11 @@ const completeGoogleProfile = async (req, res) => {
     }
 
     // Validate username
-    if (!username || username.length < 3 || username.length > 20) {
+    const usernameValidationError = validateUsernameCandidate(username);
+    if (usernameValidationError) {
       return res.status(400).json({
         success: false,
-        message: 'Username must be between 3 and 20 characters'
-      });
-    }
-
-    if (!/^[a-zA-Z0-9_]+$/.test(username)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Username can only contain letters, numbers and underscores'
+        message: usernameValidationError
       });
     }
 
@@ -874,16 +915,10 @@ const completeGoogleProfile = async (req, res) => {
     }
 
     // Check if username is already taken by another user
-    const existingUser = await User.findOne({ 
-      username, 
-      _id: { $ne: userId } 
-    });
+    const existingUser = await findExistingUsername(username, userId);
 
     if (existingUser) {
-      return res.status(400).json({
-        success: false,
-        message: 'Username is already taken'
-      });
+      return sendUsernameDuplicate(res);
     }
 
     // Update user with userType, username and password
@@ -932,6 +967,9 @@ const completeGoogleProfile = async (req, res) => {
     });
 
   } catch (error) {
+    if (isUsernameDuplicateError(error)) {
+      return sendUsernameDuplicate(res);
+    }
     res.status(500).json({
       success: false,
       message: 'Failed to complete profile',

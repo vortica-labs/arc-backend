@@ -158,6 +158,49 @@ const postSchema = new mongoose.Schema({
   boostExpiresAt: {
     type: Date
   },
+  boostMeta: {
+    activeCampaign: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'BoostCampaign'
+    },
+    status: {
+      type: String,
+      enum: ['pending', 'running', 'paused', 'completed', 'cancelled', 'rejected'],
+      default: undefined
+    },
+    budget: { type: Number, default: 0 },
+    estimatedReach: { type: Number, default: 0 },
+    purchasedReach: { type: Number, default: 0 },
+    remainingReach: { type: Number, default: 0 },
+    dailySpend: { type: Number, default: 0 },
+    totalSpend: { type: Number, default: 0 },
+    startTime: Date,
+    endTime: Date,
+    targetAudience: {
+      players: { type: Boolean, default: true },
+      teams: { type: Boolean, default: true },
+      tags: [{ type: String, trim: true, lowercase: true }],
+      regions: [{ type: String, trim: true }]
+    }
+  },
+  metrics: {
+    organicViews: { type: Number, default: 0 },
+    boostViews: { type: Number, default: 0 },
+    organicReach: { type: Number, default: 0 },
+    boostReach: { type: Number, default: 0 },
+    organicWatchTimeMs: { type: Number, default: 0 },
+    boostWatchTimeMs: { type: Number, default: 0 },
+    organicLikes: { type: Number, default: 0 },
+    boostLikes: { type: Number, default: 0 },
+    organicComments: { type: Number, default: 0 },
+    boostComments: { type: Number, default: 0 },
+    organicShares: { type: Number, default: 0 },
+    boostShares: { type: Number, default: 0 },
+    organicSaves: { type: Number, default: 0 },
+    boostSaves: { type: Number, default: 0 },
+    organicCtr: { type: Number, default: 0 },
+    boostCtr: { type: Number, default: 0 }
+  },
   views: {
     type: Number,
     default: 0
@@ -190,6 +233,8 @@ postSchema.index({ isActive: 1, hiddenByAdmin: 1, 'content.media.type': 1, creat
 postSchema.index({ 'viewedBy.user': 1, createdAt: -1 });
 postSchema.index({ 'likes.user': 1, createdAt: -1 });
 postSchema.index({ 'comments.user': 1, createdAt: -1 });
+postSchema.index({ 'boostMeta.status': 1, 'boostMeta.endTime': 1, 'boostMeta.remainingReach': 1 });
+postSchema.index({ 'metrics.organicViews': -1, createdAt: -1 });
 
 // Virtual for like count
 postSchema.virtual('likeCount').get(function() {

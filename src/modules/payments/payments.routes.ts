@@ -14,6 +14,7 @@ router.post("/tournament/create-order", protect, paymentController.createTournam
 router.post("/tournament/verify", protect, paymentController.verifyTournamentPayment);
 
 // Boost payment routes
+router.get("/boost/campaigns", protect, paymentController.getBoostCampaigns);
 router.post("/boost/create-order", protect, paymentController.createBoostOrder);
 router.post("/boost/verify", protect, paymentController.verifyBoostPayment);
 
