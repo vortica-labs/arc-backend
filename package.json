@@ -8,6 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
+    "test:auth-limiter": "node src/legacy-src/middleware/progressiveAuthLimiter.test.js",
     "test:recommendations": "node src/legacy-src/services/recommendationService.test.js",
     "test:random-connect": "node src/legacy-src/controllers/randomConnectController.test.js"
   },

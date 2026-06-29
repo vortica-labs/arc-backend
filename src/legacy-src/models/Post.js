@@ -208,8 +208,8 @@ postSchema.virtual('shareCount').get(function() {
 
 // Unique view count (viewedBy.length; fallback to views for old posts)
 postSchema.virtual('viewCount').get(function() {
-  if (this.viewedBy && this.viewedBy.length > 0) return this.viewedBy.length;
-  return this.views || 0;
+  const uniqueViews = this.viewedBy && this.viewedBy.length > 0 ? this.viewedBy.length : 0;
+  return Math.max(this.views || 0, uniqueViews);
 });
 
 // Ensure virtual fields are included in JSON

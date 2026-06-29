@@ -92,7 +92,7 @@ router.post("/verify-otp-login", progressiveOtpLoginLimiter, legacyAuthControlle
 router.post("/reset-password-otp", otpLimiter, legacyAuthController.resetPasswordWithOtp);
 router.post("/check-password-same", legacyAuthController.checkPasswordSame);
 router.post("/register", uploadSingle("avatar"), registerValidation, legacyAuthController.register);
-router.post("/login", loginValidation, progressiveLoginLimiter, legacyAuthController.login);
+router.post("/login", progressiveLoginLimiter, loginValidation, legacyAuthController.login);
 router.post("/guest-token", legacyAuthController.generateGuestToken);
 router.get("/me", protect, legacyAuthController.getMe);
 router.put("/profile", protect, uploadSingle("avatar"), profileUpdateValidation, legacyAuthController.updateProfile);

@@ -334,7 +334,7 @@ const recordClipView = async (req, res) => {
       {
         _id: postId,
         isActive: true,
-        'viewedBy.user': { $ne: userId }
+        viewedBy: { $not: { $elemMatch: { user: userId } } }
       },
       {
         $push: { viewedBy: { user: userId, viewedAt: now } },
@@ -415,7 +415,7 @@ const getPost = async (req, res) => {
       await Post.updateOne(
         {
           _id: postId,
-          'viewedBy.user': { $ne: viewerId }
+          viewedBy: { $not: { $elemMatch: { user: viewerId } } }
         },
         {
           $push: { viewedBy: { user: viewerId, viewedAt: new Date() } },
@@ -456,57 +456,78 @@ const toggleLike = async (req, res) => {
     const userId = req.user._id;
 
     const existingPost = await Post.findById(postId).select('author likes isActive');
-    const post = existingPost;
-    if (!post) {
+    if (!existingPost || existingPost.isActive === false) {
       return res.status(404).json({
         success: false,
         message: 'Post not found'
       });
     }
-    if (post.isActive === false) {
-      return res.status(404).json({ success: false, message: 'Post not found' });
-    }
 
-    const alreadyLiked = post.likes.findIndex((like) => {
+    const alreadyLiked = existingPost.likes.findIndex((like) => {
       const likeUser = like?.user?._id || like?.user;
       if (!likeUser) return false;
       return likeUser.toString() === userId.toString();
     }) > -1;
 
-    const updatedPost = alreadyLiked
-      ? await Post.findOneAndUpdate(
-        { _id: postId, 'likes.user': userId },
-        { $pull: { likes: { user: userId } } },
-        { new: true }
-      ).select('author likes')
-      : await Post.findOneAndUpdate(
-        { _id: postId, 'likes.user': { $ne: userId } },
-        { $push: { likes: { user: userId, likedAt: new Date() } } },
-        { new: true }
-      ).select('author likes');
+    if (alreadyLiked) {
+      await Post.updateOne(
+        { _id: postId, isActive: true },
+        { $pull: { likes: { user: userId } } }
+      );
+    } else {
+      await Post.updateOne(
+        {
+          _id: postId,
+          isActive: true,
+          likes: { $not: { $elemMatch: { user: userId } } }
+        },
+        { $push: { likes: { user: userId, likedAt: new Date() } } }
+      );
+    }
 
-    const finalPost = updatedPost || await Post.findById(postId).select('author likes');
-    const isLiked = !alreadyLiked;
+    const finalPost = await Post.findById(postId)
+      .populate('author', 'username profile.displayName profile.avatar userType')
+      .populate('likes.user', 'username profile.displayName profile.avatar')
+      .populate('comments.user', 'username profile.displayName profile.avatar')
+      .select('author content postType achievementInfo tags mentions likes comments shares attachedMusic visibility isActive hiddenByAdmin boostedAt boostExpiresAt views viewedBy createdAt updatedAt');
+    if (!finalPost || finalPost.isActive === false) {
+      return res.status(404).json({
+        success: false,
+        message: 'Post not found'
+      });
+    }
+
+    const authorId = finalPost.author?._id || finalPost.author;
+    const finalLikes = Array.isArray(finalPost?.likes) ? finalPost.likes : [];
+    const isLiked = finalLikes.some((like) => {
+      const likeUser = like?.user?._id || like?.user;
+      return likeUser && likeUser.toString() === userId.toString();
+    });
+    const uniqueLikeCount = new Set(finalLikes.map((like) => {
+      const likeUser = like?.user?._id || like?.user;
+      return likeUser ? likeUser.toString() : '';
+    }).filter(Boolean)).size || finalLikes.length;
 
     await recordEngagementEvent({
       userId,
       postId,
-      authorId: finalPost.author,
+      authorId,
       eventType: isLiked ? 'like' : 'unlike',
       context: req.body?.context || 'feed'
     });
 
     // Create notification for post author (if not liking own post)
-    if (isLiked && finalPost.author.toString() !== userId.toString()) {
-      await createLikeNotification(finalPost.author, userId, finalPost._id);
+    if (isLiked && authorId && authorId.toString() !== userId.toString()) {
+      await createLikeNotification(authorId, userId, finalPost._id);
     }
 
     res.status(200).json({
       success: true,
       message: isLiked ? 'Post liked' : 'Post unliked',
       data: {
-        likeCount: finalPost.likes.length,
-        isLiked
+        likeCount: uniqueLikeCount,
+        isLiked,
+        post: formatPostDTO(finalPost, req.user && req.user.userType === 'guest', authorId?.toString?.() === userId.toString())
       }
     });
 

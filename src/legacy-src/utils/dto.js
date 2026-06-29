@@ -47,12 +47,31 @@ const formatUserDTO = (user, isGuest = false, isSelf = false) => {
   return dto;
 };
 
+const getLikeUserId = (like) => {
+  const user = like && (like.user?._id || like.user);
+  return user ? String(user) : '';
+};
+
+const uniqueLikeCount = (likes) => {
+  if (!Array.isArray(likes)) return 0;
+  const ids = likes.map(getLikeUserId).filter(Boolean);
+  return ids.length > 0 ? new Set(ids).size : likes.length;
+};
+
 const formatPostDTO = (post, isGuest = false, isAuthor = false) => {
   if (!post) return null;
   
   const dto = typeof post.toObject === 'function' 
     ? post.toObject({ virtuals: true }) 
     : JSON.parse(JSON.stringify(post));
+
+  const rawViewCount = Number(dto.viewCount) || 0;
+  const uniqueViewCount = Array.isArray(dto.viewedBy) ? dto.viewedBy.length : 0;
+  const storedViewCount = Number(dto.views) || 0;
+  dto.likeCount = uniqueLikeCount(dto.likes);
+  dto.commentCount = Array.isArray(dto.comments) ? dto.comments.length : Number(dto.commentCount) || 0;
+  dto.shareCount = Array.isArray(dto.shares) ? dto.shares.length : Number(dto.shareCount) || 0;
+  dto.viewCount = Math.max(rawViewCount, storedViewCount, uniqueViewCount);
 
   // ALWAYS remove reports and precise viewing history unless author/admin
   delete dto.reports;

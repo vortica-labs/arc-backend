@@ -140,8 +140,7 @@ router.post('/verify-otp-login', progressiveOtpLoginLimiter, verifyOtpAndLogin);
 router.post('/reset-password-otp', otpLimiter, resetPasswordWithOtp);
 router.post('/check-password-same', checkPasswordSame);
 router.post('/register', uploadSingle('avatar'), registerValidation, register);
-// Progressive limiter is placed after validation so invalid payloads don't get counted.
-router.post('/login', loginValidation, progressiveLoginLimiter, login);
+router.post('/login', progressiveLoginLimiter, loginValidation, login);
 router.post('/guest-token', generateGuestToken);
 router.get('/me', protect, getMe);
 router.put('/profile', protect, uploadSingle('avatar'), profileUpdateValidation, updateProfile);
