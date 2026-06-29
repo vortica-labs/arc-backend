@@ -111,20 +111,41 @@ const getTeamRecruitments = safeAsyncHandler(async (req, res) => {
   // Search functionality
   if (search) {
     query.$or = [
+      { game: { $regex: search, $options: 'i' } },
       { role: { $regex: search, $options: 'i' } },
       { staffRole: { $regex: search, $options: 'i' } },
-      { 'requirements.additionalRequirements': { $regex: search, $options: 'i' } }
+      { 'requirements.additionalRequirements': { $regex: search, $options: 'i' } },
+      { 'requirements.requiredSkills': { $regex: search, $options: 'i' } },
+      { 'requirements.experienceLevel': { $regex: search, $options: 'i' } },
+      { 'requirements.language': { $regex: search, $options: 'i' } },
+      { 'benefits.location': { $regex: search, $options: 'i' } }
     ];
   }
 
+  const sortDirection = sortOrder === 'desc' ? -1 : 1;
   const sortOptions = {};
-  sortOptions[sortBy] = sortOrder === 'desc' ? -1 : 1;
+  sortOptions[sortBy] = sortDirection;
 
-  const recruitments = await TeamRecruitment.find(query)
-    .populate('team', 'username profile.displayName profile.avatar')
-    .sort(sortOptions)
-    .limit(limit * 1)
-    .skip((page - 1) * limit);
+  let recruitments;
+  if (sortBy === 'applicantCount') {
+    const docs = await TeamRecruitment.aggregate([
+      { $match: query },
+      { $addFields: { applicantCount: { $size: { $ifNull: ['$applicants', []] } } } },
+      { $sort: { applicantCount: sortDirection, createdAt: -1 } },
+      { $skip: (page - 1) * limit },
+      { $limit: limit * 1 }
+    ]);
+    recruitments = await TeamRecruitment.populate(docs, {
+      path: 'team',
+      select: 'username profile.displayName profile.avatar'
+    });
+  } else {
+    recruitments = await TeamRecruitment.find(query)
+      .populate('team', 'username profile.displayName profile.avatar')
+      .sort(sortOptions)
+      .limit(limit * 1)
+      .skip((page - 1) * limit);
+  }
 
   const total = await TeamRecruitment.countDocuments(query);
 
@@ -426,22 +447,46 @@ const getPlayerProfiles = safeAsyncHandler(async (req, res) => {
   // Search functionality
   if (search) {
     query.$or = [
+      { game: { $regex: search, $options: 'i' } },
       { role: { $regex: search, $options: 'i' } },
       { staffRole: { $regex: search, $options: 'i' } },
+      { 'playerInfo.playerName': { $regex: search, $options: 'i' } },
+      { 'playerInfo.currentRank': { $regex: search, $options: 'i' } },
+      { 'playerInfo.experienceLevel': { $regex: search, $options: 'i' } },
+      { 'playerInfo.languages': { $regex: search, $options: 'i' } },
       { 'playerInfo.additionalInfo': { $regex: search, $options: 'i' } },
-      { 'professionalInfo.skillsAndExpertise': { $regex: search, $options: 'i' } }
+      { 'professionalInfo.fullName': { $regex: search, $options: 'i' } },
+      { 'professionalInfo.skillsAndExpertise': { $regex: search, $options: 'i' } },
+      { 'professionalInfo.preferredLocation': { $regex: search, $options: 'i' } },
+      { 'expectations.preferredLocation': { $regex: search, $options: 'i' } }
     ];
   }
 
+  const sortDirection = sortOrder === 'desc' ? -1 : 1;
   const sortOptions = {};
-  sortOptions[sortBy] = sortOrder === 'desc' ? -1 : 1;
+  sortOptions[sortBy] = sortDirection;
 
-  const profiles = await PlayerProfile.find(query)
-    .populate('player', 'username profile.displayName profile.avatar')
-    .sort(sortOptions)
-    .limit(limit * 1)
-    .skip((page - 1) * limit)
-    .lean();
+  let profiles;
+  if (sortBy === 'interestedTeamsCount') {
+    const docs = await PlayerProfile.aggregate([
+      { $match: query },
+      { $addFields: { interestedTeamsCount: { $size: { $ifNull: ['$interestedTeams', []] } } } },
+      { $sort: { interestedTeamsCount: sortDirection, createdAt: -1 } },
+      { $skip: (page - 1) * limit },
+      { $limit: limit * 1 }
+    ]);
+    profiles = await PlayerProfile.populate(docs, {
+      path: 'player',
+      select: 'username profile.displayName profile.avatar'
+    });
+  } else {
+    profiles = await PlayerProfile.find(query)
+      .populate('player', 'username profile.displayName profile.avatar')
+      .sort(sortOptions)
+      .limit(limit * 1)
+      .skip((page - 1) * limit)
+      .lean();
+  }
 
   const total = await PlayerProfile.countDocuments(query);
 
@@ -666,6 +711,56 @@ const applyToRecruitment = safeAsyncHandler(async (req, res) => {
   });
 });
 
+// Withdraw user's active application from a team recruitment (by ID or code)
+const withdrawApplication = safeAsyncHandler(async (req, res) => {
+  const { recruitmentId } = req.params;
+  const applicantId = req.user._id;
+
+  let recruitment;
+  const mongoose = require('mongoose');
+  if (recruitmentId && recruitmentId.includes('-')) {
+    recruitment = await TeamRecruitment.findOne({ recruitmentCode: recruitmentId.toUpperCase() });
+  } else if (recruitmentId && mongoose.Types.ObjectId.isValid(recruitmentId)) {
+    recruitment = await TeamRecruitment.findById(recruitmentId);
+  } else {
+    recruitment = await TeamRecruitment.findOne({ recruitmentCode: recruitmentId });
+  }
+
+  if (!recruitment) {
+    return res.status(404).json({
+      success: false,
+      message: 'Recruitment post not found'
+    });
+  }
+
+  const application = await RecruitmentApplication.findOne({
+    applicant: applicantId,
+    recruitment: recruitment._id,
+    isActive: true
+  });
+
+  if (!application) {
+    return res.status(404).json({
+      success: false,
+      message: 'Active application not found'
+    });
+  }
+
+  application.status = 'withdrawn';
+  application.isActive = false;
+  await application.save();
+
+  recruitment.applicants = recruitment.applicants.filter(
+    app => app.user.toString() !== applicantId.toString()
+  );
+  await recruitment.save();
+
+  res.json({
+    success: true,
+    message: 'Application withdrawn successfully'
+  });
+});
+
 // Show interest in player profile
 const showInterestInProfile = safeAsyncHandler(async (req, res) => {
   const { profileId } = req.params;
@@ -681,7 +776,15 @@ const showInterestInProfile = safeAsyncHandler(async (req, res) => {
   }
 
   // Check if profile exists
-  const profile = await PlayerProfile.findById(profileId);
+  let profile;
+  const mongoose = require('mongoose');
+  if (profileId && profileId.includes('-')) {
+    profile = await PlayerProfile.findOne({ profileCode: profileId.toUpperCase() });
+  } else if (profileId && mongoose.Types.ObjectId.isValid(profileId)) {
+    profile = await PlayerProfile.findById(profileId);
+  } else {
+    profile = await PlayerProfile.findOne({ profileCode: profileId });
+  }
   if (!profile) {
     return res.status(404).json({
       success: false,
@@ -766,10 +869,13 @@ const getTeamApplications = safeAsyncHandler(async (req, res) => {
   if (recruitmentId) {
     // Find recruitment by code or ID
     let recruitment;
-    if (recruitmentId && recruitmentId.length === 16 && /^[A-F0-9]+$/.test(recruitmentId)) {
-      recruitment = await TeamRecruitment.findOne({ recruitmentCode: recruitmentId });
-    } else {
+    const mongoose = require('mongoose');
+    if (recruitmentId && recruitmentId.includes('-')) {
+      recruitment = await TeamRecruitment.findOne({ recruitmentCode: recruitmentId.toUpperCase() });
+    } else if (recruitmentId && mongoose.Types.ObjectId.isValid(recruitmentId)) {
       recruitment = await TeamRecruitment.findById(recruitmentId);
+    } else {
+      recruitment = await TeamRecruitment.findOne({ recruitmentCode: recruitmentId });
     }
     
     if (!recruitment || recruitment.team.toString() !== teamId.toString()) {
@@ -816,6 +922,14 @@ const updateApplicationStatus = safeAsyncHandler(async (req, res) => {
   const { applicationId } = req.params;
   const { status, message } = req.body;
   const teamId = req.user._id;
+  const allowedStatuses = ['pending', 'reviewed', 'shortlisted', 'rejected', 'accepted', 'withdrawn'];
+
+  if (!allowedStatuses.includes(status)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid application status'
+    });
+  }
 
   // Validate team user
   if (req.user.userType !== 'team') {
@@ -1049,6 +1163,7 @@ module.exports = {
   
   // Applications
   applyToRecruitment,
+  withdrawApplication,
   showInterestInProfile,
   getUserApplications,
   getTeamApplications,

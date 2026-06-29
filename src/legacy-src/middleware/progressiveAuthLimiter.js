@@ -15,13 +15,42 @@ function getIdentifier(req, kind) {
   return toSafeLower(req.body?.email || req.body?.username || req.body?.identifier);
 }
 
-function computeCooldownSeconds(fails) {
+function computeCooldownSeconds(fails, kind = 'password') {
+  if (kind === 'password') {
+    if (fails <= 2) return 0;          // 2 normal invalid-credential responses
+    if (fails <= 5) return 30;         // 3-5 failures -> 30 sec
+    if (fails <= 8) return 2 * 60;     // 6-8 failures -> 2 min
+    if (fails <= 12) return 10 * 60;   // 9-12 failures -> 10 min
+    if (fails <= 16) return 30 * 60;   // 13-16 failures -> 30 min
+    return 60 * 60;                    // 17+ failures -> 60 min
+  }
+
   if (fails <= 5) return 0;          // 5 free attempts before any lock
-  if (fails <= 8) return 30;         // 6-8  failures → 30 sec
-  if (fails <= 12) return 2 * 60;    // 9-12 failures → 2 min
-  if (fails <= 16) return 10 * 60;   // 13-16 failures → 10 min
-  if (fails <= 20) return 30 * 60;   // 17-20 failures → 30 min
-  return 60 * 60;                    // 21+  failures → 60 min
+  if (fails <= 8) return 30;         // 6-8 failures -> 30 sec
+  if (fails <= 12) return 2 * 60;    // 9-12 failures -> 2 min
+  if (fails <= 16) return 10 * 60;   // 13-16 failures -> 10 min
+  if (fails <= 20) return 30 * 60;   // 17-20 failures -> 30 min
+  return 60 * 60;                    // 21+ failures -> 60 min
+}
+
+function buildRateLimitResult(kind, retryAfterSec) {
+  return {
+    retryAfter: retryAfterSec,
+    message: kind === 'password'
+      ? `Too many failed login attempts. Please try again in ${retryAfterSec} seconds.`
+      : `Too many attempts. Try again after ${retryAfterSec} seconds.`
+  };
+}
+
+function sendRateLimitResponse(res, kind, retryAfterSec) {
+  const result = buildRateLimitResult(kind, retryAfterSec);
+  res.setHeader('Retry-After', String(retryAfterSec));
+  return res.status(429).json({
+    success: false,
+    message: result.message,
+    error: 'RATE_LIMIT_EXCEEDED',
+    retryAfter: result.retryAfter
+  });
 }
 
 // In-memory fallback when Redis is unavailable
@@ -55,7 +84,7 @@ async function getActiveEntry(key, nowMs) {
   const entry = await getEntry(key);
 
   if (entry?.blockedUntilMs && entry.blockedUntilMs <= nowMs && entry.blockedUntilMs > 0) {
-    entry.fails = Math.max(0, entry.fails - 3);
+    entry.fails = 0;
     entry.blockedUntilMs = 0;
     await setEntry(key, entry);
   }
@@ -110,6 +139,41 @@ async function delEntry(key) {
   await del(`pal:${key}`);
 }
 
+async function resetEntries(keys) {
+  await Promise.all(keys.map(delEntry));
+}
+
+async function recordFailureForKeys(keys, kind) {
+  const now = Date.now();
+  const blockedUntilValues = await Promise.all(keys.map(async (key) => {
+    const current = (await getActiveEntry(key, now)) || createEmptyEntry();
+
+    if (current.blockedUntilMs && current.blockedUntilMs > now) {
+      current.lastSeenAtMs = now;
+      await setEntry(key, current);
+      return current.blockedUntilMs;
+    }
+
+    current.fails += 1;
+    current.lastFailAtMs = now;
+    current.lastSeenAtMs = now;
+
+    const cooldownSec = computeCooldownSeconds(current.fails, kind);
+    if (cooldownSec > 0) {
+      current.blockedUntilMs = now + cooldownSec * 1000;
+    }
+
+    await setEntry(key, current);
+    return current.blockedUntilMs || 0;
+  }));
+
+  const blockedUntilMs = Math.max(0, ...blockedUntilValues);
+  if (blockedUntilMs <= now) return null;
+
+  const retryAfterSec = Math.max(1, Math.ceil((blockedUntilMs - now) / 1000));
+  return buildRateLimitResult(kind, retryAfterSec);
+}
+
 function createProgressiveAuthLimiter(options) {
   const kind = options?.kind || 'password'; // 'password' | 'otp'
   const name = options?.name || 'auth';
@@ -122,18 +186,39 @@ function createProgressiveAuthLimiter(options) {
 
     if (blockedUntilMs > nowMs) {
       const retryAfterSec = Math.max(1, Math.ceil((blockedUntilMs - nowMs) / 1000));
-      res.setHeader('Retry-After', String(retryAfterSec));
-      return res.status(429).json({
-        success: false,
-        message: `Too many attempts. Try again after ${retryAfterSec} seconds.`,
-        error: 'RATE_LIMIT_EXCEEDED',
-        retryAfter: retryAfterSec
-      });
+      return sendRateLimitResponse(res, kind, retryAfterSec);
     }
+
+    let outcomeTracked = false;
+    res.locals = res.locals || {};
+    res.locals.progressiveAuthLimiter = {
+      recordFailure: async () => {
+        outcomeTracked = true;
+        try {
+          return await recordFailureForKeys(keys, kind);
+        } catch (error) {
+          outcomeTracked = false;
+          throw error;
+        }
+      },
+      reset: async () => {
+        outcomeTracked = true;
+        try {
+          await resetEntries(keys);
+        } catch (error) {
+          outcomeTracked = false;
+          throw error;
+        }
+      }
+    };
 
     // Track outcome after controller runs.
     res.on('finish', async () => {
       try {
+        if (outcomeTracked) {
+          return;
+        }
+
         const status = res.statusCode;
         const isSuccess = status >= 200 && status < 300;
         const isFailure =
@@ -141,7 +226,7 @@ function createProgressiveAuthLimiter(options) {
           (kind === 'otp' && (status === 400 || status === 401)); // invalid/expired OTP or deactivated
 
         if (isSuccess) {
-          await Promise.all(keys.map(delEntry));
+          await resetEntries(keys);
           return;
         }
 
@@ -149,18 +234,7 @@ function createProgressiveAuthLimiter(options) {
           return;
         }
 
-        await Promise.all(keys.map(async (key) => {
-          const current = (await getEntry(key)) || createEmptyEntry();
-          const now = Date.now();
-          current.fails += 1;
-          current.lastFailAtMs = now;
-          current.lastSeenAtMs = now;
-          const cooldownSec = computeCooldownSeconds(current.fails);
-          if (cooldownSec > 0) {
-            current.blockedUntilMs = now + cooldownSec * 1000;
-          }
-          await setEntry(key, current);
-        }));
+        await recordFailureForKeys(keys, kind);
       } catch (err) {
         // Best-effort tracking; don't crash the response
         console.error('Progressive auth limiter tracking error:', err.message);
@@ -179,6 +253,7 @@ module.exports = {
     createProgressiveAuthLimiter,
     getIdentifier,
     getLimitKeys,
-    localStore
+    localStore,
+    recordFailureForKeys
   }
 };
