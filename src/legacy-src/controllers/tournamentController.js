@@ -959,7 +959,7 @@ const updateTournament = async (req, res) => {
       }
 
       try {
-        const tournament = await Tournament.findById(req.params.id);
+        let tournament = await Tournament.findById(req.params.id);
 
         if (!tournament) {
           return res.status(404).json({
@@ -1215,7 +1215,7 @@ const joinTournament = async (req, res) => {
 // Leave tournament
 const leaveTournament = async (req, res) => {
   try {
-    const tournament = await Tournament.findById(req.params.id);
+    let tournament = await Tournament.findById(req.params.id);
 
     if (!tournament) {
       return res.status(404).json({
@@ -1226,16 +1226,11 @@ const leaveTournament = async (req, res) => {
 
     const userId = req.user._id;
 
-    // Check if user is registered as individual participant
+    // Check if user is registered as individual participant or directly as a team
     const isIndividualParticipant = tournament.participants.some(p => p.toString() === userId.toString());
-    
-    // Check if user is part of any team
-    const userTeam = tournament.teams.find(teamId => {
-      // We need to populate teams to check members
-      return false; // This will be handled in the next step
-    });
+    const isTeamParticipant = tournament.teams.some(t => t.toString() === userId.toString());
 
-    if (!isIndividualParticipant && !userTeam) {
+    if (!isIndividualParticipant && !isTeamParticipant) {
       return res.status(400).json({
         success: false,
         message: 'You are not registered for this tournament'
@@ -1246,8 +1241,19 @@ const leaveTournament = async (req, res) => {
     if (isIndividualParticipant) {
       tournament.participants = tournament.participants.filter(id => id.toString() !== userId.toString());
     }
+    if (isTeamParticipant) {
+      tournament.teams = tournament.teams.filter(id => id.toString() !== userId.toString());
+    }
 
     await tournament.save();
+
+    if (isTeamParticipant) {
+      try {
+        await removeHistoryEntriesForTeam(tournament._id, userId);
+      } catch (historyErr) {
+        log.error('[leaveTournament] Failed to remove direct team history entries:', { error: String(historyErr) });
+      }
+    }
 
     res.status(200).json({
       success: true,
@@ -1266,7 +1272,7 @@ const leaveTournament = async (req, res) => {
 // Leave tournament as team
 const leaveTournamentAsTeam = async (req, res) => {
   try {
-    const tournament = await Tournament.findById(req.params.id);
+    let tournament = await Tournament.findById(req.params.id);
 
     if (!tournament) {
       return res.status(404).json({
@@ -2378,7 +2384,7 @@ const deleteRoundSchedule = async (req, res) => {
 const updateMatchResult = async (req, res) => {
   try {
     const { matchId, team1Score, team2Score } = req.body;
-    const tournament = await Tournament.findById(req.params.id);
+    let tournament = await Tournament.findById(req.params.id);
 
     if (!tournament) {
       return res.status(404).json({
