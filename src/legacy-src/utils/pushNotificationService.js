@@ -2,8 +2,11 @@ const https = require('https');
 const log = require('./logger');
 
 const EXPO_PUSH_SEND_URL = 'https://exp.host/--/api/v2/push/send';
+const EXPO_PUSH_RECEIPTS_URL = 'https://exp.host/--/api/v2/push/getReceipts';
 const EXPO_PUSH_TOKEN_PATTERN = /^ExponentPushToken\[[\w-]+\]$|^ExpoPushToken\[[\w-]+\]$/;
 const EXPO_MAX_BATCH_SIZE = 100;
+const EXPO_MAX_RECEIPT_BATCH_SIZE = 300;
+const EXPO_RECEIPT_DELAY_MS = Number(process.env.EXPO_PUSH_RECEIPT_DELAY_MS || 2000);
 
 const NOTIFICATION_SETTING_DEFAULTS = {
   likes: true,
@@ -50,6 +53,8 @@ const chunk = (items, size) => {
   for (let i = 0; i < items.length; i += size) chunks.push(items.slice(i, i + size));
   return chunks;
 };
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, ms || 0)));
 
 const sanitizeString = (value, fallback = '') => {
   if (typeof value !== 'string') return fallback;
@@ -213,6 +218,7 @@ const removeInvalidToken = async (token) => {
 const processExpoTickets = async (tickets, messages) => {
   const ticketList = Array.isArray(tickets) ? tickets : [tickets].filter(Boolean);
   const invalidTokens = [];
+  const receipts = [];
   let accepted = 0;
   let failed = 0;
 
@@ -221,6 +227,14 @@ const processExpoTickets = async (tickets, messages) => {
     const token = messages[index]?.to;
     if (ticket?.status === 'ok') {
       accepted += 1;
+      if (ticket.id && token) {
+        receipts.push({
+          id: ticket.id,
+          token,
+          notificationId: messages[index]?.data?.notificationId,
+          type: messages[index]?.data?.type
+        });
+      }
       continue;
     }
 
@@ -238,7 +252,72 @@ const processExpoTickets = async (tickets, messages) => {
   }
 
   await Promise.allSettled(invalidTokens.map(removeInvalidToken));
-  return { accepted, failed, invalidTokensRemoved: invalidTokens.length };
+  return { accepted, failed, invalidTokensRemoved: invalidTokens.length, receipts };
+};
+
+const processExpoReceipts = async (receiptRequests) => {
+  if (!Array.isArray(receiptRequests) || receiptRequests.length === 0) {
+    return { ok: 0, failed: 0, unavailable: 0, invalidTokensRemoved: 0 };
+  }
+
+  if (EXPO_RECEIPT_DELAY_MS > 0) {
+    await delay(EXPO_RECEIPT_DELAY_MS);
+  }
+
+  let ok = 0;
+  let failed = 0;
+  let unavailable = 0;
+  const invalidTokens = [];
+
+  for (const batch of chunk(receiptRequests, EXPO_MAX_RECEIPT_BATCH_SIZE)) {
+    const ids = batch.map((receipt) => receipt.id).filter(Boolean);
+    if (ids.length === 0) continue;
+
+    let payload = {};
+    try {
+      payload = await postJson(EXPO_PUSH_RECEIPTS_URL, { ids });
+    } catch (error) {
+      unavailable += ids.length;
+      log.error('Expo push receipt request failed', {
+        receiptCount: ids.length,
+        message: error?.message,
+        payload: error?.payload
+      });
+      continue;
+    }
+
+    const receiptMap = payload?.data || {};
+    for (const receiptRequest of batch) {
+      const receipt = receiptMap[receiptRequest.id];
+      if (!receipt) {
+        unavailable += 1;
+        continue;
+      }
+
+      if (receipt.status === 'ok') {
+        ok += 1;
+        continue;
+      }
+
+      failed += 1;
+      const errorCode = receipt?.details?.error;
+      log.error('Expo push receipt error', {
+        receiptId: receiptRequest.id,
+        token: receiptRequest.token,
+        notificationId: receiptRequest.notificationId,
+        type: receiptRequest.type,
+        errorCode,
+        message: receipt?.message
+      });
+
+      if (errorCode === 'DeviceNotRegistered' && receiptRequest.token) {
+        invalidTokens.push(receiptRequest.token);
+      }
+    }
+  }
+
+  await Promise.allSettled(invalidTokens.map(removeInvalidToken));
+  return { ok, failed, unavailable, invalidTokensRemoved: invalidTokens.length };
 };
 
 const getRecipientPushState = async (recipientId, notification) => {
@@ -298,6 +377,10 @@ const sendPushNotification = async (recipientId, notification) => {
   let accepted = 0;
   let failed = 0;
   let invalidTokensRemoved = 0;
+  let receiptOk = 0;
+  let receiptFailed = 0;
+  let receiptUnavailable = 0;
+  let receiptInvalidTokensRemoved = 0;
 
   for (const batch of chunk(messages, EXPO_MAX_BATCH_SIZE)) {
     const response = await postJson(EXPO_PUSH_SEND_URL, batch);
@@ -308,6 +391,12 @@ const sendPushNotification = async (recipientId, notification) => {
     accepted += result.accepted;
     failed += result.failed;
     invalidTokensRemoved += result.invalidTokensRemoved;
+
+    const receiptResult = await processExpoReceipts(result.receipts);
+    receiptOk += receiptResult.ok;
+    receiptFailed += receiptResult.failed;
+    receiptUnavailable += receiptResult.unavailable;
+    receiptInvalidTokensRemoved += receiptResult.invalidTokensRemoved;
   }
 
   log.info('Expo push notification sent', {
@@ -316,10 +405,23 @@ const sendPushNotification = async (recipientId, notification) => {
     sent: messages.length,
     accepted,
     failed,
-    invalidTokensRemoved
+    invalidTokensRemoved,
+    receiptOk,
+    receiptFailed,
+    receiptUnavailable,
+    receiptInvalidTokensRemoved
   });
 
-  return { sent: messages.length, accepted, failed, invalidTokensRemoved };
+  return {
+    sent: messages.length,
+    accepted,
+    failed,
+    invalidTokensRemoved,
+    receiptOk,
+    receiptFailed,
+    receiptUnavailable,
+    receiptInvalidTokensRemoved
+  };
 };
 
 const sendBulkPushNotification = async (recipientIds, notification) => {
@@ -336,11 +438,14 @@ const sendBulkPushNotification = async (recipientIds, notification) => {
       acc.sent += result.value.sent || 0;
       acc.accepted += result.value.accepted || 0;
       acc.failed += result.value.failed || 0;
+      acc.receiptOk += result.value.receiptOk || 0;
+      acc.receiptFailed += result.value.receiptFailed || 0;
+      acc.receiptUnavailable += result.value.receiptUnavailable || 0;
     } else {
       acc.failed += 1;
     }
     return acc;
-  }, { sent: 0, accepted: 0, failed: 0 });
+  }, { sent: 0, accepted: 0, failed: 0, receiptOk: 0, receiptFailed: 0, receiptUnavailable: 0 });
 };
 
 module.exports = {

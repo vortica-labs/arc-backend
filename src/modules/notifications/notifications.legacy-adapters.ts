@@ -10,6 +10,7 @@ type NotificationModelType = {
   updateMany: (...args: unknown[]) => Promise<unknown>;
 };
 type UserModelType = {
+  findById: (...args: unknown[]) => any;
   updateOne: (...args: unknown[]) => Promise<unknown>;
   updateMany: (...args: unknown[]) => Promise<unknown>;
 };

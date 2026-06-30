@@ -9,6 +9,37 @@ const VALID_PLATFORMS = new Set(["ios", "android", "web", "unknown"]);
 const getUserId = (req: { user?: { _id?: string } }) => req.user?._id;
 const safeString = (value: unknown, maxLength = 200) =>
   typeof value === "string" ? value.trim().slice(0, maxLength) : "";
+const maskToken = (token: string) =>
+  token.length <= 24 ? token : `${token.slice(0, 12)}...${token.slice(-8)}`;
+
+const serializePushToken = (entry: Record<string, unknown>) => {
+  const token = typeof entry.token === "string" ? entry.token : "";
+  const nativeToken = entry.nativeToken && typeof entry.nativeToken === "object"
+    ? entry.nativeToken as Record<string, unknown>
+    : undefined;
+
+  return {
+    tokenPreview: maskToken(token),
+    isValidExpoToken: EXPO_PUSH_TOKEN_PATTERN.test(token),
+    platform: safeString(entry.platform, 40) || "unknown",
+    deviceName: safeString(entry.deviceName, 120),
+    projectId: safeString(entry.projectId, 120),
+    nativeTokenType: safeString(nativeToken?.type, 40),
+    lastUsedAt: entry.lastUsedAt,
+    createdAt: entry.createdAt
+  };
+};
+
+const countRegisteredPushTokens = async (userId: string) => {
+  const user = await User.findById(userId).select("pushTokens").lean();
+  const pushTokens = Array.isArray(user?.pushTokens) ? user.pushTokens : [];
+  return {
+    pushTokenCount: pushTokens.length,
+    validExpoPushTokenCount: pushTokens.filter((entry: Record<string, unknown>) =>
+      typeof entry?.token === "string" && EXPO_PUSH_TOKEN_PATTERN.test(entry.token)
+    ).length
+  };
+};
 
 router.post("/push-token", protect, async (req, res) => {
   try {
@@ -62,13 +93,15 @@ router.post("/push-token", protect, async (req, res) => {
         }
       }
     );
+    const tokenCounts = await countRegisteredPushTokens(userId);
 
     return res.status(200).json({
       success: true,
       message: "Push token registered",
       data: {
         platform: normalizedPlatform,
-        registeredAt: new Date().toISOString()
+        registeredAt: new Date().toISOString(),
+        ...tokenCounts
       }
     });
   } catch (error) {
@@ -99,6 +132,43 @@ router.delete("/push-token", protect, async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to remove push token",
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
+
+router.get("/push-status", protect, async (req, res) => {
+  try {
+    const userId = getUserId(req as { user?: { _id?: string } });
+
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authenticated user is required" });
+    }
+
+    const user = await User.findById(userId).select("pushTokens notificationSettings").lean();
+    const pushTokens = Array.isArray(user?.pushTokens) ? user.pushTokens : [];
+    const tokens = pushTokens.map((entry: Record<string, unknown>) => serializePushToken(entry));
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        userId,
+        serverTime: new Date().toISOString(),
+        deliveryProvider: "expo",
+        pushTokenCount: tokens.length,
+        validExpoPushTokenCount: tokens.filter((entry: { isValidExpoToken: boolean }) => entry.isValidExpoToken).length,
+        tokens,
+        notificationSettings: user?.notificationSettings ?? {},
+        requirements: {
+          android: "Expo/EAS FCM credentials must be configured for the Android package used by the installed build.",
+          ios: "Expo/EAS APNs credentials must be configured for the iOS bundle identifier and APNs environment."
+        }
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch push notification status",
       error: error instanceof Error ? error.message : String(error)
     });
   }

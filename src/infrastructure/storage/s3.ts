@@ -22,6 +22,43 @@ export interface UploadResult {
   publicId: string;
 }
 
+function getAudioFileExtension(file: { mimetype?: string; originalname?: string }): string {
+  const mimetype = String(file.mimetype || "").toLowerCase();
+  const byMime: Record<string, string> = {
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/mp4": "m4a",
+    "audio/x-m4a": "m4a",
+    "audio/aac": "aac",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/ogg": "ogg",
+    "audio/webm": "webm",
+  };
+  if (byMime[mimetype]) return byMime[mimetype];
+
+  const name = String(file.originalname || "").toLowerCase();
+  const match = name.match(/\.(mp3|m4a|aac|wav|ogg|oga|webm)$/);
+  return match?.[1] || "m4a";
+}
+
+function getAudioContentType(file: { mimetype?: string; originalname?: string }): string {
+  const mimetype = String(file.mimetype || "").toLowerCase();
+  if (mimetype.startsWith("audio/")) return mimetype;
+
+  const extension = getAudioFileExtension(file);
+  const byExtension: Record<string, string> = {
+    mp3: "audio/mpeg",
+    m4a: "audio/mp4",
+    aac: "audio/aac",
+    wav: "audio/wav",
+    ogg: "audio/ogg",
+    oga: "audio/ogg",
+    webm: "audio/webm",
+  };
+  return byExtension[extension] || "audio/mp4";
+}
+
 export async function uploadImage(
   file: { buffer: Buffer; mimetype?: string },
   folder = "gaming-social",
@@ -88,17 +125,19 @@ export async function uploadVideo(
 }
 
 export async function uploadAudio(
-  file: { buffer: Buffer },
+  file: { buffer: Buffer; mimetype?: string; originalname?: string },
   folder = "gaming-social/audio"
 ): Promise<UploadResult> {
   assertBucket();
-  const key = `${folder}/${uuidv4()}.mp3`;
+  const extension = getAudioFileExtension(file);
+  const key = `${folder}/${uuidv4()}.${extension}`;
   await s3.send(
     new PutObjectCommand({
       Bucket: BUCKET,
       Key: key,
       Body: file.buffer,
-      ContentType: "audio/mpeg",
+      ContentType: getAudioContentType(file),
+      CacheControl: "public, max-age=31536000, immutable",
     })
   );
   return { url: publicUrl(key), publicId: key };
