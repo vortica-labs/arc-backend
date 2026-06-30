@@ -10,6 +10,19 @@ const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
 const MAX_CLIENT_UPLOAD_ID_LENGTH = 96;
 
 const toIdStr = (v) => (v == null ? '' : typeof v === 'string' ? v : (v.toString && v.toString()) || String(v));
+const STORY_DEBUG_ENABLED = process.env.STORY_DEBUG === 'true' || process.env.NODE_ENV !== 'production';
+
+const storyDebug = (event, payload = {}) => {
+  if (!STORY_DEBUG_ENABLED) return;
+  log.info(`Story:${event}`, payload);
+};
+
+const setStoryNoStoreHeaders = (res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.set('Surrogate-Control', 'no-store');
+};
 
 const validStoryMediaMatch = {
   'media.type': { $in: ['image', 'video'] },
@@ -175,6 +188,7 @@ const createStory = async (req, res) => {
 // Feed: current user + followed users who have at least one story in last 24h
 const getStoriesFeed = async (req, res) => {
   try {
+    setStoryNoStoreHeaders(res);
     if (!req.user || !req.user._id) {
       return res.status(401).json({ success: false, message: 'Not authenticated' });
     }
@@ -194,7 +208,7 @@ const getStoriesFeed = async (req, res) => {
     const allowedObjectIds = allowedIds.map((id) => new mongoose.Types.ObjectId(id));
 
     const usersWithStories = await Story.aggregate([
-      { $match: buildActiveStoryQuery({ createdAt: { $gte: since } }) },
+      { $match: buildActiveStoryQuery({ author: { $in: allowedObjectIds }, createdAt: { $gte: since } }) },
       { $sort: { createdAt: -1 } },
       {
         $group: {
@@ -205,7 +219,6 @@ const getStoriesFeed = async (req, res) => {
           latestCreatedAt: { $first: '$createdAt' }
         }
       },
-      { $match: { _id: { $in: allowedObjectIds } } },
       { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'userDoc' } },
       { $unwind: '$userDoc' },
       {
@@ -218,7 +231,8 @@ const getStoriesFeed = async (req, res) => {
           author: {
             _id: '$userDoc._id',
             username: '$userDoc.username',
-            profile: '$userDoc.profile'
+            profile: '$userDoc.profile',
+            profilePicture: '$userDoc.profilePicture'
           }
         }
       },
@@ -232,14 +246,14 @@ const getStoriesFeed = async (req, res) => {
       .lean();
     let finalUsers;
     if (myLatest) {
-      const me = await User.findById(myId).select('username profile').lean();
+      const me = await User.findById(myId).select('username profile profilePicture').lean();
       const myEntry = {
         _id: myIdStr,
         count: await Story.countDocuments(buildActiveStoryQuery({ author: myId, createdAt: { $gte: since } })),
         latestStoryId: myLatest._id,
         latestMedia: myLatest.media,
         latestCreatedAt: myLatest.createdAt,
-        author: me ? { _id: me._id, username: me.username, profile: me.profile } : { _id: myId, username: '', profile: {} }
+        author: me ? { _id: me._id, username: me.username, profile: me.profile, profilePicture: me.profilePicture } : { _id: myId, username: '', profile: {} }
       };
       const others = usersWithStories.filter((u) => (u._id && u._id.toString()) !== myIdStr);
       finalUsers = [myEntry, ...others];
@@ -260,9 +274,21 @@ const getStoriesFeed = async (req, res) => {
       author: u.author ? {
         _id: toIdStr(u.author._id),
         username: u.author.username,
-        profile: u.author.profile
+        profile: u.author.profile,
+        profilePicture: u.author.profilePicture
       } : { _id: toIdStr(u._id), username: '', profile: {} }
     }));
+
+    storyDebug('feed-response', {
+      userId: myIdStr,
+      allowedIds,
+      users: finalUsers.map((u) => ({
+        userId: toIdStr(u._id),
+        latestStoryId: toIdStr(u.latestStoryId),
+        count: u.count,
+        latestCreatedAt: u.latestCreatedAt
+      }))
+    });
 
     return res.json({
       success: true,
@@ -280,7 +306,11 @@ const getStoriesFeed = async (req, res) => {
 // Get all stories of one user (last 24h)
 const getUserStories = async (req, res) => {
   try {
+    setStoryNoStoreHeaders(res);
     const { userId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid user id' });
+    }
     const since = new Date(Date.now() - TWENTY_FOUR_HOURS_MS);
     const isOwnStoryList = toIdStr(userId) === toIdStr(req.user._id);
     const query = Story.find(buildActiveStoryQuery({
@@ -293,9 +323,24 @@ const getUserStories = async (req, res) => {
       .populate('author', 'username profile.displayName profile.avatar profilePicture')
       .lean();
     const storiesWithCounts = await withStoryViewCounts(stories);
+    const normalizedStories = storiesWithCounts
+      .filter((story) => story?.media?.type && story?.media?.url)
+      .map((story) => ({
+        ...story,
+        _id: toIdStr(story._id),
+        author: story.author ? {
+          ...story.author,
+          _id: toIdStr(story.author._id)
+        } : story.author
+      }));
+    storyDebug('user-stories-response', {
+      requestedUserId: userId,
+      storyIds: normalizedStories.map((story) => story._id),
+      count: normalizedStories.length
+    });
     return res.json({
       success: true,
-      data: { stories: storiesWithCounts }
+      data: { stories: normalizedStories }
     });
   } catch (err) {
     return res.status(500).json({
