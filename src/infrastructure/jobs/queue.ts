@@ -63,32 +63,34 @@ export const notificationWorker = new Worker(
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const Notification = require(path.join(legacyRoot, "models", "Notification.js"));
       // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { sendBulkPushNotification } = require(path.join(legacyRoot, "utils", "pushNotificationService.js"));
+      const { sendPushNotification } = require(path.join(legacyRoot, "utils", "pushNotificationService.js"));
 
-      // Batch insert
       const docs = (recipientIds as string[]).map((recipientId: string) => ({
-        insertOne: {
-          document: {
-            recipient: recipientId,
-            type: type || "system",
-            title,
-            message,
-            data: data || {},
-            isRead: false,
-            createdAt: new Date(),
-            updatedAt: new Date()
-          }
-        }
+        recipient: recipientId,
+        type: type || "system",
+        title,
+        message,
+        data: data || {},
+        isRead: false,
+        createdAt: new Date(),
+        updatedAt: new Date()
       }));
 
       if (docs.length > 0) {
-        await Notification.bulkWrite(docs, { ordered: false });
-        await sendBulkPushNotification(recipientIds, {
-          type: type || "system",
-          title,
-          message,
-          data: data || {}
-        });
+        const insertedNotifications = await Notification.insertMany(docs, { ordered: false });
+        const pushResults = await Promise.allSettled(
+          insertedNotifications.map((notification: Record<string, unknown>) =>
+            sendPushNotification(notification.recipient, notification)
+          )
+        );
+        const pushFailures = pushResults.filter(result => result.status === "rejected").length;
+        if (pushFailures > 0) {
+          logger.warn("Bulk notification push delivery had failures", {
+            failures: pushFailures,
+            count: insertedNotifications.length,
+            type
+          });
+        }
       }
 
       logger.info("Bulk notifications created", { count: recipientIds.length, type });

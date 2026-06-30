@@ -16,9 +16,33 @@ const NOTIFICATION_SETTING_DEFAULTS = {
   systemAlerts: true
 };
 
+const getChannelIdForNotification = (notification) => {
+  switch (notification?.type) {
+    case 'message':
+      return 'messages';
+    case 'like':
+    case 'comment':
+    case 'mention':
+    case 'follow':
+    case 'achievement':
+      return 'social';
+    case 'tournament':
+      return 'tournaments';
+    case 'call':
+      return 'calls';
+    default:
+      return 'default';
+  }
+};
+
 const toId = (value) => {
   if (!value) return '';
   return String(value._id || value.id || value);
+};
+
+const toUsername = (value) => {
+  if (!value || typeof value !== 'object') return '';
+  return sanitizeString(value.username || value.profile?.username);
 };
 
 const chunk = (items, size) => {
@@ -43,7 +67,13 @@ const getPreferenceKeyForNotification = (notification) => {
     case 'follow':
       return 'follows';
     case 'message':
+    case 'call':
       return 'messages';
+    case 'story':
+    case 'clip':
+      return 'comments';
+    case 'recruitment':
+      return 'recruitmentApps';
     case 'tournament':
       return notification?.data?.customData?.scrimId || notification?.data?.customData?.scrimCode
         ? 'scrimUpdates'
@@ -87,8 +117,9 @@ const buildRouteFromNotification = (notification) => {
   const chatId = toId(data.chatId || data.conversationId || customData.chatId || customData.conversationId);
   if (chatId) return `/conversation/${chatId}`;
 
+  const senderUsername = toUsername(notification?.sender);
   const senderId = toId(notification?.sender);
-  if (notification?.type === 'follow' && senderId) return `/user/${senderId}`;
+  if (notification?.type === 'follow' && (senderUsername || senderId)) return `/user/${senderUsername || senderId}`;
 
   return '/notifications';
 };
@@ -235,12 +266,20 @@ const sendPushNotification = async (recipientId, notification) => {
   }
 
   const { tokens, unreadCount } = await getRecipientPushState(resolvedRecipientId, notification);
-  if (tokens.length === 0) return { sent: 0, accepted: 0, failed: 0 };
+  if (tokens.length === 0) {
+    log.info('Expo push skipped: no registered tokens', {
+      recipientId: resolvedRecipientId,
+      notificationId: toId(notification._id),
+      type: notification?.type || 'system'
+    });
+    return { sent: 0, accepted: 0, failed: 0 };
+  }
 
   const title = sanitizeString(notification.title, 'SquadHunt');
   const body = sanitizeString(notification.message, 'You have a new notification');
   const data = buildPushData(notification);
   const image = sanitizeString(notification?.data?.image || notification?.data?.customData?.image);
+  const channelId = getChannelIdForNotification(notification);
 
   const messages = tokens.map((token) => ({
     to: token,
@@ -248,8 +287,10 @@ const sendPushNotification = async (recipientId, notification) => {
     body,
     sound: 'default',
     priority: 'high',
-    channelId: 'default',
+    channelId,
     badge: unreadCount,
+    ttl: 2419200,
+    expiration: Math.floor(Date.now() / 1000) + 2419200,
     data,
     ...(image ? { richContent: { image } } : {})
   }));

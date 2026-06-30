@@ -807,6 +807,110 @@ const toggleSave = async (req, res) => {
   }
 };
 
+const getSavedPosts = async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
+    const skip = (page - 1) * limit;
+
+    const user = await User.findById(userId).select('savedPosts').lean();
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    const savedEntries = (user.savedPosts || [])
+      .filter(item => item?.post)
+      .sort((a, b) => new Date(b.savedAt || 0).getTime() - new Date(a.savedAt || 0).getTime());
+
+    const savedIds = savedEntries.map(item => item.post);
+    const posts = await Post.find({ _id: { $in: savedIds }, isActive: true })
+      .populate('author', 'username profile.displayName profile.avatar userType')
+      .populate('likes.user', 'username profile.displayName profile.avatar')
+      .populate('comments.user', 'username profile.displayName profile.avatar');
+
+    const postsById = new Map(posts.map(post => [post._id.toString(), post]));
+    const orderedPosts = savedEntries
+      .map(entry => {
+        const post = postsById.get(entry.post.toString());
+        return post ? { post, savedAt: entry.savedAt } : null;
+      })
+      .filter(Boolean);
+
+    const total = orderedPosts.length;
+    const pageItems = orderedPosts.slice(skip, skip + limit);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        posts: pageItems.map(({ post, savedAt }) => ({
+          ...formatPostDTO(post, false, post.author?._id?.toString() === userId.toString()),
+          isSaved: true,
+          savedAt
+        })),
+        pagination: {
+          current: page,
+          total: Math.ceil(total / limit),
+          count: pageItems.length,
+          totalPosts: total
+        }
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch saved posts',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+const getLikedPosts = async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
+    const skip = (page - 1) * limit;
+
+    const [posts, total, user] = await Promise.all([
+      Post.find({ isActive: true, 'likes.user': userId })
+        .populate('author', 'username profile.displayName profile.avatar userType')
+        .populate('likes.user', 'username profile.displayName profile.avatar')
+        .populate('comments.user', 'username profile.displayName profile.avatar')
+        .sort({ 'likes.likedAt': -1, createdAt: -1 })
+        .skip(skip)
+        .limit(limit),
+      Post.countDocuments({ isActive: true, 'likes.user': userId }),
+      User.findById(userId).select('savedPosts').lean()
+    ]);
+
+    const savedIds = new Set((user?.savedPosts || []).map(item => item?.post?.toString()).filter(Boolean));
+
+    res.status(200).json({
+      success: true,
+      data: {
+        posts: posts.map(post => ({
+          ...formatPostDTO(post, false, post.author?._id?.toString() === userId.toString()),
+          isLiked: true,
+          isSaved: savedIds.has(post._id.toString())
+        })),
+        pagination: {
+          current: page,
+          total: Math.ceil(total / limit),
+          count: posts.length,
+          totalPosts: total
+        }
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch liked posts',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
 // Update post
 const updatePost = async (req, res) => {
   try {
@@ -1161,6 +1265,8 @@ module.exports = {
   addComment,
   recordShare,
   toggleSave,
+  getSavedPosts,
+  getLikedPosts,
   updatePost,
   deletePost,
   reportPost,

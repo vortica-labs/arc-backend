@@ -33,7 +33,13 @@ const getPreferenceKeyForNotification = (notificationData) => {
     case 'follow':
       return 'follows';
     case 'message':
+    case 'call':
       return 'messages';
+    case 'story':
+    case 'clip':
+      return 'comments';
+    case 'recruitment':
+      return 'recruitmentApps';
     case 'tournament':
       return notificationData?.data?.customData?.scrimId || notificationData?.data?.customData?.scrimCode
         ? 'scrimUpdates'

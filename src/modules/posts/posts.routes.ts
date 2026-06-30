@@ -29,6 +29,8 @@ const addCommentValidation = [body("text").isLength({ min: 1, max: 500 }).withMe
 router.post("/", protect, uploadFields([{ name: "media", maxCount: 5 }, { name: "cover", maxCount: 1 }]), createPostValidation, handleValidationErrors, postController.createPost);
 router.get("/", optionalAuth, postController.getPosts);
 router.get("/clips", optionalAuth, postController.getClips);
+router.get("/saved", protect, postController.getSavedPosts);
+router.get("/liked", protect, postController.getLikedPosts);
 router.get("/:id", optionalAuth, postController.getPost);
 router.post("/:id/view", protect, postController.recordClipView);
 router.post("/:id/like", protect, postController.toggleLike);

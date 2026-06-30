@@ -292,60 +292,13 @@ async function cancelSubscription(req, res) {
 
 /**
  * POST /api/payments/create-order
- * Create a payment order for tournament entry fee
+ * Deprecated tournament payment order endpoint.
  */
 async function createTournamentOrder(req, res) {
-  try {
-    const { amount, tournamentId, currency = 'INR' } = req.body;
-
-    if (!amount || !tournamentId) {
-      return res.status(400).json({
-        success: false,
-        message: 'Amount and tournament ID are required'
-      });
-    }
-
-    const tournament = await Tournament.findById(tournamentId);
-    if (!tournament) {
-      return res.status(404).json({
-        success: false,
-        message: 'Tournament not found'
-      });
-    }
-
-    const expectedAmount = tournament.entryFee * 100;
-    if (amount !== expectedAmount) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid payment amount'
-      });
-    }
-
-    const options = {
-      amount: amount,
-      currency: currency,
-      payment_capture: 1,
-      receipt: `trn_${tournamentId.toString().slice(-8)}_${Date.now().toString().slice(-8)}`,
-      notes: {
-        tournamentId: tournamentId,
-        userId: req.user._id
-      }
-    };
-
-    const order = await getRazorpay().orders.create(options);
-
-    res.status(200).json({
-      success: true,
-      data: order
-    });
-
-  } catch (error) {
-    console.error('Error creating tournament payment order:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to create payment order'
-    });
-  }
+  return res.status(410).json({
+    success: false,
+    message: 'Tournament payments are no longer supported. Join tournaments from the tournament page.'
+  });
 }
 
 /**
@@ -353,108 +306,10 @@ async function createTournamentOrder(req, res) {
  * Verify tournament payment and register user
  */
 async function verifyTournamentPayment(req, res) {
-  try {
-    const {
-      razorpay_order_id,
-      razorpay_payment_id,
-      razorpay_signature,
-      tournamentId
-    } = req.body;
-
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !tournamentId) {
-      return res.status(400).json({
-        success: false,
-        message: 'Missing required payment details'
-      });
-    }
-
-    const crypto = require('crypto');
-    const body = razorpay_order_id + '|' + razorpay_payment_id;
-    const expectedSignature = crypto
-      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-      .update(body.toString())
-      .digest('hex');
-
-    if (expectedSignature !== razorpay_signature) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid payment signature'
-      });
-    }
-
-    const payment = await getRazorpay().payments.fetch(razorpay_payment_id);
-    if (!payment || !['authorized', 'captured'].includes(payment.status)) {
-      return res.status(400).json({ success: false, message: 'Payment not confirmed by Razorpay' });
-    }
-
-    const tournament = await Tournament.findById(tournamentId);
-    if (!tournament) {
-      return res.status(404).json({
-        success: false,
-        message: 'Tournament not found'
-      });
-    }
-
-    const user = await User.findById(req.user._id);
-    const isAlreadyRegistered = tournament.participants.some(p => p._id.toString() === req.user._id) ||
-                              tournament.teams.some(t => t._id.toString() === req.user._id);
-
-    if (isAlreadyRegistered) {
-      return res.status(400).json({
-        success: false,
-        message: 'Already registered for this tournament'
-      });
-    }
-
-    const totalParticipants = tournament.participants.length + tournament.teams.length;
-    if (totalParticipants >= tournament.totalSlots) {
-      return res.status(400).json({
-        success: false,
-        message: 'Tournament is full'
-      });
-    }
-
-    if (user.userType === 'team') {
-      tournament.teams.push(req.user._id);
-    } else {
-      tournament.participants.push(req.user._id);
-    }
-
-    await tournament.save();
-
-    await recordPaymentTransaction({
-      user: req.user._id,
-      type: 'tournament',
-      amount: amountFromRazorpayPayment(payment, tournament.entryFee),
-      currency: payment.currency || 'INR',
-      status: 'completed',
-      description: `Tournament registration: ${tournament.name}`,
-      orderId: razorpay_order_id,
-      paymentId: razorpay_payment_id,
-      referenceId: tournament._id,
-      referenceType: 'tournament',
-      metadata: {
-        tournamentId,
-        razorpayStatus: payment.status
-      }
-    });
-
-    res.status(200).json({
-      success: true,
-      message: 'Payment verified and tournament registration successful',
-      data: {
-        tournamentId,
-        userId: req.user._id
-      }
-    });
-
-  } catch (error) {
-    console.error('Error verifying tournament payment:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to verify payment'
-    });
-  }
+  return res.status(410).json({
+    success: false,
+    message: 'Tournament payment verification is no longer supported.'
+  });
 }
 
 /**

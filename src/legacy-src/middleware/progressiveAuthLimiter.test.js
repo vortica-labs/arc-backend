@@ -99,10 +99,15 @@ async function simulateSuccessfulLogin(limiter, req) {
 
   const thirdFailure = await simulateInvalidCredentials(limiter, lockedUserReq);
   assert.strictEqual(thirdFailure.nextCalled, true);
-  assert.strictEqual(thirdFailure.res.statusCode, 429);
-  assert.strictEqual(thirdFailure.res.body.error, 'RATE_LIMIT_EXCEEDED');
-  assert.strictEqual(thirdFailure.res.body.retryAfter, 30);
-  assert.match(thirdFailure.res.body.message, /Too many failed login attempts/);
+  assert.strictEqual(thirdFailure.res.statusCode, 401);
+  assert.strictEqual(thirdFailure.res.body.message, 'Invalid email or password.');
+
+  const fourthFailure = await simulateInvalidCredentials(limiter, lockedUserReq);
+  assert.strictEqual(fourthFailure.nextCalled, true);
+  assert.strictEqual(fourthFailure.res.statusCode, 429);
+  assert.strictEqual(fourthFailure.res.body.error, 'RATE_LIMIT_EXCEEDED');
+  assert.strictEqual(fourthFailure.res.body.retryAfter, 30);
+  assert.match(fourthFailure.res.body.message, /Too many failed login attempts/);
 
   const correctPasswordDuringCooldown = await simulateSuccessfulLogin(
     limiter,

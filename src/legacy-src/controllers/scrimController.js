@@ -86,8 +86,11 @@ const createScrim = async (req, res) => {
       }
     }
 
+    const host = await User.findById(hostId).select('isVerifiedHost').lean();
+    const isVerifiedHost = host?.isVerifiedHost === true;
+
     // Enforce isVerifiedHost for prize pool scrims
-    if (prizePoolType === 'with_prize' && req.user.isVerifiedHost !== true) {
+    if (prizePoolType === 'with_prize' && isVerifiedHost !== true) {
       return res.status(403).json({
         success: false,
         message: 'You are not authorized to host prize pool scrims. Please apply for Verified Host status.'
@@ -95,7 +98,7 @@ const createScrim = async (req, res) => {
     }
 
     // ── Daily limit for unverified hosts (5 scrims per day) ──
-    if (!req.user.isVerifiedHost) {
+    if (!isVerifiedHost) {
       const startOfDay = new Date();
       startOfDay.setHours(0, 0, 0, 0);
       const Scrim = require('../models/Scrim');

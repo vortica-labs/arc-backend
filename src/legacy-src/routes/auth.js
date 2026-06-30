@@ -37,7 +37,8 @@ const {
   resetPasswordWithOtp,
   checkPasswordSame,
   generateGuestToken,
-  googleTokenLogin
+  googleTokenLogin,
+  appleMobileLogin
 } = require('../controllers/authController');
 
 const router = express.Router();
@@ -153,6 +154,7 @@ router.post('/complete-google-profile', protect, completeGoogleProfile);
 
 // Client-side Google OAuth (popup flow — no redirect URI required)
 router.post('/google/token', googleTokenLogin);
+router.post('/apple/mobile', appleMobileLogin);
 
 // Legacy server-side Google OAuth routes (kept for reference)
 router.get('/google',

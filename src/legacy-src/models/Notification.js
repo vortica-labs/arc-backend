@@ -18,6 +18,10 @@ const notificationSchema = new mongoose.Schema({
       'follow',
       'message',
       'tournament',
+      'recruitment',
+      'story',
+      'clip',
+      'call',
       'mention',
       'achievement',
       'system'
