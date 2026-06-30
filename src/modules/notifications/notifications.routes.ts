@@ -1,5 +1,7 @@
 import { Router } from "express";
+import path from "path";
 import { Notification, User, protect } from "./notifications.legacy-adapters";
+import { backendRootPath } from "../legacy/legacy.paths";
 
 const router = Router();
 
@@ -11,6 +13,7 @@ const safeString = (value: unknown, maxLength = 200) =>
   typeof value === "string" ? value.trim().slice(0, maxLength) : "";
 const maskToken = (token: string) =>
   token.length <= 24 ? token : `${token.slice(0, 12)}...${token.slice(-8)}`;
+const latestPushDiagnostics = new Map<string, Record<string, unknown>>();
 
 const serializePushToken = (entry: Record<string, unknown>) => {
   const token = typeof entry.token === "string" ? entry.token : "";
@@ -39,6 +42,33 @@ const countRegisteredPushTokens = async (userId: string) => {
       typeof entry?.token === "string" && EXPO_PUSH_TOKEN_PATTERN.test(entry.token)
     ).length
   };
+};
+
+const sendDiagnosticPush = async (userId: string) => {
+  const notification = await Notification.createNotification({
+    recipient: userId,
+    type: "system",
+    title: "SquadHunt test notification",
+    message: "Native push delivery is working on this device.",
+    data: {
+      customData: {
+        url: "/notifications",
+        diagnostic: true
+      }
+    },
+    sendPush: false
+  });
+
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { sendPushNotification } = require(path.join(backendRootPath, "utils", "pushNotificationService.js"));
+  const result = await sendPushNotification(userId, notification);
+  const diagnostics = {
+    notificationId: String(notification?._id || ""),
+    sentAt: new Date().toISOString(),
+    ...result
+  };
+  latestPushDiagnostics.set(userId, diagnostics);
+  return diagnostics;
 };
 
 router.post("/push-token", protect, async (req, res) => {
@@ -158,6 +188,7 @@ router.get("/push-status", protect, async (req, res) => {
         pushTokenCount: tokens.length,
         validExpoPushTokenCount: tokens.filter((entry: { isValidExpoToken: boolean }) => entry.isValidExpoToken).length,
         tokens,
+        lastTestPush: latestPushDiagnostics.get(userId) ?? null,
         notificationSettings: user?.notificationSettings ?? {},
         requirements: {
           android: "Expo/EAS FCM credentials must be configured for the Android package used by the installed build.",
@@ -169,6 +200,41 @@ router.get("/push-status", protect, async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to fetch push notification status",
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
+
+router.post("/push-test", protect, async (req, res) => {
+  try {
+    const userId = getUserId(req as { user?: { _id?: string } });
+
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authenticated user is required" });
+    }
+
+    const tokenCounts = await countRegisteredPushTokens(userId);
+    if (tokenCounts.validExpoPushTokenCount < 1) {
+      return res.status(400).json({
+        success: false,
+        message: "No valid Expo push token is registered for this account",
+        data: tokenCounts
+      });
+    }
+
+    const diagnostics = await sendDiagnosticPush(userId);
+    return res.status(200).json({
+      success: true,
+      message: "Test push notification sent",
+      data: {
+        ...tokenCounts,
+        testPush: diagnostics
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to send test push notification",
       error: error instanceof Error ? error.message : String(error)
     });
   }

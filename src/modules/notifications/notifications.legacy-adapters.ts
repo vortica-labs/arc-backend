@@ -4,6 +4,7 @@ import { backendMiddlewarePath, backendModelPath } from "../legacy/legacy.paths"
 
 type AuthMiddleware = { protect: RequestHandler };
 type NotificationModelType = {
+  createNotification: (...args: unknown[]) => Promise<any>;
   find: (...args: unknown[]) => any;
   findOne: (...args: unknown[]) => any;
   countDocuments: (...args: unknown[]) => Promise<number>;
