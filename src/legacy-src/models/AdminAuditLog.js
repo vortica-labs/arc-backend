@@ -98,10 +98,17 @@ adminAuditLogSchema.pre('findOneAndUpdate', rejectMutation);
 adminAuditLogSchema.pre('replaceOne', rejectMutation);
 adminAuditLogSchema.pre('findOneAndReplace', rejectMutation);
 adminAuditLogSchema.pre('deleteOne', rejectMutation);
+adminAuditLogSchema.pre('deleteOne', { document: true, query: false }, rejectMutation);
 adminAuditLogSchema.pre('deleteMany', rejectMutation);
 adminAuditLogSchema.pre('findOneAndDelete', rejectMutation);
 adminAuditLogSchema.pre('save', function(next) {
   if (!this.isNew) return next(new Error('Admin audit logs are immutable'));
+  return next();
+});
+adminAuditLogSchema.pre('bulkWrite', function(next, operations) {
+  if ((operations || []).some((operation) => !operation.insertOne)) {
+    return next(new Error('Admin audit logs are immutable'));
+  }
   return next();
 });
 

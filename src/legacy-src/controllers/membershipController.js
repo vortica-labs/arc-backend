@@ -217,6 +217,8 @@ async function getMembership(req, res) {
     const currentPlanId = tier;
     const plans = user.userType === 'team' ? TEAM_PLANS : PLAYER_PLANS;
     const benefits = (plans.find(p => p.id === currentPlanId) || plans[0]).features;
+    const premiumService = require('../services/premiumMembershipService');
+    const canonical = await premiumService.currentForUser(req.user._id).lean();
 
     res.status(200).json({
       success: true,
@@ -229,6 +231,17 @@ async function getMembership(req, res) {
         userType: user.userType,
         currentPlanId,
         benefits,
+        membershipId: canonical?._id || null,
+        source: canonical?.source || (isActivePro ? 'legacy' : null),
+        billingPeriod: canonical?.billingPeriod || null,
+        membershipStatus: canonical?.membershipStatus || (isActivePro ? 'active' : 'expired'),
+        subscriptionStatus: canonical?.subscriptionStatus || 'not_applicable',
+        autoRenew: canonical?.autoRenew === true,
+        cancelAtCycleEnd: canonical?.cancelAtCycleEnd === true,
+        currentPeriodStart: canonical?.currentPeriodStart || null,
+        currentPeriodEnd: canonical?.currentPeriodEnd || validUntil,
+        providerSubscriptionId: canonical?.razorpay?.subscriptionId || null,
+        providerControlsAvailable: Boolean(canonical?.razorpay?.subscriptionId),
         plans: {
           player: PLAYER_PLANS,
           team: TEAM_PLANS

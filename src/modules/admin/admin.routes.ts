@@ -1,8 +1,10 @@
 import { Router } from "express";
-import { adminController, auditLog, requireAdminPermission, requireSuperAdmin } from "./admin.legacy-adapters";
+import { adminController, auditLog, durableMutationAudit, requireAdminPermission, requireSuperAdmin } from "./admin.legacy-adapters";
 import { requireHardcodedAdminAuth } from "./admin-auth.middleware";
 import broadcastRoutes from "./broadcast.routes";
 import broadcastTemplateRoutes from "./broadcast-template.routes";
+import premiumMembershipRoutes from "./premium-membership.routes";
+import { premiumMembershipController } from "./premium-membership.legacy-adapters";
 
 const router = Router();
 
@@ -15,6 +17,7 @@ router.use((_, res, next) => {
 
 router.use("/broadcasts", broadcastRoutes);
 router.use("/broadcast-templates", broadcastTemplateRoutes);
+router.use("/premium-memberships", premiumMembershipRoutes);
 
 router.get("/dashboard", auditLog("VIEW_DASHBOARD"), requireAdminPermission("dashboard:read"), adminController.getDashboardStats);
 router.get("/search", auditLog("GLOBAL_SEARCH"), requireAdminPermission("dashboard:read"), adminController.globalSearch);
@@ -26,8 +29,8 @@ router.get("/users", auditLog("VIEW_USERS"), requireAdminPermission("users:read"
 router.get("/users/:userId/inspection", auditLog("INSPECT_USER_PROFILE"), requireAdminPermission("users:read"), adminController.getUserInspection);
 router.put("/users/:userId/status", auditLog("UPDATE_USER_STATUS"), requireAdminPermission("users:manage"), adminController.updateUserStatus);
 router.put("/users/:userId/controls", auditLog("UPDATE_USER_CONTROLS"), requireAdminPermission("users:manage"), adminController.updateUserControls);
-router.post("/users/:userId/premium/grant", auditLog("GRANT_PREMIUM"), requireAdminPermission("users:manage"), adminController.grantPremium);
-router.post("/users/:userId/premium/remove", auditLog("REMOVE_PREMIUM"), requireAdminPermission("users:manage"), adminController.removePremium);
+router.post("/users/:userId/premium/grant", auditLog("GRANT_PREMIUM"), requireAdminPermission("premium:manage"), durableMutationAudit("GRANT_PREMIUM"), premiumMembershipController.legacyGrant);
+router.post("/users/:userId/premium/remove", auditLog("REMOVE_PREMIUM"), requireAdminPermission("premium:manage"), durableMutationAudit("REMOVE_PREMIUM"), premiumMembershipController.legacyRemove);
 router.put("/users/:userId/reset-password", auditLog("RESET_USER_PASSWORD"), requireAdminPermission("users:manage"), adminController.resetUserPassword);
 router.delete("/users/:userId", auditLog("DELETE_USER"), requireSuperAdmin, adminController.deleteUser);
 router.get("/posts", auditLog("VIEW_POSTS"), requireAdminPermission("content:manage"), adminController.getPosts);
