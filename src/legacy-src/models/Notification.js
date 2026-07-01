@@ -10,6 +10,11 @@ const notificationSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'
   },
+  broadcastRecipient: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'BroadcastRecipient',
+    default: null
+  },
   type: {
     type: String,
     enum: [
@@ -36,7 +41,7 @@ const notificationSchema = new mongoose.Schema({
   message: {
     type: String,
     required: [true, 'Notification message is required'],
-    maxlength: [300, 'Message cannot exceed 300 characters']
+    maxlength: [1000, 'Message cannot exceed 1000 characters']
   },
   data: {
     postId: {
@@ -51,13 +56,44 @@ const notificationSchema = new mongoose.Schema({
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Tournament'
     },
+    broadcastId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Broadcast'
+    },
+    deliveryLogId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'BroadcastRecipient'
+    },
+    deepLink: String,
+    deliveryType: {
+      type: String,
+      enum: ['push', 'in_app', 'both']
+    },
+    channels: {
+      push: Boolean,
+      inApp: Boolean
+    },
+    // Device-scoped broadcast constraints. Notification list clients pass
+    // their current platform/appVersion so a row targeted at one installation
+    // is not surfaced or counted unread on another installation.
+    targetPlatforms: [{ type: String, enum: ['android', 'ios', 'web'] }],
+    targetAppVersions: [{ type: String, maxlength: 40 }],
+    bannerImage: String,
+    thumbnail: String,
+    cta: {
+      text: String,
+      url: String,
+      type: String
+    },
     customData: mongoose.Schema.Types.Mixed
   },
   isRead: {
     type: Boolean,
     default: false
   },
-  readAt: Date
+  readAt: Date,
+  archivedAt: { type: Date, default: null },
+  deletedAt: { type: Date, default: null }
 }, {
   timestamps: true
 });
@@ -65,7 +101,10 @@ const notificationSchema = new mongoose.Schema({
 // Indexes for better performance
 notificationSchema.index({ recipient: 1, createdAt: -1 });
 notificationSchema.index({ recipient: 1, isRead: 1 });
+notificationSchema.index({ recipient: 1, deletedAt: 1, archivedAt: 1, createdAt: -1 });
 notificationSchema.index({ type: 1, createdAt: -1 });
+notificationSchema.index({ broadcastRecipient: 1 }, { unique: true, sparse: true });
+notificationSchema.index({ 'data.broadcastId': 1, createdAt: -1 });
 
 // Static method to create notification
 notificationSchema.statics.createNotification = async function(data) {

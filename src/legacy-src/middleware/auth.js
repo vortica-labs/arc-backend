@@ -36,6 +36,14 @@ async function invalidateUserCache(userId) {
   await del(userCacheKey(userId));
 }
 
+const sendProfileCompletionRequired = (res) => {
+  return res.status(403).json({
+    success: false,
+    code: 'PROFILE_COMPLETION_REQUIRED',
+    message: 'Complete your profile to continue.'
+  });
+};
+
 // Protect routes - require authentication
 const protect = async (req, res, next) => {
   try {
@@ -81,6 +89,10 @@ const protect = async (req, res, next) => {
       });
     }
 
+    if (user.needsProfileCompletion === true && req.allowIncompleteProfile !== true) {
+      return sendProfileCompletionRequired(res);
+    }
+
     req.user = user;
     next();
   } catch (error) {
@@ -90,6 +102,13 @@ const protect = async (req, res, next) => {
       message: 'Invalid token.'
     });
   }
+};
+
+// Authentication-only variant for the small set of onboarding-safe routes
+// such as /me and /complete-profile.
+const protectAllowIncomplete = (req, res, next) => {
+  req.allowIncompleteProfile = true;
+  return protect(req, res, next);
 };
 
 // Role-based access control
@@ -138,6 +157,9 @@ const optionalAuth = async (req, res, next) => {
         const user = await getCachedUser(decoded.id);
         
         if (user && user.isActive) {
+          if (user.needsProfileCompletion === true) {
+            return sendProfileCompletionRequired(res);
+          }
           req.user = user;
         } else {
           return res.status(401).json({
@@ -217,8 +239,10 @@ const checkOwnership = (resourceModel, resourceIdParam = 'id') => {
 
 module.exports = {
   protect,
+  protectAllowIncomplete,
   authorize,
   optionalAuth,
   checkOwnership,
-  invalidateUserCache
+  invalidateUserCache,
+  getCachedUser
 };

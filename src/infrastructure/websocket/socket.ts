@@ -1,11 +1,27 @@
 import type { Server as HttpServer } from "http";
 import { Server } from "socket.io";
+import { createAdapter } from "@socket.io/redis-adapter";
 import jwt from "jsonwebtoken";
+import path from "path";
 import { env } from "../../config/env";
 import { logger } from "../../config/logger";
 import { registerChatSocketHandlers } from "../../modules/chat/chat.socket";
 import { registerCallSocketHandlers } from "../../modules/calls/calls.socket";
 import { registerLegacySocketHandlers } from "../../modules/legacy/legacy.socket";
+import { backendMiddlewarePath } from "../../modules/legacy/legacy.paths";
+import { socketRedisPubClient, socketRedisSubClient } from "../cache/redis";
+
+type SocketAuthUser = {
+  isActive?: boolean;
+  needsProfileCompletion?: boolean;
+};
+
+type LegacyAuthMiddleware = {
+  getCachedUser: (userId: string) => Promise<SocketAuthUser | null>;
+};
+
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { getCachedUser } = require(path.join(backendMiddlewarePath, "auth.js")) as LegacyAuthMiddleware;
 
 export type AuthSocketUser = {
   userId: string;
@@ -33,7 +49,7 @@ export const createSocketServer = (httpServer: HttpServer): Server => {
     maxHttpBufferSize: 1e6
   });
 
-  io.use((socket, next) => {
+  io.use(async (socket, next) => {
     try {
       const token = socket.handshake.auth.token as string | undefined;
       if (!token) {
@@ -44,6 +60,14 @@ export const createSocketServer = (httpServer: HttpServer): Server => {
       const userId = decoded.id ?? decoded.userId;
       if (!userId) {
         return next(new Error("Invalid token payload"));
+      }
+
+      const user = await getCachedUser(String(userId));
+      if (!user || !user.isActive) {
+        return next(new Error("User account is deactivated or not found"));
+      }
+      if (user.needsProfileCompletion === true) {
+        return next(new Error("PROFILE_COMPLETION_REQUIRED"));
       }
 
       socket.authUser = { userId: String(userId) };
@@ -85,4 +109,14 @@ export const createSocketServer = (httpServer: HttpServer): Server => {
   (globalThis as Record<string, unknown>)._arcSocketIO = io;
 
   return io;
+};
+
+export const attachSocketRedisAdapter = (io: Server): boolean => {
+  if (!socketRedisPubClient.isReady || !socketRedisSubClient.isReady) {
+    logger.warn("Socket.IO Redis adapter unavailable; realtime delivery is limited to this instance");
+    return false;
+  }
+  io.adapter(createAdapter(socketRedisPubClient, socketRedisSubClient));
+  logger.info("Socket.IO Redis adapter attached");
+  return true;
 };

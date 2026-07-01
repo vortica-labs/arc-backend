@@ -93,6 +93,34 @@ const withStoryViewCounts = async (stories) => {
   }));
 };
 
+// Fetch one still-active story by ID. This is intentionally constrained to
+// the same 24-hour/media validity contract as feeds so notification deep links
+// cannot resurrect expired or incomplete story records.
+const getStory = async (req, res) => {
+  try {
+    setStoryNoStoreHeaders(res);
+    const { storyId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(storyId)) {
+      return res.status(400).json({ success: false, message: 'Invalid story ID' });
+    }
+    const since = new Date(Date.now() - TWENTY_FOUR_HOURS_MS);
+    const story = await Story.findOne(buildActiveStoryQuery({
+      _id: storyId,
+      createdAt: { $gte: since }
+    })).populate('author', 'username profile.displayName profile.avatar profilePicture').lean();
+    if (!story) {
+      return res.status(404).json({ success: false, message: 'Story not found or expired' });
+    }
+    const counts = await getStoryViewCountMap([story._id]);
+    return res.json({
+      success: true,
+      data: { story: { ...story, viewCount: counts.get(toIdStr(story._id)) || 0 } }
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message || 'Failed to fetch story' });
+  }
+};
+
 const mapViewer = (view) => {
   const user = view.user || {};
   return {
@@ -466,6 +494,7 @@ const deleteStory = async (req, res) => {
 
 module.exports = {
   createStory,
+  getStory,
   getStoriesFeed,
   getUserStories,
   viewStory,

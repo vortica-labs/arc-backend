@@ -4,9 +4,17 @@ import { env } from "./config/env";
 import { logger } from "./config/logger";
 import { loadSecretsManagerEnv } from "./config/secrets";
 import { connectMongo } from "./infrastructure/database/mongodb";
-import { connectRedis, redisCacheClient } from "./infrastructure/cache/redis";
-import { createSocketServer } from "./infrastructure/websocket/socket";
-import { enqueueEmail, enqueueBulkNotifications } from "./infrastructure/jobs/queue";
+import { connectRedis, disconnectRedis, redisCacheClient } from "./infrastructure/cache/redis";
+import { attachSocketRedisAdapter, createSocketServer } from "./infrastructure/websocket/socket";
+import {
+  enqueueEmail,
+  enqueueBulkNotifications,
+  enqueueBroadcast,
+  enqueueBroadcastReceipts,
+  removeBroadcastJobs,
+  startBroadcastScheduler,
+  stopBroadcastScheduler
+} from "./infrastructure/jobs/queue";
 import path from "path";
 import { backendControllerPath, backendRootPath } from "./modules/legacy/legacy.paths";
 import { startLegacyBackgroundJobs } from "./modules/legacy/legacy.socket";
@@ -41,11 +49,19 @@ const bootstrap = async () => {
   const jobQueue = safeRequire<{ setQueueFunctions?: (fns: unknown) => void }>(
     path.join(backendRootPath, "utils", "jobQueue.js")
   );
-  jobQueue?.setQueueFunctions?.({ enqueueEmail, enqueueBulkNotifications });
+  jobQueue?.setQueueFunctions?.({
+    enqueueEmail,
+    enqueueBulkNotifications,
+    enqueueBroadcast,
+    enqueueBroadcastReceipts,
+    removeBroadcastJobs
+  });
+  startBroadcastScheduler();
 
   const app = createApp();
   const httpServer = createServer(app);
   const io = createSocketServer(httpServer);
+  attachSocketRedisAdapter(io);
   app.set("io", io);
 
   const notificationEmitter = safeRequire<{ setIoInstance?: (ioServer: unknown) => void }>(
@@ -89,15 +105,16 @@ const bootstrap = async () => {
 
     // 3. Close BullMQ workers
     try {
-      const { emailWorker, notificationWorker } = await import("./infrastructure/jobs/queue");
-      await Promise.allSettled([emailWorker.close(), notificationWorker.close()]);
+      stopBroadcastScheduler();
+      const { emailWorker, notificationWorker, broadcastWorker } = await import("./infrastructure/jobs/queue");
+      await Promise.allSettled([emailWorker.close(), notificationWorker.close(), broadcastWorker.close()]);
     } catch { /* queue may not be initialized */ }
 
     // 4. Disconnect Redis + Mongo
     try {
       const mongoose = await import("mongoose");
       await mongoose.default.disconnect();
-      await redisCacheClient?.quit?.();
+      await disconnectRedis();
     } catch { /* best effort */ }
 
     logger.info("Shutdown complete");

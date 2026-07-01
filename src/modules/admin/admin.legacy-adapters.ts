@@ -7,6 +7,7 @@ type AdminAuthMiddleware = {
   requireSuperAdmin: RequestHandler;
   requireAdminPermission: (permission: string) => RequestHandler;
   auditLog: (eventName: string) => RequestHandler;
+  durableMutationAudit: (eventName: string) => RequestHandler;
 };
 
 const loadModule = <T>(modulePath: string): T => {
@@ -15,6 +16,6 @@ const loadModule = <T>(modulePath: string): T => {
 };
 
 export const adminController = loadModule<AdminController>(path.join(backendControllerPath, "adminController.js"));
-export const { requireSuperAdmin, requireAdminPermission, auditLog } = loadModule<AdminAuthMiddleware>(
+export const { requireSuperAdmin, requireAdminPermission, auditLog, durableMutationAudit } = loadModule<AdminAuthMiddleware>(
   path.join(backendMiddlewarePath, "adminAuth.js")
 );

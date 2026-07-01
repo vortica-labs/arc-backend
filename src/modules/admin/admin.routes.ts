@@ -1,6 +1,8 @@
 import { Router } from "express";
 import { adminController, auditLog, requireAdminPermission, requireSuperAdmin } from "./admin.legacy-adapters";
 import { requireHardcodedAdminAuth } from "./admin-auth.middleware";
+import broadcastRoutes from "./broadcast.routes";
+import broadcastTemplateRoutes from "./broadcast-template.routes";
 
 const router = Router();
 
@@ -10,6 +12,9 @@ router.use((_, res, next) => {
   res.setHeader("X-Robots-Tag", "noindex, nofollow");
   next();
 });
+
+router.use("/broadcasts", broadcastRoutes);
+router.use("/broadcast-templates", broadcastTemplateRoutes);
 
 router.get("/dashboard", auditLog("VIEW_DASHBOARD"), requireAdminPermission("dashboard:read"), adminController.getDashboardStats);
 router.get("/search", auditLog("GLOBAL_SEARCH"), requireAdminPermission("dashboard:read"), adminController.globalSearch);

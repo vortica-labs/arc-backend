@@ -88,4 +88,21 @@ adminAuditLogSchema.index({ createdAt: -1 });
 adminAuditLogSchema.index({ action: 1, createdAt: -1 });
 adminAuditLogSchema.index({ resourceType: 1, resourceId: 1, createdAt: -1 });
 
+const rejectMutation = function(next) {
+  next(new Error('Admin audit logs are immutable'));
+};
+
+adminAuditLogSchema.pre('updateOne', rejectMutation);
+adminAuditLogSchema.pre('updateMany', rejectMutation);
+adminAuditLogSchema.pre('findOneAndUpdate', rejectMutation);
+adminAuditLogSchema.pre('replaceOne', rejectMutation);
+adminAuditLogSchema.pre('findOneAndReplace', rejectMutation);
+adminAuditLogSchema.pre('deleteOne', rejectMutation);
+adminAuditLogSchema.pre('deleteMany', rejectMutation);
+adminAuditLogSchema.pre('findOneAndDelete', rejectMutation);
+adminAuditLogSchema.pre('save', function(next) {
+  if (!this.isNew) return next(new Error('Admin audit logs are immutable'));
+  return next();
+});
+
 module.exports = mongoose.model('AdminAuditLog', adminAuditLogSchema);

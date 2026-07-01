@@ -7,12 +7,13 @@ type NotificationModelType = {
   createNotification: (...args: unknown[]) => Promise<any>;
   find: (...args: unknown[]) => any;
   findOne: (...args: unknown[]) => any;
+  findById: (...args: unknown[]) => any;
   countDocuments: (...args: unknown[]) => Promise<number>;
   updateMany: (...args: unknown[]) => Promise<unknown>;
 };
 type UserModelType = {
   findById: (...args: unknown[]) => any;
-  updateOne: (...args: unknown[]) => Promise<unknown>;
+  updateOne: (...args: unknown[]) => Promise<{ matchedCount?: number }>;
   updateMany: (...args: unknown[]) => Promise<unknown>;
 };
 

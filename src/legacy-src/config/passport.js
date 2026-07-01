@@ -25,6 +25,16 @@ passport.use(
         // Find or create user
         let user = await User.findOne({ email });
 
+        if (user?.userType === 'admin') {
+          return done(null, false, {
+            message: 'Admin accounts must sign in through the dedicated Admin Portal.'
+          });
+        }
+
+        if (user && !user.isActive) {
+          return done(null, false, { message: 'Account is deactivated.' });
+        }
+
         // Handle avatar upload to Cloudinary (fallback to Google URL if upload fails)
         let avatarUrl = avatar || '';
         if (avatar) {

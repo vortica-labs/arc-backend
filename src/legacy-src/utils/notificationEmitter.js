@@ -12,7 +12,28 @@ const emitNotification = (userId, notification) => {
   }
 };
 
+const emitBroadcastNotification = (userId, notification) => {
+  if (io) {
+    io.to(`user-${userId}`).emit('broadcast-notification', notification);
+  }
+};
+
+// Push-only Web broadcasts use a separate ephemeral event so they can invoke
+// the browser Notification API without creating an inbox row. The payload
+// carries targetPlatforms/targetAppVersions for installation-side suppression.
+const emitBroadcastPushNotification = (userId, notification) => {
+  if (!io) return false;
+  const room = `user-${userId}`;
+  // Emit through the configured Socket.IO adapter without consulting the
+  // process-local room map. Cross-node delivery is acknowledged by the Web
+  // client; a missing ACK expires durably in the broadcast recovery worker.
+  io.to(room).emit('broadcast-push-notification', notification);
+  return true;
+};
+
 const NOTIFICATION_SETTING_DEFAULTS = {
+  pushEnabled: true,
+  inAppEnabled: true,
   likes: true,
   comments: true,
   follows: true,
@@ -20,7 +41,11 @@ const NOTIFICATION_SETTING_DEFAULTS = {
   tournamentUpdates: true,
   scrimUpdates: true,
   recruitmentApps: true,
-  systemAlerts: true
+  systemAlerts: true,
+  marketingEnabled: true,
+  announcementsEnabled: true,
+  promotionsEnabled: true,
+  mutedBroadcastCategories: []
 };
 
 const getPreferenceKeyForNotification = (notificationData) => {
@@ -54,12 +79,10 @@ const getPreferenceKeyForNotification = (notificationData) => {
 
 const shouldDeliverNotification = async (notificationData) => {
   const preferenceKey = getPreferenceKeyForNotification(notificationData);
-  if (!preferenceKey) return true;
-
   const User = require('../models/User');
   const user = await User.findById(notificationData.recipient).select('notificationSettings').lean();
   const settings = { ...NOTIFICATION_SETTING_DEFAULTS, ...(user?.notificationSettings || {}) };
-  return settings[preferenceKey] !== false;
+  return settings.inAppEnabled !== false && (!preferenceKey || settings[preferenceKey] !== false);
 };
 
 const createAndEmitNotification = async (notificationData) => {
@@ -107,6 +130,8 @@ const emitNotificationToMultiple = (userIds, notification) => {
 module.exports = {
   setIoInstance,
   emitNotification,
+  emitBroadcastNotification,
+  emitBroadcastPushNotification,
   emitNotificationToMultiple,
   createAndEmitNotification
 };

@@ -24,6 +24,11 @@ const redisConfig = {
 export const redisPubClient = createClient(redisConfig);
 export const redisSubClient = redisPubClient.duplicate();
 export const redisCacheClient = redisPubClient.duplicate();
+// Socket.IO requires dedicated pub/sub connections. They cannot share the
+// subscriber used by application cache invalidation because Redis subscriber
+// mode has isolated channel ownership and lifecycle.
+export const socketRedisPubClient = redisPubClient.duplicate();
+export const socketRedisSubClient = redisPubClient.duplicate();
 
 // Deduplicate noisy startup errors — only log once per client until it connects
 const registerRedisLogging = (name: string, client: ReturnType<typeof createClient>) => {
@@ -49,7 +54,28 @@ const registerRedisLogging = (name: string, client: ReturnType<typeof createClie
 registerRedisLogging("pub", redisPubClient);
 registerRedisLogging("sub", redisSubClient);
 registerRedisLogging("cache", redisCacheClient);
+registerRedisLogging("socket-pub", socketRedisPubClient);
+registerRedisLogging("socket-sub", socketRedisSubClient);
 
 export const connectRedis = async (): Promise<void> => {
-  await Promise.all([redisPubClient.connect(), redisSubClient.connect(), redisCacheClient.connect()]);
+  await Promise.all([
+    redisPubClient.connect(),
+    redisSubClient.connect(),
+    redisCacheClient.connect(),
+    socketRedisPubClient.connect(),
+    socketRedisSubClient.connect()
+  ]);
+};
+
+export const disconnectRedis = async (): Promise<void> => {
+  const clients = [
+    socketRedisSubClient,
+    socketRedisPubClient,
+    redisSubClient,
+    redisPubClient,
+    redisCacheClient
+  ];
+  await Promise.allSettled(clients.map(async (client) => {
+    if (client.isOpen) await client.quit();
+  }));
 };
