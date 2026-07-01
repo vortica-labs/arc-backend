@@ -40,6 +40,8 @@ const envSchema = z.object({
   // Razorpay
   RAZORPAY_KEY_ID: z.string().optional(),
   RAZORPAY_KEY_SECRET: z.string().optional(),
+  RAZORPAY_WEBHOOK_SECRET: z.string().optional(),
+  RAZORPAY_PREMIUM_PLAN_IDS: z.string().optional(),
 
   // Hardcoded admin credentials (admin panel login)
   // Generate ADMIN_PASSWORD_HASH with: node scripts/generate-admin-hash.js <password>

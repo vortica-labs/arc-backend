@@ -2481,52 +2481,11 @@ const updateUserControls = async (req, res) => {
 };
 
 const grantPremium = async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { tier = 'player_pro', days = 30 } = req.body || {};
-    const validDays = Math.min(3650, Math.max(1, parseInt(days, 10) || 30));
-    const validUntil = new Date(Date.now() + (validDays * dayMs));
-    const user = await User.findByIdAndUpdate(
-      userId,
-      {
-        $set: {
-          isPremium: true,
-          'membership.tier': tier,
-          'membership.validUntil': validUntil
-        }
-      },
-      { new: true }
-    ).select('-password');
-    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-    await createSystemNotification(userId, 'Premium Granted', `Premium access has been enabled until ${validUntil.toDateString()}.`, { type: 'premium_granted' });
-    res.json({ success: true, message: 'Premium granted', data: user });
-  } catch (error) {
-    log.error('Grant premium error:', { error: String(error) });
-    res.status(500).json({ success: false, message: 'Failed to grant premium' });
-  }
+  return res.status(410).json({ success: false, message: 'Use POST /api/admin/premium-memberships/grant with premium RBAC and Idempotency-Key.' });
 };
 
 const removePremium = async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const user = await User.findByIdAndUpdate(
-      userId,
-      {
-        $set: {
-          isPremium: false,
-          'membership.tier': 'free',
-          'membership.validUntil': null
-        }
-      },
-      { new: true }
-    ).select('-password');
-    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-    await createSystemNotification(userId, 'Premium Removed', 'Premium access has been removed by the platform.', { type: 'premium_removed' });
-    res.json({ success: true, message: 'Premium removed', data: user });
-  } catch (error) {
-    log.error('Remove premium error:', { error: String(error) });
-    res.status(500).json({ success: false, message: 'Failed to remove premium' });
-  }
+  return res.status(410).json({ success: false, message: 'Use POST /api/admin/premium-memberships/:id/remove with premium RBAC and Idempotency-Key.' });
 };
 
 const getBoostCampaigns = async (req, res) => {

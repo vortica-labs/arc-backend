@@ -103,6 +103,7 @@ async function recordPaymentTransaction(transaction) {
 async function createOrder(req, res) {
   try {
     const { planId, billingPeriod } = req.body;
+    const platform = ['web', 'android', 'ios'].includes(req.body?.platform) ? req.body.platform : 'unknown';
     const userId = req.user._id;
 
     if (!planId || !billingPeriod) {
@@ -148,7 +149,7 @@ async function createOrder(req, res) {
       currency: 'INR',
       payment_capture: 1,
       receipt: `sub_${userId.toString().slice(-8)}_${Date.now().toString().slice(-8)}`,
-      notes: { planId, billingPeriod, userId: userId.toString() }
+      notes: { purpose: 'premium_membership', planId, planKey: planId, billingPeriod, userId: userId.toString(), platform }
     });
 
     res.status(200).json({
@@ -158,6 +159,7 @@ async function createOrder(req, res) {
         planId: plan.id,
         planName: plan.name,
         billingPeriod,
+        platform,
         amount: order.amount,
         currency: order.currency
       }
@@ -178,90 +180,40 @@ async function createOrder(req, res) {
  */
 async function verifyPayment(req, res) {
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, planId, billingPeriod } = req.body;
-    const userId = req.user._id;
-
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !planId || !billingPeriod) {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       return res.status(400).json({
         success: false,
-        message: 'razorpay_order_id, razorpay_payment_id, razorpay_signature, planId, and billingPeriod are required'
+        message: 'razorpay_order_id, razorpay_payment_id, and razorpay_signature are required'
       });
     }
-
-    const crypto = require('crypto');
-    const body = razorpay_order_id + '|' + razorpay_payment_id;
-    const expectedSignature = crypto
-      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-      .update(body)
-      .digest('hex');
-
-    if (expectedSignature !== razorpay_signature) {
-      return res.status(400).json({ success: false, message: 'Invalid payment signature' });
-    }
-
-    const payment = await getRazorpay().payments.fetch(razorpay_payment_id);
-    if (!payment || !['authorized', 'captured'].includes(payment.status)) {
-      return res.status(400).json({ success: false, message: 'Payment not confirmed by Razorpay' });
-    }
-
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-
-    const plan = getPlanById(planId, user.userType);
-    if (!plan) {
-      return res.status(404).json({ success: false, message: 'Plan not found' });
-    }
-
-    const validUntil = calculateValidUntil(billingPeriod);
-    const tier = plan.id;
-
-    user.isPremium = true;
-    user.membership = {
-      tier,
-      validUntil,
-      credits: plan.creditsPerMonth || (plan.creditsPerWeek ? plan.creditsPerWeek * 4 : 0)
-    };
-
-    await user.save();
-
-    await recordPaymentTransaction({
-      user: userId,
-      type: 'subscription',
-      amount: amountFromRazorpayPayment(payment, getPriceForPeriod(plan, billingPeriod)),
-      currency: payment.currency || 'INR',
-      status: 'completed',
-      description: `${plan.name} subscription (${billingPeriod})`,
+    const premiumService = require('../services/premiumMembershipService');
+    const result = await premiumService.verifyOneTimePurchase({
+      userId: req.user._id,
       orderId: razorpay_order_id,
       paymentId: razorpay_payment_id,
-      referenceId: userId,
-      referenceType: 'membership',
-      metadata: {
-        planId,
-        billingPeriod,
-        tier,
-        validUntil,
-        razorpayStatus: payment.status
-      }
+      signature: razorpay_signature,
+      platform: req.body?.platform
     });
-
-    res.status(200).json({
+    const membership = premiumService.serializeMembership(result.membership);
+    return res.status(200).json({
       success: true,
-      message: 'Payment verified and subscription activated',
+      idempotentReplay: result.idempotentReplay,
+      message: 'Payment verified and premium activated',
       data: {
-        tier,
-        validUntil,
-        credits: user.membership.credits,
-        planName: plan.name
+        membership,
+        tier: membership.planKey,
+        validUntil: membership.expiresAt,
+        billingPeriod: membership.billingPeriod,
+        autoRenew: membership.autoRenew
       }
     });
   } catch (err) {
-    console.error('Error verifying subscription payment:', err);
-    res.status(500).json({
+    const status = Number(err?.statusCode) || 500;
+    return res.status(status).json({
       success: false,
-      message: 'Failed to verify payment',
-      error: err.message
+      code: err?.code || 'PAYMENT_VERIFICATION_FAILED',
+      message: status < 500 ? err.message : 'Failed to verify payment'
     });
   }
 }
@@ -272,21 +224,54 @@ async function verifyPayment(req, res) {
  */
 async function cancelSubscription(req, res) {
   try {
-    const user = await User.findById(req.user._id);
-    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-
-    if (!user.isPremium || !user.membership || user.membership.tier === 'free') {
-      return res.status(400).json({ success: false, message: 'No active subscription to cancel' });
-    }
-
-    user.isPremium = false;
-    user.membership = { tier: 'free', validUntil: null, credits: 0 };
-    await user.save();
-
-    res.status(200).json({ success: true, message: 'Subscription cancelled. You are now on the Free plan.' });
+    const premiumService = require('../services/premiumMembershipService');
+    const membership = await premiumService.cancelCurrentForUser({
+      userId: req.user._id,
+      mode: req.body?.mode || 'immediate',
+      reason: req.body?.reason || 'Cancelled by customer'
+    });
+    return res.status(200).json({ success: true, message: membership.cancelAtCycleEnd ? 'Cancellation scheduled for the end of the current period.' : 'Premium cancelled.', data: premiumService.serializeMembership(membership) });
   } catch (err) {
-    console.error('Error cancelling subscription:', err);
-    res.status(500).json({ success: false, message: 'Failed to cancel subscription' });
+    const status = Number(err?.statusCode) || 500;
+    return res.status(status).json({ success: false, code: err?.code || 'CANCELLATION_FAILED', message: status < 500 ? err.message : 'Failed to cancel subscription' });
+  }
+}
+
+async function createRecurringPremiumSubscription(req, res) {
+  let claim;
+  try {
+    const premiumService = require('../services/premiumMembershipService');
+    const actorKey = `user:${String(req.user._id)}`;
+    const claimed = await premiumService.claimMutation({
+      actorKey,
+      operation: 'customer-create-subscription',
+      idempotencyKey: req.get('Idempotency-Key'),
+      payload: { planKey: req.body?.planKey || req.body?.planId, billingPeriod: req.body?.billingPeriod, platform: req.body?.platform }
+    });
+    if (claimed.replay) return res.status(200).json({ success: true, idempotentReplay: true, data: claimed.result });
+    claim = claimed.claim;
+    const result = await premiumService.createRecurringSubscription({ userId: req.user._id, planKey: req.body?.planKey || req.body?.planId, billingPeriod: req.body?.billingPeriod, platform: req.body?.platform, correlationId: String(claim._id) });
+    const data = { membership: premiumService.serializeMembership(result.membership), checkout: result.checkout };
+    await premiumService.completeMutation(claim, result.membership, data);
+    return res.status(201).json({ success: true, idempotentReplay: false, data });
+  } catch (err) {
+    const premiumService = require('../services/premiumMembershipService');
+    await premiumService.failMutation(claim, err).catch(() => null);
+    const status = Number(err?.statusCode) || 500;
+    return res.status(status).json({ success: false, code: err?.code || 'SUBSCRIPTION_CREATE_FAILED', message: status < 500 ? err.message : 'Failed to create recurring subscription' });
+  }
+}
+
+async function verifyRecurringPremiumSubscription(req, res) {
+  try {
+    const { razorpay_subscription_id, razorpay_payment_id, razorpay_signature } = req.body || {};
+    if (!razorpay_subscription_id || !razorpay_payment_id || !razorpay_signature) return res.status(400).json({ success: false, message: 'razorpay_subscription_id, razorpay_payment_id, and razorpay_signature are required' });
+    const premiumService = require('../services/premiumMembershipService');
+    const result = await premiumService.verifyRecurringSubscription({ userId: req.user._id, subscriptionId: razorpay_subscription_id, paymentId: razorpay_payment_id, signature: razorpay_signature, platform: req.body?.platform });
+    return res.status(200).json({ success: true, idempotentReplay: result.idempotentReplay, data: { membership: premiumService.serializeMembership(result.membership) } });
+  } catch (err) {
+    const status = Number(err?.statusCode) || 500;
+    return res.status(status).json({ success: false, code: err?.code || 'SUBSCRIPTION_VERIFICATION_FAILED', message: status < 500 ? err.message : 'Failed to verify recurring subscription' });
   }
 }
 
@@ -618,6 +603,8 @@ module.exports = {
   createOrder,
   verifyPayment,
   cancelSubscription,
+  createRecurringPremiumSubscription,
+  verifyRecurringPremiumSubscription,
   createTournamentOrder,
   verifyTournamentPayment,
   createBoostOrder,

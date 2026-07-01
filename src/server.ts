@@ -84,6 +84,12 @@ const bootstrap = async () => {
   );
   boostDeliveryCron?.startBoostDeliveryCron?.();
 
+  const premiumMembershipCron = safeRequire<{
+    startPremiumMembershipCron?: () => void;
+    stopPremiumMembershipCron?: () => void;
+  }>(path.join(backendRootPath, "jobs", "premiumMembershipCron.js"));
+  premiumMembershipCron?.startPremiumMembershipCron?.();
+
   httpServer.listen(env.PORT, () => {
     logger.info("Server started", {
       port: env.PORT,
@@ -106,6 +112,7 @@ const bootstrap = async () => {
     // 3. Close BullMQ workers
     try {
       stopBroadcastScheduler();
+      premiumMembershipCron?.stopPremiumMembershipCron?.();
       const { emailWorker, notificationWorker, broadcastWorker } = await import("./infrastructure/jobs/queue");
       await Promise.allSettled([emailWorker.close(), notificationWorker.close(), broadcastWorker.close()]);
     } catch { /* queue may not be initialized */ }

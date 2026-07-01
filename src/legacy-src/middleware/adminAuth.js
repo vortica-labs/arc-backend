@@ -4,10 +4,10 @@ const AdminAuditLog = require('../models/AdminAuditLog');
 
 const ROLE_PERMISSIONS = {
   super_admin: ['*'],
-  admin: ['dashboard:read', 'users:manage', 'content:manage', 'reports:manage', 'hosts:manage', 'boosts:manage', 'boost_delivery:manage', 'monetization:manage', 'broadcasts:read', 'broadcasts:manage', 'broadcasts:send', 'analytics:read', 'audit:read'],
+  admin: ['dashboard:read', 'users:manage', 'content:manage', 'reports:manage', 'hosts:manage', 'boosts:manage', 'boost_delivery:manage', 'monetization:manage', 'broadcasts:read', 'broadcasts:manage', 'broadcasts:send', 'premium:read', 'analytics:read', 'audit:read'],
   moderator: ['dashboard:read', 'content:manage', 'reports:manage', 'users:read'],
   support: ['dashboard:read', 'users:read', 'reports:read', 'feedback:manage'],
-  finance: ['dashboard:read', 'payments:read', 'boosts:read', 'boost_delivery:manage', 'monetization:manage'],
+  finance: ['dashboard:read', 'payments:read', 'boosts:read', 'boost_delivery:manage', 'monetization:manage', 'premium:read', 'premium:refund'],
   tournament_manager: ['dashboard:read', 'tournaments:manage', 'hosts:read'],
   content_moderator: ['dashboard:read', 'content:manage', 'reports:manage'],
   creator_manager: ['dashboard:read', 'monetization:manage', 'analytics:read']
@@ -208,6 +208,7 @@ const durableMutationAudit = (action) => {
         metadata: { phase: 'intent', correlationId }
       });
       res.locals.auditIntentId = String(intent._id);
+      res.locals.auditCorrelationId = correlationId;
     } catch (error) {
       console.error('[ADMIN DURABLE AUDIT INTENT FAILED]', error.message);
       return res.status(503).json({ success: false, message: 'Audit service unavailable; admin mutation was not executed' });

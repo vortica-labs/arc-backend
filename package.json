@@ -15,7 +15,12 @@
     "test:recommendations": "node src/legacy-src/services/recommendationService.test.js",
     "test:random-connect": "node src/legacy-src/controllers/randomConnectController.test.js",
     "migrate:broadcast-indexes": "node scripts/migrate-broadcast-indexes.js",
-    "verify:broadcast-indexes": "node scripts/migrate-broadcast-indexes.js --verify"
+    "verify:broadcast-indexes": "node scripts/migrate-broadcast-indexes.js --verify",
+    "migrate:premium-indexes": "node scripts/migrate-premium-indexes.js",
+    "verify:premium-indexes": "node scripts/migrate-premium-indexes.js --verify",
+    "backfill:premium": "node scripts/backfill-premium-memberships.js",
+    "backfill:premium:apply": "node scripts/backfill-premium-memberships.js --apply",
+    "test:premium": "node src/legacy-src/services/premiumMembershipService.test.js"
   },
   "keywords": [
     "modular-monolith",
