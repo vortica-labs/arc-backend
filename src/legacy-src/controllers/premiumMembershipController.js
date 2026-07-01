@@ -69,20 +69,23 @@ const eligibleUsers = async (req, res) => {
     const search = typeof req.query.search === 'string' ? req.query.search.trim().slice(0, 100) : '';
     if (search.length < 2) return res.status(400).json({ success: false, message: 'search must contain at least 2 characters' });
     const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const activeUserIds = await PremiumMembership.distinct('user', {
+    const identityConditions = [
+      { username: new RegExp(escaped, 'i') },
+      { email: new RegExp(escaped, 'i') },
+      { 'profile.displayName': new RegExp(escaped, 'i') }
+    ];
+    if (/^[a-f\d]{24}$/i.test(search)) identityConditions.push({ _id: search });
+    const candidates = await User.find({
+      userType: { $ne: 'admin' },
+      $or: identityConditions
+    }).select('username email profile.displayName profile.avatar userType').sort({ username: 1, _id: 1 }).limit(75).lean();
+    const activeUserIds = new Set((await PremiumMembership.distinct('user', {
+      user: { $in: candidates.map((user) => user._id) },
       isCurrent: true,
       membershipStatus: { $in: ['trial', 'active'] },
       $or: [{ expiresAt: null }, { expiresAt: { $gt: new Date() } }]
-    });
-    const users = await User.find({
-      userType: { $ne: 'admin' },
-      _id: { $nin: activeUserIds },
-      $or: [
-        { username: new RegExp(escaped, 'i') },
-        { email: new RegExp(escaped, 'i') },
-        { 'profile.displayName': new RegExp(escaped, 'i') }
-      ]
-    }).select('username email profile.displayName profile.avatar userType').sort({ username: 1, _id: 1 }).limit(25).lean();
+    })).map(String));
+    const users = candidates.filter((user) => !activeUserIds.has(String(user._id))).slice(0, 25);
     return res.json({ success: true, data: users.map((user) => ({
       id: String(user._id),
       displayName: user.profile?.displayName || user.username,

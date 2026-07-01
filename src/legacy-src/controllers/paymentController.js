@@ -168,8 +168,7 @@ async function createOrder(req, res) {
     console.error('Error creating subscription order:', err);
     res.status(500).json({
       success: false,
-      message: 'Failed to create order',
-      error: err.message
+      message: 'Failed to create order'
     });
   }
 }
@@ -196,6 +195,8 @@ async function verifyPayment(req, res) {
       platform: req.body?.platform
     });
     const membership = premiumService.serializeMembership(result.membership);
+    const projectedUser = await User.findById(req.user._id).select('membership.credits').lean();
+    const plan = premiumService.findPlan(membership.planKey, membership.accountType);
     return res.status(200).json({
       success: true,
       idempotentReplay: result.idempotentReplay,
@@ -205,7 +206,9 @@ async function verifyPayment(req, res) {
         tier: membership.planKey,
         validUntil: membership.expiresAt,
         billingPeriod: membership.billingPeriod,
-        autoRenew: membership.autoRenew
+        autoRenew: membership.autoRenew,
+        credits: Math.max(0, Number(projectedUser?.membership?.credits) || 0),
+        planName: plan.name
       }
     });
   } catch (err) {

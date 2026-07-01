@@ -1,4 +1,5 @@
 import { Router } from "express";
+import rateLimit from "express-rate-limit";
 import { adminController, auditLog, durableMutationAudit, requireAdminPermission, requireSuperAdmin } from "./admin.legacy-adapters";
 import { requireHardcodedAdminAuth } from "./admin-auth.middleware";
 import broadcastRoutes from "./broadcast.routes";
@@ -7,6 +8,13 @@ import premiumMembershipRoutes from "./premium-membership.routes";
 import { premiumMembershipController } from "./premium-membership.legacy-adapters";
 
 const router = Router();
+const legacyPremiumMutationLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Too many premium membership mutations. Try again shortly." }
+});
 
 // All admin routes are protected by the hardcoded-admin JWT check
 router.use(requireHardcodedAdminAuth);
@@ -29,8 +37,8 @@ router.get("/users", auditLog("VIEW_USERS"), requireAdminPermission("users:read"
 router.get("/users/:userId/inspection", auditLog("INSPECT_USER_PROFILE"), requireAdminPermission("users:read"), adminController.getUserInspection);
 router.put("/users/:userId/status", auditLog("UPDATE_USER_STATUS"), requireAdminPermission("users:manage"), adminController.updateUserStatus);
 router.put("/users/:userId/controls", auditLog("UPDATE_USER_CONTROLS"), requireAdminPermission("users:manage"), adminController.updateUserControls);
-router.post("/users/:userId/premium/grant", auditLog("GRANT_PREMIUM"), requireAdminPermission("premium:manage"), durableMutationAudit("GRANT_PREMIUM"), premiumMembershipController.legacyGrant);
-router.post("/users/:userId/premium/remove", auditLog("REMOVE_PREMIUM"), requireAdminPermission("premium:manage"), durableMutationAudit("REMOVE_PREMIUM"), premiumMembershipController.legacyRemove);
+router.post("/users/:userId/premium/grant", auditLog("GRANT_PREMIUM"), legacyPremiumMutationLimiter, requireAdminPermission("premium:manage"), durableMutationAudit("GRANT_PREMIUM"), premiumMembershipController.legacyGrant);
+router.post("/users/:userId/premium/remove", auditLog("REMOVE_PREMIUM"), legacyPremiumMutationLimiter, requireAdminPermission("premium:manage"), durableMutationAudit("REMOVE_PREMIUM"), premiumMembershipController.legacyRemove);
 router.put("/users/:userId/reset-password", auditLog("RESET_USER_PASSWORD"), requireAdminPermission("users:manage"), adminController.resetUserPassword);
 router.delete("/users/:userId", auditLog("DELETE_USER"), requireSuperAdmin, adminController.deleteUser);
 router.get("/posts", auditLog("VIEW_POSTS"), requireAdminPermission("content:manage"), adminController.getPosts);

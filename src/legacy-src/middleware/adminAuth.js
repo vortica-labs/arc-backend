@@ -19,6 +19,10 @@ const getAdminRole = (user) => {
   return 'admin';
 };
 
+const getAdminActorKey = (user) => user?._id
+  ? `user:${String(user._id)}`
+  : `hardcoded:${String(user?.username || 'admin').trim().toLowerCase()}`;
+
 const getAdminPermissions = (user) => {
   const role = getAdminRole(user);
   const rolePermissions = ROLE_PERMISSIONS[role] || [];
@@ -145,6 +149,7 @@ const auditLog = (action) => {
       const { resourceType, resourceId } = inferResource(req);
       AdminAuditLog.create({
         actor: {
+          actorKey: getAdminActorKey(req.user),
           user: req.user?._id || null,
           username: req.user?.username || 'admin',
           role: getAdminRole(req.user),
@@ -184,6 +189,7 @@ const durableMutationAudit = (action) => {
     const { resourceType, resourceId } = inferResource(req);
     const base = {
       actor: {
+        actorKey: getAdminActorKey(req.user),
         user: req.user?._id || null,
         username: req.user?.username || 'admin',
         role: getAdminRole(req.user),

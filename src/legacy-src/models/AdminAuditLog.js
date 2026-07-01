@@ -2,6 +2,12 @@ const mongoose = require('mongoose');
 
 const adminAuditLogSchema = new mongoose.Schema({
   actor: {
+    actorKey: {
+      type: String,
+      required: true,
+      default: 'hardcoded:admin',
+      index: true
+    },
     user: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
