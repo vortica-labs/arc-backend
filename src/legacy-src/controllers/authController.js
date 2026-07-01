@@ -5,6 +5,8 @@ const { generateToken, generateRefreshToken } = require('../utils/jwt');
 const { uploadAvatar, uploadImage } = require('../utils/cloudinary');
 const { sendOTPEmail } = require('../utils/email');
 const log = require('../utils/logger');
+const { invalidateUserCache } = require('../middleware/auth');
+const { validateOnboardingProfile } = require('../utils/onboardingValidation');
 
 const INVALID_LOGIN_MESSAGE = 'Invalid email or password.';
 
@@ -193,6 +195,21 @@ const register = async (req, res) => {
     
     username = normalizeUsernameInput(username);
     email = String(email || '').trim().toLowerCase();
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide a valid email'
+      });
+    }
+
+    if (typeof password !== 'string' || password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 6 characters long'
+      });
+    }
+
     const usernameValidationError = validateUsernameCandidate(username);
     if (usernameValidationError) {
       return res.status(400).json({
@@ -200,6 +217,16 @@ const register = async (req, res) => {
         message: usernameValidationError
       });
     }
+
+    const onboardingProfile = validateOnboardingProfile({ userType, displayName, gender, dob, bio });
+    if (onboardingProfile.error) {
+      return res.status(400).json({
+        success: false,
+        message: onboardingProfile.error
+      });
+    }
+
+    ({ userType, displayName, gender, dob, bio } = onboardingProfile.value);
 
     // Check if user already exists
     const existingUser = await User.findOne({
@@ -262,9 +289,9 @@ const register = async (req, res) => {
       userType,
       profile: {
         displayName,
-        bio: bio || '',
-        gender: gender || '',
-        dob: dob ? new Date(dob) : null,
+        bio,
+        gender,
+        dob,
         location: location || '',
         website: website || '',
         ...avatarData
@@ -864,11 +891,11 @@ const logout = async (req, res) => {
   }
 };
 
-// Complete Google OAuth profile (set userType, username and password)
-const completeGoogleProfile = async (req, res) => {
+// Complete the provider-neutral onboarding profile for an OAuth account.
+const completeProfile = async (req, res) => {
   try {
     const userId = req.user._id;
-    let { userType, username, password } = req.body;
+    let { userType, username, displayName, gender, dob, bio } = req.body;
     username = normalizeUsernameInput(username);
 
     // Get user
@@ -889,13 +916,15 @@ const completeGoogleProfile = async (req, res) => {
       });
     }
 
-    // Validate userType
-    if (!userType || !['player', 'team'].includes(userType)) {
+    const onboardingProfile = validateOnboardingProfile({ userType, displayName, gender, dob, bio });
+    if (onboardingProfile.error) {
       return res.status(400).json({
         success: false,
-        message: 'User type must be either player or team'
+        message: onboardingProfile.error
       });
     }
+
+    ({ userType, displayName, gender, dob, bio } = onboardingProfile.value);
 
     // Validate username
     const usernameValidationError = validateUsernameCandidate(username);
@@ -906,14 +935,6 @@ const completeGoogleProfile = async (req, res) => {
       });
     }
 
-    // Validate password
-    if (!password || password.length < 6) {
-      return res.status(400).json({
-        success: false,
-        message: 'Password must be at least 6 characters long'
-      });
-    }
-
     // Check if username is already taken by another user
     const existingUser = await findExistingUsername(username, userId);
 
@@ -921,10 +942,15 @@ const completeGoogleProfile = async (req, res) => {
       return sendUsernameDuplicate(res);
     }
 
-    // Update user with userType, username and password
+    // Authentication providers establish identity. Profile completion only
+    // applies the same profile fields collected during OTP registration.
     user.userType = userType;
     user.username = username;
-    user.password = password;
+    user.profile = user.profile || {};
+    user.profile.displayName = displayName;
+    user.profile.gender = gender;
+    user.profile.dob = dob;
+    user.profile.bio = bio;
     user.needsProfileCompletion = false;
 
     // Initialize type-specific fields if not already set
@@ -947,6 +973,7 @@ const completeGoogleProfile = async (req, res) => {
     }
 
     await user.save();
+    await invalidateUserCache(userId);
 
     // Generate new token with updated username
     const token = generateToken({ id: user._id, username: user.username, userType: user.userType });
@@ -959,6 +986,7 @@ const completeGoogleProfile = async (req, res) => {
     res.status(200).json({
       success: true,
       message: 'Profile completed successfully',
+      profileComplete: true,
       data: {
         user: userResponse,
         token,
@@ -976,6 +1004,18 @@ const completeGoogleProfile = async (req, res) => {
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
+};
+
+// Compatibility wrapper for deployed clients that predate the shared
+// onboarding form. Their OAuth account already has a provider display name.
+const completeGoogleProfile = (req, res) => {
+  if (!String(req.body?.displayName || '').trim()) {
+    req.body = {
+      ...req.body,
+      displayName: req.user?.profile?.displayName || ''
+    };
+  }
+  return completeProfile(req, res);
 };
 
 // Send OTP to email (for login / forgot password / register verification)
@@ -1161,6 +1201,20 @@ const googleTokenLogin = async (req, res) => {
 
     let user = await User.findOne({ email });
 
+    if (user?.userType === 'admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Admin accounts must sign in through the dedicated Admin Portal.'
+      });
+    }
+
+    if (user && !user.isActive) {
+      return res.status(401).json({
+        success: false,
+        message: 'Account is deactivated.'
+      });
+    }
+
     if (!user) {
       const { uploadAvatarFromUrl } = require('../utils/cloudinary');
       let avatarUrl = profile.picture || '';
@@ -1207,17 +1261,20 @@ const googleTokenLogin = async (req, res) => {
     const token = generateToken({ id: user._id, username: user.username, userType: user.userType });
     const refreshToken = generateRefreshToken({ id: user._id });
 
+    const userResponse = user.toObject();
+    delete userResponse.password;
+
     return res.json({
       success: true,
       token,
       refreshToken,
-      user: {
-        id: user._id,
-        username: user.username,
-        email: user.email,
-        userType: user.userType,
-        needsProfileCompletion: user.needsProfileCompletion
-      }
+      user: userResponse,
+      data: {
+        token,
+        refreshToken,
+        user: userResponse
+      },
+      profileComplete: !user.needsProfileCompletion
     });
   } catch (error) {
     log.error('Google token login error:', { error: String(error) });
@@ -1301,6 +1358,13 @@ const appleMobileLogin = async (req, res) => {
       user = await User.findOne({ email: tokenEmail });
     }
 
+    if (user?.userType === 'admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Admin accounts must sign in through the dedicated Admin Portal.'
+      });
+    }
+
     if (!user && !tokenEmail) {
       return res.status(400).json({
         success: false,
@@ -1352,6 +1416,12 @@ const appleMobileLogin = async (req, res) => {
           ]
         });
         if (!user) throw createError;
+        if (user.userType === 'admin') {
+          return res.status(403).json({
+            success: false,
+            message: 'Admin accounts must sign in through the dedicated Admin Portal.'
+          });
+        }
         if (!user.appleId) user.appleId = appleId;
         user.lastSeen = new Date();
         await user.save();
@@ -1360,6 +1430,15 @@ const appleMobileLogin = async (req, res) => {
       if (!user.appleId) user.appleId = appleId;
       user.lastSeen = new Date();
       await user.save();
+    }
+
+    // Re-check after duplicate-key recovery in case a concurrent request linked
+    // this provider identity to an admin account.
+    if (user.userType === 'admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Admin accounts must sign in through the dedicated Admin Portal.'
+      });
     }
 
     if (!user.isActive) {
@@ -1399,6 +1478,7 @@ module.exports = {
   logout,
   uploadProfilePicture,
   uploadBanner,
+  completeProfile,
   completeGoogleProfile,
   checkUsernameAvailability,
   checkEmailAvailability,

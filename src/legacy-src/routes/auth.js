@@ -1,6 +1,6 @@
 const express = require('express');
 const { body } = require('express-validator');
-const { protect } = require('../middleware/auth');
+const { protect, protectAllowIncomplete } = require('../middleware/auth');
 const { uploadSingle } = require('../middleware/upload');
 const passport = require('passport');
 const rateLimit = require('express-rate-limit');
@@ -28,6 +28,7 @@ const {
   logout,
   uploadProfilePicture,
   uploadBanner,
+  completeProfile,
   completeGoogleProfile,
   checkUsernameAvailability,
   checkEmailAvailability,
@@ -143,14 +144,15 @@ router.post('/check-password-same', checkPasswordSame);
 router.post('/register', uploadSingle('avatar'), registerValidation, register);
 router.post('/login', progressiveLoginLimiter, loginValidation, login);
 router.post('/guest-token', generateGuestToken);
-router.get('/me', protect, getMe);
+router.get('/me', protectAllowIncomplete, getMe);
 router.put('/profile', protect, uploadSingle('avatar'), profileUpdateValidation, updateProfile);
 router.post('/upload-profile-picture', protect, uploadSingle('image'), uploadProfilePicture);
 router.post('/upload-banner', protect, uploadSingle('image'), uploadBanner);
 router.put('/change-password', protect, changePasswordValidation, changePassword);
 router.delete('/account', protect, deleteAccountValidation, deleteAccount);
 router.post('/logout', logout);
-router.post('/complete-google-profile', protect, completeGoogleProfile);
+router.post('/complete-profile', protectAllowIncomplete, completeProfile);
+router.post('/complete-google-profile', protectAllowIncomplete, completeGoogleProfile);
 
 // Client-side Google OAuth (popup flow — no redirect URI required)
 router.post('/google/token', googleTokenLogin);

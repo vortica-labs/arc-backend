@@ -6,6 +6,8 @@ import { backendRootPath } from "../legacy/legacy.paths";
 const router = Router();
 
 const EXPO_PUSH_TOKEN_PATTERN = /^ExponentPushToken\[[\w-]+\]$|^ExpoPushToken\[[\w-]+\]$/;
+const EXPO_PUSH_TOKEN_MAX_LENGTH = 512;
+const MAX_PUSH_TOKENS_PER_USER = 10;
 const VALID_PLATFORMS = new Set(["ios", "android", "web", "unknown"]);
 
 const getUserId = (req: { user?: { _id?: string } }) => req.user?._id;
@@ -14,6 +16,40 @@ const safeString = (value: unknown, maxLength = 200) =>
 const maskToken = (token: string) =>
   token.length <= 24 ? token : `${token.slice(0, 12)}...${token.slice(-8)}`;
 const latestPushDiagnostics = new Map<string, Record<string, unknown>>();
+
+const buildClientVisibilityFilter = (platform: string, appVersion: string) => {
+  const hasKnownPlatform = Boolean(platform && VALID_PLATFORMS.has(platform) && platform !== "unknown");
+  return [
+    {
+      $or: [
+        { "data.targetPlatforms": { $exists: false } },
+        { "data.targetPlatforms": { $size: 0 } },
+        ...(hasKnownPlatform ? [{ "data.targetPlatforms": platform }] : [])
+      ]
+    },
+    {
+      $or: [
+        { "data.targetAppVersions": { $exists: false } },
+        { "data.targetAppVersions": { $size: 0 } },
+        ...(appVersion ? [{ "data.targetAppVersions": appVersion }] : [])
+      ]
+    }
+  ];
+};
+
+const withClientVisibility = (
+  base: Record<string, unknown>,
+  platform: string,
+  appVersion: string
+) => {
+  const constraints = buildClientVisibilityFilter(platform, appVersion);
+  return constraints.length ? { ...base, $and: constraints } : base;
+};
+
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const BroadcastRecipient = require(path.join(backendRootPath, "models", "BroadcastRecipient.js"));
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { trackDelivery, trackEvent } = require(path.join(backendRootPath, "services", "broadcastService.js"));
 
 const serializePushToken = (entry: Record<string, unknown>) => {
   const token = typeof entry.token === "string" ? entry.token : "";
@@ -27,6 +63,7 @@ const serializePushToken = (entry: Record<string, unknown>) => {
     platform: safeString(entry.platform, 40) || "unknown",
     deviceName: safeString(entry.deviceName, 120),
     projectId: safeString(entry.projectId, 120),
+    appVersion: safeString(entry.appVersion, 40),
     nativeTokenType: safeString(nativeToken?.type, 40),
     lastUsedAt: entry.lastUsedAt,
     createdAt: entry.createdAt
@@ -79,6 +116,7 @@ router.post("/push-token", protect, async (req, res) => {
       platform = "unknown",
       deviceName = "",
       projectId = "",
+      appVersion = "",
       nativeToken
     } = req.body ?? {};
 
@@ -86,7 +124,7 @@ router.post("/push-token", protect, async (req, res) => {
       return res.status(401).json({ success: false, message: "Authenticated user is required" });
     }
 
-    if (typeof token !== "string" || !EXPO_PUSH_TOKEN_PATTERN.test(token)) {
+    if (typeof token !== "string" || token.length > EXPO_PUSH_TOKEN_MAX_LENGTH || !EXPO_PUSH_TOKEN_PATTERN.test(token)) {
       return res.status(400).json({ success: false, message: "Valid Expo push token is required" });
     }
 
@@ -112,13 +150,17 @@ router.post("/push-token", protect, async (req, res) => {
       {
         $push: {
           pushTokens: {
+            $each: [{
             token,
             platform: normalizedPlatform,
             deviceName: safeString(deviceName, 120),
             projectId: safeString(projectId, 120),
+            appVersion: safeString(appVersion, 40),
             ...(normalizedNativeToken ? { nativeToken: normalizedNativeToken } : {}),
             lastUsedAt: new Date(),
             createdAt: new Date()
+            }],
+            $slice: -MAX_PUSH_TOKENS_PER_USER
           }
         }
       }
@@ -130,6 +172,7 @@ router.post("/push-token", protect, async (req, res) => {
       message: "Push token registered",
       data: {
         platform: normalizedPlatform,
+        appVersion: safeString(appVersion, 40),
         registeredAt: new Date().toISOString(),
         ...tokenCounts
       }
@@ -138,6 +181,73 @@ router.post("/push-token", protect, async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to register push token",
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
+
+router.post("/client-context", protect, async (req, res) => {
+  try {
+    const userId = getUserId(req as { user?: { _id?: string } });
+    if (!userId) return res.status(401).json({ success: false, message: "Authenticated user is required" });
+    const platform = safeString(req.body?.platform, 40).toLowerCase();
+    if (!VALID_PLATFORMS.has(platform) || platform === "unknown") {
+      return res.status(400).json({ success: false, message: "platform must be ios, android, or web" });
+    }
+    const appVersion = safeString(req.body?.appVersion, 40);
+    const clientId = safeString(req.body?.clientId, 200);
+    const permissionInput = safeString(req.body?.notificationPermission, 20).toLowerCase();
+    const notificationPermission = new Set(["granted", "denied", "default", "unsupported"])
+      .has(permissionInput) ? permissionInput : "unknown";
+    const browserNotificationsSupported = req.body?.browserNotificationsSupported === true;
+    if (!clientId) {
+      return res.status(400).json({ success: false, message: "A stable clientId is required" });
+    }
+    const now = new Date();
+
+    // An installation belongs to one authenticated account at a time. Moving
+    // it first prevents a signed-out account from remaining eligible for
+    // platform/version broadcasts on the same browser or mobile installation.
+    await User.updateMany(
+      { _id: { $ne: userId }, "notificationClients.clientId": clientId },
+      { $pull: { notificationClients: { clientId } } }
+    );
+    const result = await User.updateOne(
+      { _id: userId, "notificationClients.clientId": clientId },
+      {
+        $set: {
+          "notificationClients.$.platform": platform,
+          "notificationClients.$.appVersion": appVersion,
+          "notificationClients.$.notificationPermission": notificationPermission,
+          "notificationClients.$.browserNotificationsSupported": browserNotificationsSupported,
+          "notificationClients.$.lastSeenAt": now
+        }
+      }
+    );
+    if (!result?.matchedCount) {
+      await User.updateOne(
+        { _id: userId },
+        {
+          $push: {
+            notificationClients: {
+              $each: [{
+                clientId, platform, appVersion, notificationPermission,
+                browserNotificationsSupported, lastSeenAt: now, createdAt: now
+              }],
+              $slice: -10
+            }
+          }
+        }
+      );
+    }
+    return res.json({
+      success: true,
+      data: { clientId, platform, appVersion, notificationPermission, browserNotificationsSupported, registeredAt: now }
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to register notification client context",
       error: error instanceof Error ? error.message : String(error)
     });
   }
@@ -175,7 +285,7 @@ router.get("/push-status", protect, async (req, res) => {
       return res.status(401).json({ success: false, message: "Authenticated user is required" });
     }
 
-    const user = await User.findById(userId).select("pushTokens notificationSettings").lean();
+    const user = await User.findById(userId).select("pushTokens notificationClients notificationSettings").lean();
     const pushTokens = Array.isArray(user?.pushTokens) ? user.pushTokens : [];
     const tokens = pushTokens.map((entry: Record<string, unknown>) => serializePushToken(entry));
 
@@ -188,8 +298,22 @@ router.get("/push-status", protect, async (req, res) => {
         pushTokenCount: tokens.length,
         validExpoPushTokenCount: tokens.filter((entry: { isValidExpoToken: boolean }) => entry.isValidExpoToken).length,
         tokens,
+        clients: Array.isArray(user?.notificationClients)
+          ? user.notificationClients.map((client: Record<string, unknown>) => ({
+              clientId: safeString(client.clientId, 200),
+              platform: safeString(client.platform, 40) || "unknown",
+              appVersion: safeString(client.appVersion, 40),
+              notificationPermission: safeString(client.notificationPermission, 20) || "unknown",
+              browserNotificationsSupported: client.browserNotificationsSupported === true,
+              lastSeenAt: client.lastSeenAt
+            }))
+          : [],
         lastTestPush: latestPushDiagnostics.get(userId) ?? null,
-        notificationSettings: user?.notificationSettings ?? {},
+        notificationSettings: {
+          pushEnabled: true,
+          inAppEnabled: true,
+          ...(user?.notificationSettings ?? {})
+        },
         requirements: {
           android: "Expo/EAS FCM credentials must be configured for the Android package used by the installed build.",
           ios: "Expo/EAS APNs credentials must be configured for the iOS bundle identifier and APNs environment."
@@ -240,17 +364,150 @@ router.post("/push-test", protect, async (req, res) => {
   }
 });
 
+const resolveOwnedBroadcastDelivery = async (notificationId: string, userId: string) => {
+  if (!/^[a-f\d]{24}$/i.test(notificationId)) return null;
+  const notification = await Notification.findOne({ _id: notificationId, recipient: userId, deletedAt: null });
+  if (notification) return { notification, persistentNotification: true };
+  const deliveryLog = await BroadcastRecipient.findOne({ _id: notificationId, recipient: userId }).lean();
+  if (!deliveryLog) return null;
+  return {
+    persistentNotification: false,
+    notification: {
+      _id: deliveryLog._id,
+      recipient: deliveryLog.recipient,
+      broadcastRecipient: deliveryLog._id,
+      data: {
+        broadcastId: deliveryLog.broadcast,
+        deliveryLogId: deliveryLog._id,
+        customData: {
+          broadcastId: String(deliveryLog.broadcast),
+          deliveryLogId: String(deliveryLog._id)
+        }
+      }
+    }
+  };
+};
+
+router.post("/:id/delivered", protect, async (req, res) => {
+  try {
+    const userId = getUserId(req as { user?: { _id?: string } });
+    if (!userId) return res.status(401).json({ success: false, message: "Authenticated user is required" });
+    const owned = await resolveOwnedBroadcastDelivery(req.params.id, userId);
+    if (!owned) return res.status(404).json({ success: false, message: "Notification not found" });
+    const result = await trackDelivery({
+      notification: owned.notification,
+      userId,
+      platform: safeString(req.body?.platform, 40).toLowerCase(),
+      metadata: { source: safeString(req.body?.source, 80) }
+    });
+    return res.json({ success: true, data: result });
+  } catch (error) {
+    const statusCode = Number((error as { statusCode?: number })?.statusCode) || 500;
+    return res.status(statusCode).json({
+      success: false,
+      message: statusCode === 500 ? "Failed to acknowledge notification delivery" : (error as Error).message
+    });
+  }
+});
+
+router.post("/:id/open", protect, async (req, res) => {
+  try {
+    const userId = getUserId(req as { user?: { _id?: string } });
+    if (!userId) return res.status(401).json({ success: false, message: "Authenticated user is required" });
+    const owned = await resolveOwnedBroadcastDelivery(req.params.id, userId);
+    if (!owned) return res.status(404).json({ success: false, message: "Notification not found" });
+    if (owned.persistentNotification) {
+      await Notification.updateMany(
+        { _id: owned.notification._id, recipient: userId, isRead: false },
+        { $set: { isRead: true, readAt: new Date() } }
+      );
+    }
+    const result = await trackEvent({
+      notification: owned.notification,
+      userId,
+      eventType: "open",
+      platform: safeString(req.body?.platform, 40).toLowerCase(),
+      metadata: { source: safeString(req.body?.source, 80) }
+    });
+    return res.json({ success: true, data: result });
+  } catch (error) {
+    const statusCode = Number((error as { statusCode?: number })?.statusCode) || 500;
+    return res.status(statusCode).json({
+      success: false,
+      message: statusCode === 500 ? "Failed to track notification open" : (error as Error).message
+    });
+  }
+});
+
+router.post("/:id/click", protect, async (req, res) => {
+  try {
+    const userId = getUserId(req as { user?: { _id?: string } });
+    if (!userId) return res.status(401).json({ success: false, message: "Authenticated user is required" });
+    const owned = await resolveOwnedBroadcastDelivery(req.params.id, userId);
+    if (!owned) return res.status(404).json({ success: false, message: "Notification not found" });
+    // A click implies an open. Both operations are idempotent at the recipient-log layer.
+    if (owned.persistentNotification) {
+      await Notification.updateMany(
+        { _id: owned.notification._id, recipient: userId, isRead: false },
+        { $set: { isRead: true, readAt: new Date() } }
+      );
+    }
+    await trackEvent({
+      notification: owned.notification,
+      userId,
+      eventType: "open",
+      platform: safeString(req.body?.platform, 40).toLowerCase(),
+      metadata: { source: "click" }
+    });
+    const result = await trackEvent({
+      notification: owned.notification,
+      userId,
+      eventType: "click",
+      url: safeString(req.body?.url, 2048),
+      platform: safeString(req.body?.platform, 40).toLowerCase(),
+      metadata: { source: safeString(req.body?.source, 80) }
+    });
+    return res.json({ success: true, data: result });
+  } catch (error) {
+    const statusCode = Number((error as { statusCode?: number })?.statusCode) || 500;
+    return res.status(statusCode).json({
+      success: false,
+      message: statusCode === 500 ? "Failed to track notification click" : (error as Error).message
+    });
+  }
+});
+
 router.get("/", protect, async (req, res) => {
   try {
     const userId = getUserId(req as { user?: { _id?: string } });
-    const page = Number.parseInt(String(req.query.page ?? "1"), 10) || 1;
-    const limit = Number.parseInt(String(req.query.limit ?? "20"), 10) || 20;
+    const page = Math.max(1, Number.parseInt(String(req.query.page ?? "1"), 10) || 1);
+    const limit = Math.max(1, Math.min(100, Number.parseInt(String(req.query.limit ?? "20"), 10) || 20));
     const skip = (page - 1) * limit;
     const isRead = req.query.isRead;
 
-    const filter: Record<string, unknown> = { recipient: userId };
+    const platform = safeString(req.query.platform, 40).toLowerCase();
+    const appVersion = safeString(req.query.appVersion, 40);
+    const archived = String(req.query.archived ?? "false") === "true";
+    let filter: Record<string, unknown> = withClientVisibility({
+      recipient: userId,
+      deletedAt: null,
+      archivedAt: archived ? { $ne: null } : null
+    }, platform, appVersion);
     if (isRead !== undefined) {
-      filter.isRead = String(isRead) === "true";
+      filter = { ...filter, isRead: String(isRead) === "true" };
+    }
+    const category = safeString(req.query.category, 60).toLowerCase();
+    if (category && category !== "all") filter = { ...filter, "data.customData.category": category };
+    const search = safeString(req.query.search, 100);
+    if (search) {
+      const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      filter = {
+        ...filter,
+        $or: [
+          { title: { $regex: escaped, $options: "i" } },
+          { message: { $regex: escaped, $options: "i" } }
+        ]
+      };
     }
 
     const notifications = await Notification.find(filter)
@@ -262,7 +519,9 @@ router.get("/", protect, async (req, res) => {
       .exec();
 
     const total = await Notification.countDocuments(filter);
-    const unreadCount = await Notification.countDocuments({ recipient: userId, isRead: false });
+    const unreadCount = await Notification.countDocuments(
+      withClientVisibility({ recipient: userId, isRead: false, deletedAt: null, archivedAt: null }, platform, appVersion)
+    );
 
     return res.status(200).json({
       success: true,
@@ -290,7 +549,11 @@ router.put("/:id/read", protect, async (req, res) => {
   try {
     const userId = (req as { user?: { _id?: string } }).user?._id;
     const { id } = req.params;
-    const notification = await Notification.findOne({ _id: id, recipient: userId });
+    const platform = safeString(req.body?.platform ?? req.query.platform, 40).toLowerCase();
+    const appVersion = safeString(req.body?.appVersion ?? req.query.appVersion, 40);
+    const notification = await Notification.findOne(
+      withClientVisibility({ _id: id, recipient: userId, deletedAt: null }, platform, appVersion)
+    );
     if (!notification) {
       return res.status(404).json({ success: false, message: "Notification not found" });
     }
@@ -308,7 +571,12 @@ router.put("/:id/read", protect, async (req, res) => {
 router.put("/read-all", protect, async (req, res) => {
   try {
     const userId = (req as { user?: { _id?: string } }).user?._id;
-    await Notification.updateMany({ recipient: userId, isRead: false }, { isRead: true, readAt: new Date() });
+    const platform = safeString(req.body?.platform ?? req.query.platform, 40).toLowerCase();
+    const appVersion = safeString(req.body?.appVersion ?? req.query.appVersion, 40);
+    await Notification.updateMany(
+      withClientVisibility({ recipient: userId, isRead: false, deletedAt: null, archivedAt: null }, platform, appVersion),
+      { isRead: true, readAt: new Date() }
+    );
     return res.status(200).json({ success: true, message: "All notifications marked as read" });
   } catch (error) {
     return res.status(500).json({
@@ -319,15 +587,45 @@ router.put("/read-all", protect, async (req, res) => {
   }
 });
 
+router.put("/:id/archive", protect, async (req, res) => {
+  try {
+    const userId = getUserId(req as { user?: { _id?: string } });
+    const notification = await Notification.findOne({ _id: req.params.id, recipient: userId, deletedAt: null });
+    if (!notification) return res.status(404).json({ success: false, message: "Notification not found" });
+    notification.archivedAt = new Date();
+    await notification.save();
+    return res.json({ success: true, message: "Notification archived" });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to archive notification" });
+  }
+});
+
+router.put("/:id/unarchive", protect, async (req, res) => {
+  try {
+    const userId = getUserId(req as { user?: { _id?: string } });
+    const notification = await Notification.findOne({ _id: req.params.id, recipient: userId, deletedAt: null });
+    if (!notification) return res.status(404).json({ success: false, message: "Notification not found" });
+    notification.archivedAt = null;
+    await notification.save();
+    return res.json({ success: true, message: "Notification restored" });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to restore notification" });
+  }
+});
+
 router.delete("/:id", protect, async (req, res) => {
   try {
     const userId = (req as { user?: { _id?: string } }).user?._id;
     const { id } = req.params;
-    const notification = await Notification.findOne({ _id: id, recipient: userId });
+    const notification = await Notification.findOne({ _id: id, recipient: userId, deletedAt: null });
     if (!notification) {
       return res.status(404).json({ success: false, message: "Notification not found" });
     }
-    await notification.deleteOne();
+    notification.deletedAt = new Date();
+    notification.archivedAt = null;
+    notification.isRead = true;
+    notification.readAt = notification.readAt || new Date();
+    await notification.save();
     return res.status(200).json({ success: true, message: "Notification deleted" });
   } catch (error) {
     return res.status(500).json({

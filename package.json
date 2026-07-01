@@ -8,9 +8,14 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
+    "test:auth-oauth-contracts": "node src/legacy-src/controllers/authController.oauth.test.js",
+    "test:auth-onboarding": "node src/legacy-src/utils/onboardingValidation.test.js && node src/legacy-src/middleware/auth.profile-completion.test.js && node src/legacy-src/controllers/authController.oauth.test.js && node src/legacy-src/config/passport.oauth.test.js",
     "test:auth-limiter": "node src/legacy-src/middleware/progressiveAuthLimiter.test.js",
+    "test:broadcast": "node src/legacy-src/services/broadcastService.test.js",
     "test:recommendations": "node src/legacy-src/services/recommendationService.test.js",
-    "test:random-connect": "node src/legacy-src/controllers/randomConnectController.test.js"
+    "test:random-connect": "node src/legacy-src/controllers/randomConnectController.test.js",
+    "migrate:broadcast-indexes": "node scripts/migrate-broadcast-indexes.js",
+    "verify:broadcast-indexes": "node scripts/migrate-broadcast-indexes.js --verify"
   },
   "keywords": [
     "modular-monolith",

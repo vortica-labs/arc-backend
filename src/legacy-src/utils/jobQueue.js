@@ -10,13 +10,46 @@
 
 let _enqueueEmail = null;
 let _enqueueBulkNotifications = null;
+let _enqueueBroadcast = null;
+let _enqueueBroadcastReceipts = null;
+let _removeBroadcastJobs = null;
 
 /**
  * Inject the queue functions from TypeScript land.
  */
-const setQueueFunctions = ({ enqueueEmail, enqueueBulkNotifications }) => {
+const setQueueFunctions = ({ enqueueEmail, enqueueBulkNotifications, enqueueBroadcast, enqueueBroadcastReceipts, removeBroadcastJobs }) => {
   _enqueueEmail = enqueueEmail;
   _enqueueBulkNotifications = enqueueBulkNotifications;
+  _enqueueBroadcast = enqueueBroadcast;
+  _enqueueBroadcastReceipts = enqueueBroadcastReceipts;
+  _removeBroadcastJobs = removeBroadcastJobs;
+};
+
+const enqueueBroadcastReceipts = async (receiptRecordIds, runAt, reconciliationKey) => {
+  if (!_enqueueBroadcastReceipts) {
+    const error = new Error('Broadcast receipt queue is not available');
+    error.statusCode = 503;
+    throw error;
+  }
+  return _enqueueBroadcastReceipts(receiptRecordIds, runAt, reconciliationKey);
+};
+
+/**
+ * Queue one immediate or delayed broadcast dispatch. Broadcast delivery never
+ * falls back to the request process because fan-out must remain asynchronous.
+ */
+const enqueueBroadcast = async (broadcastId, runAt, occurrenceKey, recoveryKey) => {
+  if (!_enqueueBroadcast) {
+    const error = new Error('Broadcast queue is not available');
+    error.statusCode = 503;
+    throw error;
+  }
+  return _enqueueBroadcast(broadcastId, runAt, occurrenceKey, recoveryKey);
+};
+
+const removeBroadcastJobs = async (broadcastId) => {
+  if (!_removeBroadcastJobs) return;
+  return _removeBroadcastJobs(broadcastId);
 };
 
 /**
@@ -95,5 +128,8 @@ const enqueueBulkNotifications = async (recipientIds, title, message, type, data
 module.exports = {
   setQueueFunctions,
   enqueueEmail,
-  enqueueBulkNotifications
+  enqueueBulkNotifications,
+  enqueueBroadcast,
+  enqueueBroadcastReceipts,
+  removeBroadcastJobs
 };

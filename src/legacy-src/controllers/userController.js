@@ -3424,6 +3424,8 @@ const updatePrivacySettings = async (req, res) => {
 };
 
 const notificationSettingDefaults = {
+  pushEnabled: true,
+  inAppEnabled: true,
   likes: true,
   comments: true,
   follows: true,
@@ -3431,7 +3433,11 @@ const notificationSettingDefaults = {
   tournamentUpdates: true,
   scrimUpdates: true,
   recruitmentApps: true,
-  systemAlerts: true
+  systemAlerts: true,
+  marketingEnabled: true,
+  announcementsEnabled: true,
+  promotionsEnabled: true,
+  mutedBroadcastCategories: []
 };
 
 const normalizeNotificationSettings = (settings) => ({
@@ -3453,14 +3459,30 @@ const getNotificationSettings = async (req, res) => {
 
 const updateNotificationSettings = async (req, res) => {
   try {
-    const allowedKeys = Object.keys(notificationSettingDefaults);
+    const allowedBooleanKeys = Object.keys(notificationSettingDefaults)
+      .filter((key) => key !== 'mutedBroadcastCategories');
     const update = {};
 
-    allowedKeys.forEach((key) => {
+    allowedBooleanKeys.forEach((key) => {
       if (typeof req.body?.[key] === 'boolean') {
         update[`notificationSettings.${key}`] = req.body[key];
       }
     });
+
+    if (Array.isArray(req.body?.mutedBroadcastCategories)) {
+      const allowedCategories = new Set([
+        'announcement', 'update', 'maintenance', 'feature_release', 'tournament',
+        'recruitment', 'promotion', 'creator', 'premium', 'system', 'custom'
+      ]);
+      const categories = Array.from(new Set(req.body.mutedBroadcastCategories
+        .filter((category) => typeof category === 'string')
+        .map((category) => category.trim().toLowerCase())
+        .filter((category) => allowedCategories.has(category))));
+      if (categories.length !== req.body.mutedBroadcastCategories.length) {
+        return res.status(400).json({ success: false, message: 'mutedBroadcastCategories contains an invalid category' });
+      }
+      update['notificationSettings.mutedBroadcastCategories'] = categories;
+    }
 
     if (Object.keys(update).length === 0) {
       return res.status(400).json({ success: false, message: 'At least one notification setting is required' });

@@ -1,9 +1,10 @@
 const { protect } = require('./auth');
+const { randomUUID } = require('crypto');
 const AdminAuditLog = require('../models/AdminAuditLog');
 
 const ROLE_PERMISSIONS = {
   super_admin: ['*'],
-  admin: ['dashboard:read', 'users:manage', 'content:manage', 'reports:manage', 'hosts:manage', 'boosts:manage', 'boost_delivery:manage', 'monetization:manage', 'analytics:read', 'audit:read'],
+  admin: ['dashboard:read', 'users:manage', 'content:manage', 'reports:manage', 'hosts:manage', 'boosts:manage', 'boost_delivery:manage', 'monetization:manage', 'broadcasts:read', 'broadcasts:manage', 'broadcasts:send', 'analytics:read', 'audit:read'],
   moderator: ['dashboard:read', 'content:manage', 'reports:manage', 'users:read'],
   support: ['dashboard:read', 'users:read', 'reports:read', 'feedback:manage'],
   finance: ['dashboard:read', 'payments:read', 'boosts:read', 'boost_delivery:manage', 'monetization:manage'],
@@ -173,12 +174,81 @@ const auditLog = (action) => {
   };
 };
 
+// Broadcast mutations fail closed unless an immutable intent record is
+// durable. The response is held until a second immutable outcome record is
+// appended, providing an audit trail even if the process dies after mutation.
+const durableMutationAudit = (action) => {
+  return async (req, res, next) => {
+    const correlationId = randomUUID();
+    const startedAt = Date.now();
+    const { resourceType, resourceId } = inferResource(req);
+    const base = {
+      actor: {
+        user: req.user?._id || null,
+        username: req.user?.username || 'admin',
+        role: getAdminRole(req.user),
+        permissions: getAdminPermissions(req.user)
+      },
+      resourceType,
+      resourceId,
+      method: req.method,
+      path: req.originalUrl || req.path,
+      request: {
+        query: sanitizeForAudit(req.query || {}),
+        body: sanitizeForAudit(req.body || {})
+      },
+      ip: String(req.ip || req.headers['x-forwarded-for'] || ''),
+      userAgent: req.get ? (req.get('user-agent') || '') : ''
+    };
+    try {
+      const intent = await AdminAuditLog.create({
+        ...base,
+        action: `${action}_INTENT`,
+        statusCode: 102,
+        metadata: { phase: 'intent', correlationId }
+      });
+      res.locals.auditIntentId = String(intent._id);
+    } catch (error) {
+      console.error('[ADMIN DURABLE AUDIT INTENT FAILED]', error.message);
+      return res.status(503).json({ success: false, message: 'Audit service unavailable; admin mutation was not executed' });
+    }
+
+    const originalJson = res.json.bind(res);
+    let outcomeStarted = false;
+    res.json = (body) => {
+      if (outcomeStarted) return res;
+      outcomeStarted = true;
+      const intendedStatus = res.statusCode;
+      AdminAuditLog.create({
+        ...base,
+        action: `${action}_OUTCOME`,
+        statusCode: intendedStatus,
+        before: res.locals?.auditBefore || null,
+        after: res.locals?.auditAfter || null,
+        metadata: {
+          phase: 'outcome',
+          correlationId,
+          intentId: res.locals.auditIntentId,
+          durationMs: Date.now() - startedAt
+        }
+      }).then(() => originalJson(body)).catch((error) => {
+        console.error('[ADMIN DURABLE AUDIT OUTCOME FAILED]', error.message);
+        res.status(503);
+        originalJson({ success: false, message: 'Mutation completed but its audit outcome could not be persisted', auditIntentId: res.locals.auditIntentId });
+      });
+      return res;
+    };
+    next();
+  };
+};
+
 module.exports = { 
   requireAdmin, 
   requireAdminWithAuth,
   requireAdminPermission,
   requireSuperAdmin, 
   auditLog,
+  durableMutationAudit,
   ROLE_PERMISSIONS,
   hasPermission,
   getAdminPermissions

@@ -12,6 +12,7 @@ type LegacyAuthController = {
   logout: RequestHandler;
   uploadProfilePicture: RequestHandler;
   uploadBanner: RequestHandler;
+  completeProfile: RequestHandler;
   completeGoogleProfile: RequestHandler;
   checkUsernameAvailability: RequestHandler;
   checkEmailAvailability: RequestHandler;
@@ -32,6 +33,7 @@ type ProgressiveAuthLimiter = {
 
 type ProtectMiddleware = {
   protect: RequestHandler;
+  protectAllowIncomplete: RequestHandler;
 };
 
 type UploadMiddleware = {
@@ -51,7 +53,7 @@ export const legacyAuthController = loadModule<LegacyAuthController>(path.join(b
 export const { progressiveLoginLimiter, progressiveOtpLoginLimiter } = loadModule<ProgressiveAuthLimiter>(
   path.join(backendMiddlewarePath, "progressiveAuthLimiter.js")
 );
-export const { protect } = loadModule<ProtectMiddleware>(path.join(backendMiddlewarePath, "auth.js"));
+export const { protect, protectAllowIncomplete } = loadModule<ProtectMiddleware>(path.join(backendMiddlewarePath, "auth.js"));
 export const { uploadSingle } = loadModule<UploadMiddleware>(path.join(backendMiddlewarePath, "upload.js"));
 export const passport = loadModule<PassportModule>("passport");
 

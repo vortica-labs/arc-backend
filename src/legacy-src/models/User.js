@@ -502,6 +502,14 @@ const userSchema = new mongoose.Schema({
     }
   },
   notificationSettings: {
+    pushEnabled: {
+      type: Boolean,
+      default: true
+    },
+    inAppEnabled: {
+      type: Boolean,
+      default: true
+    },
     likes: {
       type: Boolean,
       default: true
@@ -533,7 +541,26 @@ const userSchema = new mongoose.Schema({
     systemAlerts: {
       type: Boolean,
       default: true
-    }
+    },
+    marketingEnabled: {
+      type: Boolean,
+      default: true
+    },
+    announcementsEnabled: {
+      type: Boolean,
+      default: true
+    },
+    promotionsEnabled: {
+      type: Boolean,
+      default: true
+    },
+    mutedBroadcastCategories: [{
+      type: String,
+      enum: [
+        'announcement', 'update', 'maintenance', 'feature_release', 'tournament',
+        'recruitment', 'promotion', 'creator', 'premium', 'system', 'custom'
+      ]
+    }]
   },
   googleId: {
     type: String,
@@ -556,7 +583,8 @@ const userSchema = new mongoose.Schema({
   pushTokens: [{
     token: {
       type: String,
-      required: true
+      required: true,
+      maxlength: 512
     },
     platform: {
       type: String,
@@ -570,6 +598,11 @@ const userSchema = new mongoose.Schema({
     projectId: {
       type: String,
       default: ''
+    },
+    appVersion: {
+      type: String,
+      default: '',
+      maxlength: 40
     },
     nativeToken: {
       type: {
@@ -589,6 +622,23 @@ const userSchema = new mongoose.Schema({
       type: Date,
       default: Date.now
     }
+  }],
+  notificationClients: [{
+    clientId: { type: String, required: true, maxlength: 200 },
+    platform: {
+      type: String,
+      enum: ['ios', 'android', 'web', 'unknown'],
+      default: 'unknown'
+    },
+    appVersion: { type: String, default: '', maxlength: 40 },
+    notificationPermission: {
+      type: String,
+      enum: ['granted', 'denied', 'default', 'unsupported', 'unknown'],
+      default: 'unknown'
+    },
+    browserNotificationsSupported: { type: Boolean, default: false },
+    lastSeenAt: { type: Date, default: Date.now },
+    createdAt: { type: Date, default: Date.now }
   }],
   pinnedChats: [{
     type: mongoose.Schema.Types.ObjectId,
@@ -613,6 +663,14 @@ userSchema.index({ isActive: 1, username: 1 }); // user list + search
 userSchema.index({ isActive: 1, createdAt: -1 }); // admin: new users
 userSchema.index({ isActive: 1, lastSeen: -1 }); // admin: active users
 userSchema.index({ isActive: 1, userType: 1, createdAt: -1 }); // filtered user lists
+userSchema.index({ isActive: 1, isPremium: 1, _id: 1 });
+userSchema.index({ isActive: 1, isVerifiedHost: 1, _id: 1 });
+userSchema.index({ isActive: 1, creatorMonetizationStatus: 1, _id: 1 });
+userSchema.index({ isActive: 1, 'membership.tier': 1, _id: 1 });
+userSchema.index({ 'notificationClients.platform': 1, 'notificationClients.appVersion': 1, 'notificationClients.lastSeenAt': -1 });
+userSchema.index({ 'pushTokens.platform': 1, 'pushTokens.appVersion': 1, 'pushTokens.lastUsedAt': -1 });
+userSchema.index({ 'notificationClients.clientId': 1 }, { unique: true, sparse: true });
+userSchema.index({ 'pushTokens.token': 1 }, { unique: true, sparse: true });
 
 // Hash password before saving
 userSchema.pre('save', async function(next) {

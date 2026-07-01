@@ -7,6 +7,7 @@ import {
   progressiveLoginLimiter,
   progressiveOtpLoginLimiter,
   protect,
+  protectAllowIncomplete,
   uploadSingle
 } from "./auth.legacy-adapters";
 
@@ -94,14 +95,15 @@ router.post("/check-password-same", legacyAuthController.checkPasswordSame);
 router.post("/register", uploadSingle("avatar"), registerValidation, legacyAuthController.register);
 router.post("/login", progressiveLoginLimiter, loginValidation, legacyAuthController.login);
 router.post("/guest-token", legacyAuthController.generateGuestToken);
-router.get("/me", protect, legacyAuthController.getMe);
+router.get("/me", protectAllowIncomplete, legacyAuthController.getMe);
 router.put("/profile", protect, uploadSingle("avatar"), profileUpdateValidation, legacyAuthController.updateProfile);
 router.post("/upload-profile-picture", protect, uploadSingle("image"), legacyAuthController.uploadProfilePicture);
 router.post("/upload-banner", protect, uploadSingle("image"), legacyAuthController.uploadBanner);
 router.put("/change-password", protect, changePasswordValidation, legacyAuthController.changePassword);
 router.delete("/account", protect, deleteAccountValidation, legacyAuthController.deleteAccount);
 router.post("/logout", legacyAuthController.logout);
-router.post("/complete-google-profile", protect, legacyAuthController.completeGoogleProfile);
+router.post("/complete-profile", protectAllowIncomplete, legacyAuthController.completeProfile);
+router.post("/complete-google-profile", protectAllowIncomplete, legacyAuthController.completeGoogleProfile);
 
 router.post("/google/token", legacyAuthController.googleTokenLogin);
 router.post("/apple/mobile", legacyAuthController.appleMobileLogin);
