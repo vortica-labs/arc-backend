@@ -11,8 +11,9 @@ const {
 const {
   withRandomConnectAdmissions,
   withRandomConnectAdmission,
+  commitRandomConnectMatch,
+  ensureGenderFilterQuota,
   reserveGenderFilterSlot,
-  releaseGenderFilterSlot,
   syncAttributedUsage,
   getGenderFilterUsage
 } = require('../services/randomConnectAdmissionService');
@@ -342,7 +343,7 @@ const buildRequestErrorPayload = async (req, error, fallbackMessage) => {
     success: false,
     code: error?.code || 'RANDOM_CONNECT_REQUEST_FAILED',
     message: error?.message || fallbackMessage,
-    retryable: error?.status === 409,
+    retryable: error?.retryable === true || error?.status === 409,
     retryAfterMs: error?.retryAfterMs,
     ...entitlementResponse
   };
@@ -545,7 +546,7 @@ const queueAndTryMatch = async ({
       userIds: [userId, match.userId],
       operation: 'join',
       existingLeases: admissionLease ? [admissionLease] : [],
-      work: async ({ assertLeases }) => {
+      work: async ({ leases, assertLeases }) => {
         assertLease();
         assertLeases();
         const claimed = await claimWaitingPair(userId, match.userId);
@@ -579,11 +580,15 @@ const queueAndTryMatch = async ({
             tags: normalizedTags,
             genderFilterUserIds,
             matchedTags: match.commonTags || [],
-            matchQuality: match.matchQuality || 'unknown'
+            matchQuality: match.matchQuality || 'unknown',
+            admissionLeases: leases
           });
           return { connection };
         } catch (error) {
-          await recoverClaimedPair(userId, match.userId, error?.userId);
+          if (!error?.commitOutcomeUnknown) {
+            await recoverClaimedPair(userId, match.userId, error?.userId);
+          }
+          if (error?.commitOutcomeUnknown) throw error;
           if (error?.status && String(error.userId || '') === String(userId)) {
             throw createHttpError(error.status, {
               success: false,
@@ -868,7 +873,16 @@ const cleanupCommittedPairQueue = async (connection, userIds) => {
   return connection;
 };
 
-const createConnectionForPair = async ({ user1, user2, selectedGame, tags, genderFilterUserIds = [], matchedTags = [], matchQuality = 'unknown' }) => {
+const createConnectionForPair = async ({
+  user1,
+  user2,
+  selectedGame,
+  tags,
+  genderFilterUserIds = [],
+  matchedTags = [],
+  matchQuality = 'unknown',
+  admissionLeases = []
+}) => {
   const user1Id = user1.userId || user1._id;
   const user2Id = user2.userId || user2._id;
   const [dbUser1, dbUser2, entitlement1, entitlement2] = await Promise.all([
@@ -888,59 +902,82 @@ const createConnectionForPair = async ({ user1, user2, selectedGame, tags, gende
     [String(user1Id), entitlement1],
     [String(user2Id), entitlement2]
   ]);
-  const reservations = [];
-  let connection;
-  try {
-    for (const [participantId, participantEntitlement] of entitlementsByUserId) {
-      if (!participantEntitlement?.entitlements?.randomConnect?.enabled) {
-        const error = new Error('Random Connect is no longer available for this account');
-        error.status = 403;
-        error.code = 'RANDOM_CONNECT_NOT_ALLOWED';
-        error.userId = participantId;
-        throw error;
-      }
+  for (const [participantId, participantEntitlement] of entitlementsByUserId) {
+    if (!participantEntitlement?.entitlements?.randomConnect?.enabled) {
+      const error = new Error('Random Connect is no longer available for this account');
+      error.status = 403;
+      error.code = 'RANDOM_CONNECT_NOT_ALLOWED';
+      error.userId = participantId;
+      throw error;
     }
-    for (const filteredUserId of genderFilterUserIds) {
-      const filteredEntitlement = entitlementsByUserId.get(String(filteredUserId));
-      const genderCapability = filteredEntitlement?.entitlements?.randomConnect?.genderFilter;
-      if (!genderCapability?.enabled) {
-        const error = new Error('Gender filtering is no longer available for this account');
-        error.status = 403;
-        error.code = 'RANDOM_CONNECT_GENDER_FILTER_NOT_ALLOWED';
-        error.userId = String(filteredUserId);
-        throw error;
-      }
-      if (!genderCapability.unlimited) {
-        await syncAttributedUsage({ userId: filteredUserId });
-        const reservation = await reserveGenderFilterSlot({
-          userId: filteredUserId,
-          reservationKey: roomId
-        });
-        if (reservation.reserved) reservations.push({ userId: filteredUserId, reservationKey: roomId });
-      }
-    }
-
-    connection = await RandomConnection.create({
-      roomId,
-      participants: [
-        buildParticipant(user1, dbUser1, user1.videoEnabled, entitlement1),
-        buildParticipant(user2, dbUser2, user2.videoEnabled, entitlement2)
-      ],
-      selectedGame: selectedGame || null,
-      tags: tags || [],
-      matchedTags,
-      matchQuality,
-      status: 'active',
-      createdBy: dbUser1._id,
-      usedGenderFilter: genderFilterUserIds.length > 0,
-      genderFilterUserIds,
-      durationLimitSeconds: policy.durationLimitSeconds,
-      endReason: null
-    });
-  } catch (error) {
-    await Promise.all(reservations.map((reservation) => releaseGenderFilterSlot(reservation)));
-    throw error;
   }
+
+  // Reconcile historical, already-durable connections before entering the
+  // new atomic commit. Only this match's reservation belongs in the transaction.
+  for (const filteredUserId of genderFilterUserIds) {
+    const filteredEntitlement = entitlementsByUserId.get(String(filteredUserId));
+    const genderCapability = filteredEntitlement?.entitlements?.randomConnect?.genderFilter;
+    if (!genderCapability?.enabled) {
+      const error = new Error('Gender filtering is no longer available for this account');
+      error.status = 403;
+      error.code = 'RANDOM_CONNECT_GENDER_FILTER_NOT_ALLOWED';
+      error.userId = String(filteredUserId);
+      throw error;
+    }
+    if (!genderCapability.unlimited) {
+      await syncAttributedUsage({ userId: filteredUserId });
+      await ensureGenderFilterQuota({ userId: filteredUserId });
+    }
+  }
+
+  const connectionDocument = {
+    roomId,
+    participants: [
+      buildParticipant(user1, dbUser1, user1.videoEnabled, entitlement1),
+      buildParticipant(user2, dbUser2, user2.videoEnabled, entitlement2)
+    ],
+    selectedGame: selectedGame || null,
+    tags: tags || [],
+    matchedTags,
+    matchQuality,
+    status: 'active',
+    createdBy: dbUser1._id,
+    usedGenderFilter: genderFilterUserIds.length > 0,
+    genderFilterUserIds,
+    durationLimitSeconds: policy.durationLimitSeconds,
+    endReason: null
+  };
+
+  const connection = await commitRandomConnectMatch({
+    leases: admissionLeases,
+    userIds: [user1Id, user2Id],
+    reserveQuota: async (session) => {
+      // Each callback retry receives the same roomId. $addToSet plus the
+      // transaction rollback makes reservations both atomic and idempotent.
+      for (const filteredUserId of genderFilterUserIds) {
+        const filteredEntitlement = entitlementsByUserId.get(String(filteredUserId));
+        const genderCapability = filteredEntitlement?.entitlements?.randomConnect?.genderFilter;
+        if (!genderCapability.unlimited) {
+          await reserveGenderFilterSlot({
+            userId: filteredUserId,
+            reservationKey: roomId,
+            session
+          });
+        }
+      }
+    },
+    persistConnection: (session) => RandomConnection.findOneAndUpdate(
+      { roomId },
+      { $setOnInsert: connectionDocument },
+      {
+        upsert: true,
+        new: true,
+        setDefaultsOnInsert: true,
+        session
+      }
+    ),
+    findCommittedConnection: () => RandomConnection.findOne({ roomId })
+  });
 
   return cleanupCommittedPairQueue(connection, [dbUser1._id, dbUser2._id]);
 };
@@ -993,7 +1030,7 @@ const matchUsersFromQueue = async (io) => {
           await withRandomConnectAdmissions({
             userIds: [user1.userId, match.userId],
             operation: 'join',
-            work: async ({ assertLeases }) => {
+            work: async ({ leases, assertLeases }) => {
               assertLeases();
               const claimed = await claimWaitingPair(user1.userId, match.userId);
               if (!claimed) return;
@@ -1009,10 +1046,13 @@ const matchUsersFromQueue = async (io) => {
                   tags: user1.tags || [],
                   genderFilterUserIds,
                   matchedTags: match.commonTags || [],
-                  matchQuality: match.matchQuality || 'unknown'
+                  matchQuality: match.matchQuality || 'unknown',
+                  admissionLeases: leases
                 });
               } catch (error) {
-                await recoverClaimedPair(user1.userId, match.userId, error?.userId);
+                if (!error?.commitOutcomeUnknown) {
+                  await recoverClaimedPair(user1.userId, match.userId, error?.userId);
+                }
                 if (error?.status) return;
                 throw error;
               }
@@ -1582,14 +1622,25 @@ const cleanupCurrentConnection = async (req, res) => runAdmissionProtectedContro
   fallbackMessage: 'Failed to cleanup connection'
 });
 
-// List active sessions for monitoring (each session has unique sessionId = roomId)
+// Return only sessions owned by the authenticated participant. This route is
+// player-authorized, so exposing the global active-session roster would leak
+// other players' display names, tags, Premium state, and activity timestamps.
 const getActiveSessions = async (req, res) => {
+  setEntitlementNoStore(res);
   try {
-    const sessions = await RandomConnection.find({ status: 'active' })
-      .select('roomId startTime connectedAt expiresAt durationLimitSeconds participants.username participants.displayName participants.isPremium tags matchQuality matchedTags')
+    const requesterId = String(req.user._id);
+    const sessions = await RandomConnection.find({
+      status: 'active',
+      'participants.userId': req.user._id
+    })
+      .select('roomId startTime connectedAt expiresAt durationLimitSeconds participants.userId participants.username participants.displayName tags matchQuality matchedTags')
       .lean();
 
-    const list = sessions.map(s => ({
+    // Defense in depth for mocks, unusual projections, and future query edits.
+    const ownedSessions = sessions.filter((session) => (
+      (session.participants || []).some((participant) => getUserIdString(participant.userId) === requesterId)
+    ));
+    const list = ownedSessions.map(s => ({
       sessionId: s.roomId,
       roomId: s.roomId,
       usernames: (s.participants || []).map(p => p.username || p.displayName || '?').filter(Boolean),

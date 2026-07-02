@@ -133,8 +133,14 @@ async function run() {
     // In-memory implementation of the atomic unique daily counter. Six
     // concurrent distinct reservations may commit at most five slots.
     let quota = null;
-    RandomConnectGenderQuota.findOne = () => queryReturning(quota ? { ...quota, reservationKeys: [...quota.reservationKeys] } : null);
+    const quotaQuerySessions = [];
+    const quotaMutationSessions = [];
+    RandomConnectGenderQuota.findOne = (_filter, _projection, options) => {
+      quotaQuerySessions.push(options?.session);
+      return queryReturning(quota ? { ...quota, reservationKeys: [...quota.reservationKeys] } : null);
+    };
     RandomConnectGenderQuota.findOneAndUpdate = async (filter, update, options = {}) => {
+      quotaMutationSessions.push(options.session);
       await Promise.resolve();
       const key = update.$addToSet.reservationKeys;
       const canUpdate = quota && quota.slotCount < filter.slotCount.$lt && !quota.reservationKeys.includes(key);
@@ -167,6 +173,188 @@ async function run() {
       return { modifiedCount: 1 };
     };
 
+    const userA = '507f1f77bcf86cd799439011';
+    const userB = '507f1f77bcf86cd799439012';
+    const leases = [
+      { userId: userA, leaseToken: 'lease-a', operation: 'join' },
+      { userId: userB, leaseToken: 'lease-b', operation: 'join' }
+    ];
+
+    // A heartbeat that has not noticed a stolen lease is insufficient. The
+    // database fence runs inside the transaction and must prevent the insert.
+    const lostFenceSession = {
+      async withTransaction(work) { return work(); },
+      async endSession() { this.ended = true; }
+    };
+    RandomConnectAdmission.findOneAndUpdate = async (filter, _update, options) => {
+      assert.strictEqual(options.session, lostFenceSession);
+      return String(filter.user) === userA ? { leaseToken: 'lease-a' } : null;
+    };
+    let stalePersistCalls = 0;
+    await assert.rejects(
+      service.commitRandomConnectMatch({
+        leases,
+        userIds: [userA, userB],
+        reserveQuota: async (session) => assert.strictEqual(session, lostFenceSession),
+        persistConnection: async () => {
+          stalePersistCalls += 1;
+          return { roomId: 'must-not-commit' };
+        },
+        startSession: async () => lostFenceSession
+      }),
+      (error) => error?.code === 'RANDOM_CONNECT_ADMISSION_LOST' && error?.lostUserIds?.includes(userB)
+    );
+    assert.equal(stalePersistCalls, 0, 'lost DB lease must fence the durable connection write');
+    assert.equal(lostFenceSession.ended, true);
+
+    // Exercise a transient transaction callback retry. The transaction's
+    // rollback is modelled by restoring the quota snapshot before retrying.
+    quota = null;
+    const retrySession = {
+      async withTransaction(work, options) {
+        assert.deepStrictEqual(options.writeConcern, { w: 'majority' });
+        try {
+          await work();
+        } catch (error) {
+          if (!error.transient) throw error;
+          quota = null;
+          return work();
+        }
+      },
+      async endSession() { this.ended = true; }
+    };
+    RandomConnectAdmission.findOneAndUpdate = async (filter, _update, options) => {
+      assert.strictEqual(options.session, retrySession);
+      const lease = leases.find((candidate) => String(candidate.userId) === String(filter.user));
+      return lease ? { leaseToken: lease.leaseToken } : null;
+    };
+    const deterministicRoomId = 'room-stable-across-transaction-retry';
+    let persistAttempts = 0;
+    const retriedConnection = await service.commitRandomConnectMatch({
+      leases,
+      userIds: [userA, userB],
+      reserveQuota: (session) => service.reserveGenderFilterSlot({
+        userId: userA,
+        reservationKey: deterministicRoomId,
+        now: new Date('2026-07-02T12:00:00.000Z'),
+        session
+      }),
+      persistConnection: async (session) => {
+        assert.strictEqual(session, retrySession);
+        persistAttempts += 1;
+        if (persistAttempts === 1) {
+          const error = new Error('simulated transient transaction error');
+          error.transient = true;
+          throw error;
+        }
+        return { roomId: deterministicRoomId };
+      },
+      startSession: async () => retrySession
+    });
+    assert.equal(retriedConnection.roomId, deterministicRoomId);
+    assert.equal(persistAttempts, 2);
+    assert.equal(quota.slotCount, 1, 'aborted transaction attempt must not leave phantom quota');
+    assert.deepStrictEqual(quota.reservationKeys, [deterministicRoomId]);
+    assert(quotaQuerySessions.includes(retrySession));
+    assert(quotaMutationSessions.includes(retrySession));
+    assert.equal(retrySession.ended, true);
+
+    // If the driver ultimately reports an ambiguous commit but the stable
+    // room is visible, reconcile to success; quota and connection committed as
+    // one unit and must never be compensated independently.
+    quota = null;
+    const committedAfterAmbiguity = { roomId: 'room-ambiguous-but-committed' };
+    const ambiguousSession = {
+      async withTransaction(work) {
+        await work();
+        const error = new Error('unknown commit result');
+        error.hasErrorLabel = (label) => label === 'UnknownTransactionCommitResult';
+        throw error;
+      },
+      async endSession() { this.ended = true; }
+    };
+    RandomConnectAdmission.findOneAndUpdate = async (filter) => {
+      const lease = leases.find((candidate) => String(candidate.userId) === String(filter.user));
+      return lease ? { leaseToken: lease.leaseToken } : null;
+    };
+    const reconciled = await service.commitRandomConnectMatch({
+      leases,
+      userIds: [userA, userB],
+      reserveQuota: (session) => service.reserveGenderFilterSlot({
+        userId: userA,
+        reservationKey: committedAfterAmbiguity.roomId,
+        now: new Date('2026-07-02T12:00:00.000Z'),
+        session
+      }),
+      persistConnection: async (session) => {
+        assert.strictEqual(session, ambiguousSession);
+        return committedAfterAmbiguity;
+      },
+      findCommittedConnection: async () => committedAfterAmbiguity,
+      startSession: async () => ambiguousSession
+    });
+    assert.strictEqual(reconciled, committedAfterAmbiguity);
+    assert.equal(quota.slotCount, 1);
+    assert.equal(ambiguousSession.ended, true);
+
+    const unresolvedSession = {
+      async withTransaction(work) {
+        await work();
+        const error = new Error('unknown commit result without readable reconciliation');
+        error.hasErrorLabel = (label) => label === 'UnknownTransactionCommitResult';
+        throw error;
+      },
+      async endSession() {}
+    };
+    await assert.rejects(
+      service.commitRandomConnectMatch({
+        leases,
+        userIds: [userA, userB],
+        reserveQuota: async () => {},
+        persistConnection: async () => ({ roomId: 'room-outcome-unresolved' }),
+        findCommittedConnection: async () => null,
+        startSession: async () => unresolvedSession
+      }),
+      (error) => (
+        error?.code === 'RANDOM_CONNECT_COMMIT_OUTCOME_UNKNOWN' &&
+        error?.commitOutcomeUnknown === true &&
+        error?.retryable === true
+      )
+    );
+
+    // A crash before the connection write completes aborts the unit of work.
+    // The fake session restores the quota snapshot to model Mongo rollback.
+    quota = null;
+    const crashSession = {
+      async withTransaction(work) {
+        try {
+          return await work();
+        } catch (error) {
+          quota = null;
+          throw error;
+        }
+      },
+      async endSession() {}
+    };
+    await assert.rejects(
+      service.commitRandomConnectMatch({
+        leases,
+        userIds: [userA, userB],
+        reserveQuota: (session) => service.reserveGenderFilterSlot({
+          userId: userA,
+          reservationKey: 'room-crash-before-insert',
+          now: new Date('2026-07-02T12:00:00.000Z'),
+          session
+        }),
+        persistConnection: async () => { throw new Error('simulated process failure before insert'); },
+        findCommittedConnection: async () => null,
+        startSession: async () => crashSession
+      }),
+      /simulated process failure/
+    );
+    assert.equal(quota, null, 'aborted connection write must not consume quota');
+
+    quota = null;
     const attempts = await Promise.allSettled(
       Array.from({ length: 6 }, (_, index) => service.reserveGenderFilterSlot({
         userId: '507f1f77bcf86cd799439011',
@@ -212,6 +400,47 @@ async function run() {
     assert.equal(quota.slotCount, 2);
     assert.deepStrictEqual(quota.reservationKeys.sort(), ['legacy:legacy-a', 'legacy:legacy-b']);
 
+    // Player-facing active session discovery must never return the global
+    // roster. The query and a defense-in-depth response filter both bind it to
+    // the authenticated participant.
+    let activeSessionsFilter;
+    RandomConnection.find = (filter) => {
+      activeSessionsFilter = filter;
+      return queryReturning([
+        {
+          roomId: 'owned-room',
+          status: 'active',
+          participants: [
+            { userId: userA, username: 'requester' },
+            { userId: userB, username: 'partner' }
+          ]
+        },
+        {
+          roomId: 'global-room-must-not-leak',
+          status: 'active',
+          participants: [
+            { userId: '507f1f77bcf86cd799439013', username: 'private-a' },
+            { userId: '507f1f77bcf86cd799439014', username: 'private-b' }
+          ]
+        }
+      ]);
+    };
+    let activeSessionsPayload;
+    const activeSessionsResponse = {
+      set() { return this; },
+      status(status) { this.statusCode = status; return this; },
+      json(payload) { activeSessionsPayload = payload; return payload; }
+    };
+    await randomConnectController.getActiveSessions(
+      { user: { _id: userA } },
+      activeSessionsResponse
+    );
+    assert.equal(activeSessionsResponse.statusCode, 200);
+    assert.equal(String(activeSessionsFilter['participants.userId']), userA);
+    assert.equal(activeSessionsPayload.count, 1);
+    assert.equal(activeSessionsPayload.sessions[0].roomId, 'owned-room');
+    assert(!JSON.stringify(activeSessionsPayload).includes('global-room-must-not-leak'));
+
     const admissionIndexes = RandomConnectAdmission.schema.indexes();
     assert(admissionIndexes.some(([fields, options]) => fields.user === 1 && options.unique === true));
     const quotaIndexes = RandomConnectGenderQuota.schema.indexes();
@@ -228,6 +457,10 @@ async function run() {
     assert(controller.includes('withRandomConnectAdmissions'));
     assert(controller.includes('existingLeases: admissionLease ? [admissionLease] : []'));
     assert(controller.includes('cleanupCommittedPairQueue(connection'));
+    assert(controller.includes('commitRandomConnectMatch'));
+    assert(controller.includes('admissionLeases: leases'));
+    assert(controller.includes('$setOnInsert: connectionDocument'));
+    assert(controller.includes('if (!error?.commitOutcomeUnknown)'));
     assert(controller.includes('reserveGenderFilterSlot'));
     assert(controller.includes('resolveRandomConnectEntitlement({ userId: user1Id'));
 
@@ -246,6 +479,14 @@ async function run() {
     );
     assert(releasePreflight.includes("run('migrate-random-connect-indexes.js')"));
     assert(releasePreflight.includes("run('migrate-random-connect-indexes.js', ['--verify'])"));
+    const indexMigration = fs.readFileSync(
+      path.resolve(__dirname, '..', '..', '..', 'scripts', 'migrate-random-connect-indexes.js'),
+      'utf8'
+    );
+    assert(indexMigration.includes('expireAfterSeconds'));
+    assert(indexMigration.includes('partialFilterExpression'));
+    assert(indexMigration.includes('verifyTransactionSupport'));
+    assert(indexMigration.includes('verified MongoDB transaction support for Random Connect'));
   } finally {
     RandomConnectAdmission.findOneAndUpdate = originals.admissionFindOneAndUpdate;
     RandomConnectAdmission.updateOne = originals.admissionUpdateOne;

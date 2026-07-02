@@ -61,6 +61,26 @@ const verifyModelIndexes = async (Model) => {
   console.log(`verified ${Model.modelName}: ${expected.length} declared indexes`);
 };
 
+const verifyTransactionSupport = async (AdmissionModel) => {
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      // Force a real database command; an empty transaction would not prove
+      // that the deployment topology supports the atomic match commit.
+      await AdmissionModel.findOne({}, { _id: 1 }, { session }).lean();
+    }, {
+      readPreference: 'primary',
+      readConcern: { level: 'snapshot' },
+      writeConcern: { w: 'majority' }
+    });
+    console.log('verified MongoDB transaction support for Random Connect');
+  } catch (error) {
+    throw new Error(`Random Connect requires MongoDB transaction support: ${String(error?.message || error)}`);
+  } finally {
+    await session.endSession().catch(() => {});
+  }
+};
+
 const main = async () => {
   await mongoose.connect(uri, {
     autoIndex: false,
@@ -83,6 +103,11 @@ const main = async () => {
     }
   }
   for (const Model of models) await verifyModelIndexes(Model);
+  if (process.argv.includes('--verify')) {
+    const AdmissionModel = models.find((Model) => Model.modelName === 'RandomConnectAdmission');
+    if (!AdmissionModel) throw new Error('RandomConnectAdmission model was not loaded');
+    await verifyTransactionSupport(AdmissionModel);
+  }
   await mongoose.disconnect();
 };
 
