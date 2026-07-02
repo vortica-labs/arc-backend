@@ -70,6 +70,7 @@ assert(notificationEmitter.includes('deletedAt: new Date()'), 'push-only deliver
 assert(!notificationEmitter.includes('getRecipientDeliveryContext(notificationData).catch'), 'preference lookup must never fail open');
 
 const { normalizeNotificationPayload, resolveNotificationChannels } = require('./notificationEmitter');
+const { buildMessageNotificationBody } = require('./notificationService');
 assert.deepEqual(normalizeNotificationPayload({
   type: 'recruitment',
   data: { recruitmentId: 'recruitment-1', applicationId: 'application-1', deepLink: '/recruitment/1' }
@@ -87,6 +88,10 @@ assert.deepEqual(resolveNotificationChannels({ type: 'message' }, {
   inApp: false,
   push: false
 });
+assert.equal(buildMessageNotificationBody('PlayerOne', 'text'), 'You received a new message from PlayerOne');
+assert.equal(buildMessageNotificationBody('PlayerOne', 'media', 'audio'), 'You received a voice message from PlayerOne');
+assert.equal(buildMessageNotificationBody('PlayerOne', 'media', 'image'), 'You received an image from PlayerOne');
+assert.equal(buildMessageNotificationBody('PlayerOne', 'media', 'video'), 'You received a video from PlayerOne');
 
 assert(recruitmentController.includes("type: 'recruitment'"), 'recruitment decisions must honor recruitment preferences');
 for (const eventType of [

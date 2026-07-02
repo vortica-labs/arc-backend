@@ -17,20 +17,30 @@ IMAGE="$REPO:$TAG"
 
 echo "==> Tag: $TAG"
 
-# 1. ECR login
+# 1. Fail before publishing an image if channel policy or notification
+# producers regress. The artifact check runs after compilation and compares
+# canonical source with the generated worker tree used by the image.
+echo "==> Running notification and email policy release gates..."
+npm run test:notification-policy
+npm run test:notification-producers
+npm run typecheck
+npm run build
+npm run verify:email-policy-release
+
+# 2. ECR login
 echo "==> ECR login..."
 aws ecr get-login-password --region "$REGION" | \
   docker login --username AWS --password-stdin "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
 
-# 2. Build
+# 3. Build
 echo "==> Building image..."
 docker build --platform linux/amd64 -t "$IMAGE" .
 
-# 3. Push
+# 4. Push
 echo "==> Pushing to ECR..."
 docker push "$IMAGE"
 
-# 4. Fetch latest task definition, swap image, strip read-only fields
+# 5. Fetch latest task definition, swap image, strip read-only fields
 echo "==> Registering new task definition..."
 aws ecs describe-task-definition --task-definition "$TASK_FAMILY" \
   --query 'taskDefinition' --output json | \
@@ -51,7 +61,8 @@ NEW_REV=$(aws ecs register-task-definition \
   --query 'taskDefinition.revision' --output text)
 echo "==> Task definition: $TASK_FAMILY:$NEW_REV"
 
-# 5. Run provider credential verification and additive push migrations inside
+# 6. Run provider credential verification, email-policy artifact verification,
+# and additive push migrations inside
 # the new image, with the same secrets/network as the service. A failed
 # preflight prevents the broken revision from receiving production traffic.
 echo "==> Running push provider and database preflight..."
@@ -85,7 +96,7 @@ if [[ "$PREFLIGHT_EXIT" != "0" ]]; then
   exit 1
 fi
 
-# 6. Deploy
+# 7. Deploy
 echo "==> Updating ECS service..."
 aws ecs update-service \
   --cluster "$CLUSTER" \
@@ -95,9 +106,50 @@ aws ecs update-service \
   --output table \
   --query 'service.{taskDef:taskDefinition,running:runningCount,pending:pendingCount}'
 
-# 7. Wait
+# 8. Wait
 echo "==> Waiting for stable deployment (~2 min)..."
 aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+
+# 9. A healthy rolling deployment is not sufficient for an email-policy
+# release: every queue consumer must be on the new revision and image digest.
+echo "==> Verifying running ECS tasks use the new policy revision..."
+RUNNING_TASKS=$(aws ecs list-tasks \
+  --cluster "$CLUSTER" \
+  --service-name "$SERVICE" \
+  --desired-status RUNNING \
+  --query 'taskArns' --output text)
+if [[ -z "$RUNNING_TASKS" || "$RUNNING_TASKS" == "None" ]]; then
+  echo "No running ECS service tasks were found after deployment" >&2
+  exit 1
+fi
+EXPECTED_TASK_DEF=$(aws ecs describe-task-definition \
+  --task-definition "$TASK_FAMILY:$NEW_REV" \
+  --query 'taskDefinition.taskDefinitionArn' --output text)
+EXPECTED_DIGEST=$(aws ecr describe-images \
+  --repository-name arc-backend \
+  --image-ids imageTag="$TAG" \
+  --query 'imageDetails[0].imageDigest' --output text)
+RUNNING_TASK_DEFS=$(aws ecs describe-tasks \
+  --cluster "$CLUSTER" \
+  --tasks $RUNNING_TASKS \
+  --query 'tasks[].taskDefinitionArn' --output text)
+RUNNING_DIGESTS=$(aws ecs describe-tasks \
+  --cluster "$CLUSTER" \
+  --tasks $RUNNING_TASKS \
+  --query 'tasks[].containers[0].imageDigest' --output text)
+for task_def in $RUNNING_TASK_DEFS; do
+  if [[ "$task_def" != "$EXPECTED_TASK_DEF" ]]; then
+    echo "Old ECS task revision is still consuming queues: $task_def" >&2
+    exit 1
+  fi
+done
+for digest in $RUNNING_DIGESTS; do
+  if [[ "$digest" != "$EXPECTED_DIGEST" ]]; then
+    echo "Unexpected ECS image digest is still running: $digest" >&2
+    exit 1
+  fi
+done
+echo "==> Verified task revision $TASK_FAMILY:$NEW_REV and digest $EXPECTED_DIGEST"
 
 echo ""
 rm -f ./arc-task-def.json

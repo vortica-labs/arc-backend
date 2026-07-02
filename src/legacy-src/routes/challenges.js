@@ -12,7 +12,7 @@ const {
   deleteChallenge,
   distributeRewards
 } = require('../controllers/challengeController');
-const { protect: auth } = require('../middleware/auth');
+const { protect: auth, publicOptionalAuth } = require('../middleware/auth');
 const { body } = require('express-validator');
 
 // Validation middleware
@@ -132,15 +132,15 @@ const validateProgressUpdate = [
 ];
 
 // Public routes
-router.get('/', getChallenges);
-router.get('/:id', getChallenge);
+router.get('/', publicOptionalAuth, getChallenges);
+router.get('/my/challenges', auth, getMyChallenges);
+router.get('/my/participations', auth, getMyParticipations);
+router.get('/:id', publicOptionalAuth, getChallenge);
 
 // Protected routes
 router.post('/', auth, ...validateChallenge, createChallenge);
 router.post('/:id/join', auth, joinChallenge);
 router.put('/:id/progress', auth, ...validateProgressUpdate, updateProgress);
-router.get('/my/challenges', auth, getMyChallenges);
-router.get('/my/participations', auth, getMyParticipations);
 router.put('/:id', auth, updateChallenge);
 router.delete('/:id', auth, deleteChallenge);
 router.post('/:id/distribute-rewards', auth, distributeRewards);

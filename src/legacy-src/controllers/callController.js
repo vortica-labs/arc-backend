@@ -17,7 +17,7 @@
 
 const { generateToken04 } = require('../utils/zegoTokenGenerator');
 const User = require('../models/User');
-const { Message } = require('../models/Message');
+const { Message, ChatRoom } = require('../models/Message');
 const { createAndEmitNotification } = require('../utils/notificationEmitter');
 const {
   createCallSession,
@@ -26,6 +26,8 @@ const {
   serializeCallSession
 } = require('../services/callSessionService');
 const log = require('../utils/logger');
+const { resolvePrivacyAccess } = require('../utils/privacyPolicy');
+const { assertCallSessionPrivacy } = require('../utils/callPrivacy');
 
 // ── Config ──
 const ZEGO_APP_ID = parseInt(process.env.ZEGOCLOUD_APP_ID || '0', 10);
@@ -56,6 +58,7 @@ const generateCallToken = async (req, res) => {
     }
 
     const callSession = await getCallSessionForParticipant(roomId, userId);
+    await assertCallSessionPrivacy(callSession);
     if (!['ringing', 'accepted'].includes(callSession.status)) {
       const error = new Error(`Call is already ${callSession.status}`);
       error.statusCode = 409;
@@ -153,7 +156,7 @@ const initiateCall = async (req, res) => {
 
     // Check if target user exists and is active
     const targetUser = await User.findById(targetUserId)
-      .select('isActive username profile.displayName profile.avatar blockedUsers')
+      .select('isActive username userType profile privacySettings blockedUsers')
       .lean();
 
     if (!targetUser || !targetUser.isActive) {
@@ -165,13 +168,35 @@ const initiateCall = async (req, res) => {
 
     // Get caller info for the offer payload
     const callerUser = await User.findById(callerId)
-      .select('username profile.displayName profile.avatar blockedUsers')
+      .select('username userType profile privacySettings blockedUsers')
       .lean();
 
     const callerBlockedTarget = (callerUser?.blockedUsers || []).some((id) => String(id) === String(targetUserId));
     const targetBlockedCaller = (targetUser.blockedUsers || []).some((id) => String(id) === callerId);
     if (callerBlockedTarget || targetBlockedCaller) {
       return res.status(403).json({ success: false, message: 'Call is not permitted' });
+    }
+
+    const existingConversation = Boolean(await Message.exists({
+      messageType: 'direct',
+      isDeleted: false,
+      $or: [
+        { sender: targetUserId, recipient: callerId },
+        { sender: callerId, recipient: targetUserId }
+      ]
+    }));
+    const targetAccess = await resolvePrivacyAccess({
+      viewer: callerUser,
+      targetUser,
+      existingConversation
+    });
+    if (!targetAccess.access.canMessage) {
+      return res.status(403).json({
+        success: false,
+        code: 'CALL_PRIVACY_RESTRICTED',
+        reason: targetAccess.settings.allowMessageFrom === 'followers' ? 'not_follower' : 'messages_disabled',
+        message: 'This user is not accepting calls from you'
+      });
     }
 
     // Generate unique room ID for this call
@@ -212,6 +237,17 @@ const initiateCall = async (req, res) => {
       },
       expiresAt: new Date(Date.now() + 30_000)
     });
+    try {
+      await assertCallSessionPrivacy(callSession);
+    } catch (privacyError) {
+      await transitionCallSession({
+        callId: roomId,
+        actorId: callerId,
+        action: 'end',
+        reason: 'privacy_changed'
+      }).catch(() => undefined);
+      throw privacyError;
+    }
 
     // Emit to target user's socket room
     const callData = {
@@ -345,6 +381,7 @@ const acceptCall = async (req, res) => {
       error.statusCode = 403;
       throw error;
     }
+    await assertCallSessionPrivacy(durableSession);
     if (durableSession.status === 'ringing') {
       durableSession = await transitionCallSession({ callId: roomId, actorId: calleeId, action: 'accept' });
     } else if (durableSession.status !== 'accepted') {
@@ -611,24 +648,17 @@ const generateGroupCallToken = async (req, res) => {
     }
 
     // Verify user is a member of the chat room
-    const ChatRoom = require('../models/ChatRoom');
-    const chatRoom = await ChatRoom.findById(chatRoomId).lean();
+    const chatRoom = await ChatRoom.findOne({
+      _id: chatRoomId,
+      isActive: true,
+      'members.user': userId
+    }).select('_id').lean();
 
-    if (!chatRoom || !chatRoom.isActive) {
-      return res.status(404).json({
-        success: false,
-        message: 'Chat room not found'
-      });
-    }
-
-    const isMember = chatRoom.members.some(
-      m => m.user.toString() === userId
-    );
-
-    if (!isMember) {
+    if (!chatRoom) {
       return res.status(403).json({
         success: false,
-        message: 'You are not a member of this chat room'
+        code: 'GROUP_CALL_ACCESS_DENIED',
+        message: 'Chat room not found or access denied'
       });
     }
 

@@ -486,6 +486,5 @@ tournamentSchema.pre('save', function(next) {
 tournamentSchema.index({ status: 1, startDate: 1 });
 tournamentSchema.index({ host: 1 });
 tournamentSchema.index({ game: 1, format: 1 });
-tournamentSchema.index({ tournamentCode: 1 });
 
 module.exports = mongoose.model('Tournament', tournamentSchema);

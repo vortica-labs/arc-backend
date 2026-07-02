@@ -29,6 +29,7 @@ let existingNotification = null;
 let inAppCreates = 0;
 let pushes = 0;
 let emails = 0;
+let lastEmailContext = null;
 let outboxClaims = 0;
 let outboxCompletions = 0;
 const createdPayloads = [];
@@ -66,29 +67,94 @@ pushService.sendPushNotification = async () => {
   pushes += 1;
   return { sent: 1, accepted: 1, failed: 0 };
 };
-jobQueue.enqueueEmail = async () => {
+jobQueue.enqueueEmail = async (_to, _subject, _text, _link, context) => {
   emails += 1;
+  lastEmailContext = context;
   return { queued: true };
 };
 
 const recipient = '507f1f77bcf86cd799439011';
 
 const run = async () => {
-  settings = { inAppEnabled: true, pushEnabled: true, likes: true, comments: true, follows: true };
-  for (const type of ['like', 'comment', 'follow']) {
+  settings = {
+    inAppEnabled: true,
+    pushEnabled: true,
+    likes: true,
+    comments: true,
+    follows: true,
+    messages: true,
+    tournamentUpdates: true,
+    recruitmentApps: true,
+    systemAlerts: true
+  };
+  const routineCases = [
+    ['like', 'post_like'],
+    ['like', 'clip_like'],
+    ['like', 'story_like'],
+    ['comment', 'post_comment'],
+    ['comment', 'comment_reply'],
+    ['comment', 'mention'],
+    ['follow', 'follow_request'],
+    ['follow', 'follow_acceptance'],
+    ['system', 'post_share'],
+    ['system', 'saved_post'],
+    ['message', 'voice_message'],
+    ['message', 'image_message'],
+    ['message', 'video_message'],
+    ['message', 'group_message'],
+    ['message', 'media_message'],
+    ['story', 'story_reply'],
+    ['story', 'story_reaction'],
+    ['story', 'story_view'],
+    ['clip', 'clip_comment'],
+    ['clip', 'clip_share'],
+    ['tournament', 'tournament_update'],
+    ['tournament', 'tournament_registration'],
+    ['tournament', 'tournament_invitation'],
+    ['recruitment', 'recruitment_application'],
+    ['recruitment', 'recruitment_application_accepted'],
+    ['recruitment', 'recruitment_application_rejected'],
+    ['call', 'incoming_voice_call'],
+    ['call', 'incoming_video_call'],
+    ['call', 'missed_call'],
+    ['system', 'random_connect_match_found']
+  ];
+  for (const [type, eventType] of routineCases) {
     const result = await emitter.createAndEmitNotification({
       recipient,
       type,
       title: `Routine ${type}`,
       message: `A ${type} happened`,
-      data: {}
+      data: {},
+      // Even an incorrectly attached valid intent must not turn engagement
+      // activity into email.
+      email: { intent: EMAIL_INTENTS.PLATFORM_CRITICAL, eventType }
     });
     assert(result, `${type} should still create an in-app notification`);
   }
-  assert.equal(inAppCreates, 3, 'like/comment/follow should persist in-app notifications');
-  assert.equal(pushes, 3, 'like/comment/follow should still send push');
+  const routineCount = routineCases.length;
+  assert.equal(inAppCreates, routineCount, 'routine activity should persist in-app notifications');
+  assert.equal(pushes, routineCount, 'routine activity should still send push');
   assert.equal(emails, 0, 'routine engagement must never enqueue email by default');
   assert(createdPayloads.every((payload) => payload.sendPush === false));
+
+  for (const email of [
+    { intent: EMAIL_INTENTS.PLATFORM_CRITICAL },
+    { intent: EMAIL_INTENTS.PLATFORM_CRITICAL, eventType: 'general_activity_update' }
+  ]) {
+    await emitter.createAndEmitNotification({
+      recipient,
+      type: 'system',
+      title: 'Invalid email metadata',
+      message: 'Keep notification channels independent',
+      data: {},
+      email
+    });
+  }
+  const baselineCount = routineCount + 2;
+  assert.equal(inAppCreates, baselineCount, 'invalid email metadata must not suppress in-app delivery');
+  assert.equal(pushes, baselineCount, 'invalid email metadata must not suppress push delivery');
+  assert.equal(emails, 0, 'missing and unknown email events must fail closed at the emitter');
 
   settings = { inAppEnabled: false, pushEnabled: true, likes: true };
   const pushOnly = await emitter.createAndEmitNotification({
@@ -99,11 +165,11 @@ const run = async () => {
     data: {}
   });
   assert(pushOnly, 'push-only delivery should report a delivered notification payload');
-  assert.equal(inAppCreates, 4, 'push-only delivery must retain a hidden durable outbox row');
+  assert.equal(inAppCreates, baselineCount + 1, 'push-only delivery must retain a hidden durable outbox row');
   assert.equal(createdPayloads.at(-1).isRead, true);
   assert(createdPayloads.at(-1).archivedAt instanceof Date);
   assert(createdPayloads.at(-1).deletedAt instanceof Date);
-  assert.equal(pushes, 4, 'in-app disabled must not suppress push');
+  assert.equal(pushes, baselineCount + 1, 'in-app disabled must not suppress push');
   assert.equal(emails, 0);
 
   settings = { inAppEnabled: true, pushEnabled: false, comments: true };
@@ -114,8 +180,8 @@ const run = async () => {
     message: 'Do not push this',
     data: {}
   });
-  assert.equal(inAppCreates, 5, 'push disabled must not suppress in-app persistence');
-  assert.equal(pushes, 4);
+  assert.equal(inAppCreates, baselineCount + 2, 'push disabled must not suppress in-app persistence');
+  assert.equal(pushes, baselineCount + 1);
 
   settings = { inAppEnabled: true, pushEnabled: true, follows: false };
   const categorySuppressed = await emitter.createAndEmitNotification({
@@ -126,8 +192,8 @@ const run = async () => {
     data: {}
   });
   assert.equal(categorySuppressed, null, 'category preference must suppress both notification channels');
-  assert.equal(inAppCreates, 5);
-  assert.equal(pushes, 4);
+  assert.equal(inAppCreates, baselineCount + 2);
+  assert.equal(pushes, baselineCount + 1);
 
   isActive = false;
   const inactiveSuppressed = await emitter.createAndEmitNotification({
@@ -138,8 +204,8 @@ const run = async () => {
     data: {}
   });
   assert.equal(inactiveSuppressed, null, 'inactive recipients must not receive in-app or push delivery');
-  assert.equal(inAppCreates, 5);
-  assert.equal(pushes, 4);
+  assert.equal(inAppCreates, baselineCount + 2);
+  assert.equal(pushes, baselineCount + 1);
   isActive = true;
 
   lookupError = new Error('preference lookup unavailable');
@@ -147,8 +213,8 @@ const run = async () => {
     emitter.createAndEmitNotification({ recipient, type: 'system', title: 'Lookup failure', message: 'Fail closed', data: {} }),
     /preference lookup unavailable/
   );
-  assert.equal(inAppCreates, 5);
-  assert.equal(pushes, 4);
+  assert.equal(inAppCreates, baselineCount + 2);
+  assert.equal(pushes, baselineCount + 1);
   lookupError = null;
 
   settings = { inAppEnabled: true, pushEnabled: true, systemAlerts: true };
@@ -160,9 +226,12 @@ const run = async () => {
     data: {},
     email: { intent: EMAIL_INTENTS.PLATFORM_CRITICAL, eventType: 'service_incident' }
   });
-  assert.equal(inAppCreates, 6);
-  assert.equal(pushes, 5);
+  assert.equal(inAppCreates, baselineCount + 3);
+  assert.equal(pushes, baselineCount + 2);
   assert.equal(emails, 1, 'explicit non-engagement transactional intent may enqueue email');
+  assert.equal(lastEmailContext.intent, EMAIL_INTENTS.PLATFORM_CRITICAL);
+  assert.equal(lastEmailContext.eventType, 'service_incident');
+  assert.equal(lastEmailContext.notificationType, 'system');
 
   existingNotification = {
     _id: 'notification-existing',
@@ -179,10 +248,10 @@ const run = async () => {
     message: 'Recover delivery',
     data: { customData: { notificationDedupeKey: 'stable-event', pushRequestId: 'stable-event' } }
   });
-  assert.equal(inAppCreates, 6, 'dedupe retries must reuse the existing inbox row');
-  assert.equal(pushes, 6, 'dedupe retries must revisit the stable durable push request');
-  assert.equal(outboxClaims, 6, 'every push must own a durable outbox lease before provider submission');
-  assert.equal(outboxCompletions, 6, 'successful submissions must complete their outbox lease');
+  assert.equal(inAppCreates, baselineCount + 3, 'dedupe retries must reuse the existing inbox row');
+  assert.equal(pushes, baselineCount + 3, 'dedupe retries must revisit the stable durable push request');
+  assert.equal(outboxClaims, baselineCount + 3, 'every push must own a durable outbox lease before provider submission');
+  assert.equal(outboxCompletions, baselineCount + 3, 'successful submissions must complete their outbox lease');
   existingNotification = null;
 
   const channels = emitter.resolveNotificationChannels(

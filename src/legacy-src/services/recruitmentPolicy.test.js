@@ -9,6 +9,15 @@ const {
   serializePlayerProfile,
   isRecruitmentLive,
   isPlayerProfileLive,
+  addTeamRecruitmentIntegrityFilters,
+  addPlayerProfileIntegrityFilters,
+  getValidRecruitmentOwnerMatch,
+  isValidRecruitmentOwner,
+  isTeamRecruitmentStructurallyValid,
+  isPlayerProfileStructurallyValid,
+  listCanonicalRecruitmentRecords,
+  buildRecruitmentOwnerPrivacyStages,
+  listCanonicalRecruitmentApplications,
   sameId,
   parsePagination,
   mergeAllowedObject
@@ -55,6 +64,65 @@ assert.strictEqual(isPlayerProfileLive(profile), true);
 assert.strictEqual(isPlayerProfileLive({ ...profile, status: 'inactive' }), false);
 assert.strictEqual(isPlayerProfileLive({ ...profile, expiresAt: past }), false);
 
+assert.deepStrictEqual(getValidRecruitmentOwnerMatch('player'), {
+  userType: 'player',
+  isActive: true,
+  needsProfileCompletion: { $ne: true },
+  username: { $type: 'string' },
+  $expr: {
+    $gt: [
+      {
+        $strLenCP: {
+          $trim: {
+            input: { $convert: { input: '$username', to: 'string', onError: '', onNull: '' } }
+          }
+        }
+      },
+      0
+    ]
+  }
+});
+assert.strictEqual(isValidRecruitmentOwner({
+  _id: 'player-1', username: 'active_player', userType: 'player', isActive: true
+}, 'player'), true);
+assert.strictEqual(isValidRecruitmentOwner({
+  _id: 'player-1', username: 'inactive_player', userType: 'player', isActive: false
+}, 'player'), false);
+
+const guestPrivacyStages = buildRecruitmentOwnerPrivacyStages();
+assert.strictEqual(guestPrivacyStages.length, 1);
+assert.strictEqual(guestPrivacyStages[0].$match.$expr.$eq[1], 'public');
+const authenticatedPrivacyStages = buildRecruitmentOwnerPrivacyStages({
+  viewerId: '507f1f77bcf86cd799439011',
+  viewerBlockedIds: ['507f1f77bcf86cd799439012']
+});
+assert(authenticatedPrivacyStages.some((stage) => stage.$lookup?.from === 'follows'));
+assert(authenticatedPrivacyStages.some((stage) => stage.$match?.$expr));
+assert.strictEqual(isValidRecruitmentOwner({
+  _id: 'player-1', username: 'wrong_role', userType: 'team', isActive: true
+}, 'player'), false);
+assert.strictEqual(isValidRecruitmentOwner({
+  _id: 'player-1', username: '   ', userType: 'player', isActive: true
+}, 'player'), false);
+
+assert.strictEqual(isTeamRecruitmentStructurallyValid({
+  recruitmentType: 'roster', game: 'BGMI', role: 'IGL'
+}), true);
+assert.strictEqual(isTeamRecruitmentStructurallyValid({
+  recruitmentType: 'roster', game: 'BGMI', role: '   '
+}), false);
+assert.strictEqual(isPlayerProfileStructurallyValid({
+  profileType: 'staff-position', staffRole: 'Coach'
+}), true);
+
+const teamIntegrityQuery = addTeamRecruitmentIntegrityFilters({ status: 'active' });
+assert.strictEqual(teamIntegrityQuery.status, 'active');
+assert.strictEqual(teamIntegrityQuery.$and[0].$or[0].recruitmentType, 'roster');
+assert.strictEqual(teamIntegrityQuery.$and[0].$or[1].recruitmentType, 'staff');
+const profileIntegrityQuery = addPlayerProfileIntegrityFilters({ status: 'active' });
+assert.strictEqual(profileIntegrityQuery.$and[0].$or[0].profileType, 'looking-for-team');
+assert.strictEqual(profileIntegrityQuery.$and[0].$or[1].profileType, 'staff-position');
+
 assert.strictEqual(sameId({ _id: 'abc' }, 'abc'), true);
 assert.strictEqual(sameId('abc', 'def'), false);
 assert.deepStrictEqual(parsePagination('-5', '10000'), { page: 1, limit: 100 });
@@ -75,6 +143,8 @@ assert.deepStrictEqual(
 
 const legacyRoot = path.resolve(__dirname, '..');
 const controllerSource = fs.readFileSync(path.join(legacyRoot, 'controllers/recruitmentController.js'), 'utf8');
+const authControllerSource = fs.readFileSync(path.join(legacyRoot, 'controllers/authController.js'), 'utf8');
+const adminControllerSource = fs.readFileSync(path.join(legacyRoot, 'controllers/adminController.js'), 'utf8');
 const modularUserRoutesSource = fs.readFileSync(path.resolve(legacyRoot, '../modules/users/users.routes.ts'), 'utf8');
 const legacyUserRoutesSource = fs.readFileSync(path.join(legacyRoot, 'routes/users.js'), 'utf8');
 const modularRecruitmentRoutesSource = fs.readFileSync(
@@ -93,6 +163,16 @@ assert(controllerSource.includes('status: previousStatus'));
 assert(controllerSource.includes('syncEmbeddedApplicantStatus'));
 assert(controllerSource.includes('queueRecruitmentNotification'));
 assert(controllerSource.includes('includeInterestedTeams: isOwner'));
+assert(controllerSource.includes('listCanonicalRecruitmentRecords({'));
+assert(controllerSource.includes('listCanonicalRecruitmentApplications({'));
+assert(controllerSource.includes('RecruitmentApplication.deleteMany({ recruitment: recruitment._id })'));
+assert(controllerSource.includes("match: getValidRecruitmentOwnerMatch('team')"));
+assert(controllerSource.includes("match: getValidRecruitmentOwnerMatch('player')"));
+assert(authControllerSource.includes("{ $set: { status: 'closed', isActive: false } }"));
+assert(authControllerSource.includes("{ $set: { status: 'inactive', isActive: false } }"));
+assert(adminControllerSource.includes('TeamRecruitment.deleteMany({ team: userId })'));
+assert(adminControllerSource.includes('PlayerProfile.deleteMany({ player: userId })'));
+assert(adminControllerSource.includes('RecruitmentApplication.deleteMany({'));
 assert(!modularUserRoutesSource.includes('/:playerId/add-team/:teamId'));
 assert(!legacyUserRoutesSource.includes('/:playerId/add-team/:teamId'));
 assert(modularRecruitmentRoutesSource.includes('publicOptionalAuth, recruitmentController.getTeamRecruitment'));
@@ -141,6 +221,57 @@ const runValidation = async (middlewares, body) => {
 };
 
 (async () => {
+  let capturedPipeline = null;
+  const fakeModel = {
+    aggregate(pipeline) {
+      capturedPipeline = pipeline;
+      return { allowDiskUse: async () => [{ records: [{ _id: 'valid-1' }], metadata: [{ total: 1 }] }] };
+    }
+  };
+  const canonical = await listCanonicalRecruitmentRecords({
+    model: fakeModel,
+    userModel: { collection: { name: 'users' } },
+    query: { status: 'active' },
+    ownerField: 'player',
+    expectedUserType: 'player',
+    countField: 'interestedTeamsCount',
+    sortBy: 'createdAt',
+    sortDirection: -1,
+    page: 1,
+    limit: 10
+  });
+  assert.deepStrictEqual(canonical, { records: [{ _id: 'valid-1' }], total: 1 });
+  const lookup = capturedPipeline.find(stage => stage.$lookup)?.$lookup;
+  assert.strictEqual(lookup.from, 'users');
+  assert.strictEqual(lookup.let.ownerId, '$player');
+  assert.deepStrictEqual(lookup.pipeline[1].$match, getValidRecruitmentOwnerMatch('player'));
+  assert(capturedPipeline.some(stage => stage.$unwind === '$__validOwner'));
+  assert(capturedPipeline.some(stage => stage.$facet), 'canonical validity must run before pagination and count');
+
+  let capturedApplicationPipeline = null;
+  const canonicalApplications = await listCanonicalRecruitmentApplications({
+    applicationModel: {
+      aggregate(pipeline) {
+        capturedApplicationPipeline = pipeline;
+        return { allowDiskUse: async () => [{ records: [{ _id: 'application-1' }], metadata: [{ total: 1 }] }] };
+      }
+    },
+    recruitmentModel: { collection: { name: 'teamrecruitments' } },
+    userModel: { collection: { name: 'users' } },
+    query: { isActive: true },
+    page: 1,
+    limit: 10
+  });
+  assert.deepStrictEqual(canonicalApplications, {
+    records: [{ _id: 'application-1' }],
+    total: 1
+  });
+  const applicationLookups = capturedApplicationPipeline.filter(stage => stage.$lookup);
+  assert.strictEqual(applicationLookups[0].$lookup.from, 'teamrecruitments');
+  assert.strictEqual(applicationLookups[1].$lookup.from, 'users');
+  assert(capturedApplicationPipeline.filter(stage => stage.$unwind).length >= 2);
+  assert(capturedApplicationPipeline.some(stage => stage.$facet), 'application validity must precede pagination');
+
   const validStaffResponse = await runValidation(validateRecruitment, {
     recruitmentType: 'staff',
     game: '',

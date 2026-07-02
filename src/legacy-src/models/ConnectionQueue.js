@@ -1,4 +1,8 @@
 const mongoose = require('mongoose');
+const {
+  normalizeMatchmakingGender,
+  normalizePreferredGender
+} = require('../utils/randomConnectGender');
 
 const connectionQueueSchema = new mongoose.Schema({
   userId: {
@@ -24,12 +28,15 @@ const connectionQueueSchema = new mongoose.Schema({
   },
   gender: {
     type: String,
-    default: ''
+    enum: ['', 'male', 'female'],
+    default: '',
+    set: normalizeMatchmakingGender
   },
   preferredGender: {
     type: String,
     enum: ['', 'male', 'female'],
-    default: ''
+    default: '',
+    set: normalizePreferredGender
   },
   region: {
     type: String,

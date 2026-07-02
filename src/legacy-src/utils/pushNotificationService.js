@@ -96,8 +96,11 @@ const getChannelIdForNotification = (notification) => {
     case 'mention':
     case 'follow':
     case 'achievement':
+    case 'story':
+    case 'clip':
       return 'social';
     case 'tournament':
+    case 'recruitment':
       return 'tournaments';
     case 'call':
       return 'calls';
@@ -268,6 +271,9 @@ const buildRouteFromNotification = (notification) => {
   const clipId = toId(data.clipId || customData.clipId);
   if (clipId) return `/clip/${clipId}`;
 
+  const storyId = toId(data.storyId || customData.storyId);
+  if (storyId) return `/story/${storyId}`;
+
   const tournamentId = toId(data.tournamentId || customData.tournamentId);
   if (tournamentId) return `/tournament/${tournamentId}`;
 
@@ -332,8 +338,11 @@ const buildPushData = (notification) => {
     pushDeliveryAttemptId: toId(customData.pushDeliveryAttemptId) || undefined,
     collapseKey: sanitizeString(customData.pushOptions?.collapseKey) || undefined,
     type: notification?.type || 'system',
+    targetType: sanitizeString(data.targetType || customData.targetType).slice(0, 80) || undefined,
+    targetId: toId(data.targetId || customData.targetId) || undefined,
     postId: toId(data.postId || customData.postId) || undefined,
     clipId: toId(data.clipId || customData.clipId) || undefined,
+    storyId: toId(data.storyId || customData.storyId) || undefined,
     tournamentId: toId(data.tournamentId || customData.tournamentId) || undefined,
     recruitmentId: toId(data.recruitmentId || customData.recruitmentId) || undefined,
     chatId: toId(data.chatId || data.conversationId || customData.chatId || customData.conversationId) || undefined,

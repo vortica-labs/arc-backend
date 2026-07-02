@@ -1077,12 +1077,6 @@ const chatWithAI = async (req, res) => {
 
   } catch (error) {
     log.error('AI Coach Error:', { error: String(error) });
-    console.error('Error details:', {
-      message: error.message,
-      stack: error.stack,
-      name: error.name
-    });
-    
     // Return user-friendly error message based on language
     let errorMessage = 'Internal server error. Please try again.';
     

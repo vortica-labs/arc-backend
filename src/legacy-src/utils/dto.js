@@ -38,7 +38,7 @@ const normalizeUserAvatarFields = (dto) => {
   return dto;
 };
 
-const formatUserDTO = (user, isGuest = false, isSelf = false) => {
+const formatUserDTO = (user, isGuest = false, isSelf = false, canSeeOnlineStatus = false) => {
   if (!user) return null;
   
   // If we receive a mongoose model, convert to plain object
@@ -49,14 +49,43 @@ const formatUserDTO = (user, isGuest = false, isSelf = false) => {
   normalizeUserAvatarFields(dto);
 
   // ALWAYS remove these highly sensitive fields from ANY response
-  delete dto.password;
-  delete dto.email;
-  delete dto.googleId;
-  delete dto.isSuperUser;
+  for (const field of [
+    'password', 'email', 'googleId', 'appleId', 'isSuperUser',
+    'pushTokens', 'notificationClients', 'resetPasswordToken',
+    'resetPasswordExpires', 'emailVerificationToken', 'otp', 'otpExpires'
+  ]) {
+    delete dto[field];
+  }
 
   // Prevent leaking who blocklists who unless requested by self
   if (!isSelf) {
     delete dto.blockedUsers;
+    delete dto.privacySettings;
+    delete dto.followers;
+    delete dto.following;
+    delete dto.posts;
+    delete dto.savedPosts;
+    delete dto.notificationSettings;
+    delete dto.pushTokens;
+    delete dto.notificationClients;
+    delete dto.mutedChats;
+    delete dto.pinnedChats;
+    delete dto.pinnedGroups;
+    delete dto.adminRole;
+    delete dto.adminPermissions;
+    delete dto.adminControls;
+    delete dto.adminWarnings;
+    delete dto.moderationStatus;
+    delete dto.creatorCpm;
+    delete dto.membership;
+    delete dto.needsProfileCompletion;
+    delete dto.appleId;
+    if (!canSeeOnlineStatus) {
+      delete dto.lastSeen;
+      delete dto.online;
+      delete dto.isOnline;
+      delete dto.activityStatus;
+    }
   }
 
   if (isGuest) {

@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { buildPrefixRegex } = require('../utils/searchQuery');
 
 /**
  * Follow Model
@@ -75,16 +76,34 @@ followSchema.statics.isFollowing = async function(followerId, followingId) {
  * Static: Get follower count
  */
 followSchema.statics.getFollowerCount = async function(userId) {
-  const ids = await this.distinct('follower', { following: userId });
-  return ids.length;
+  const followingId = mongoose.Types.ObjectId.isValid(String(userId))
+    ? new mongoose.Types.ObjectId(String(userId))
+    : userId;
+  const [result] = await this.aggregate([
+    { $match: { following: followingId } },
+    { $lookup: { from: 'users', localField: 'follower', foreignField: '_id', as: 'user' } },
+    { $unwind: '$user' },
+    { $match: { 'user.isActive': true } },
+    { $count: 'total' }
+  ]);
+  return Number(result?.total || 0);
 };
 
 /**
  * Static: Get following count
  */
 followSchema.statics.getFollowingCount = async function(userId) {
-  const ids = await this.distinct('following', { follower: userId });
-  return ids.length;
+  const followerId = mongoose.Types.ObjectId.isValid(String(userId))
+    ? new mongoose.Types.ObjectId(String(userId))
+    : userId;
+  const [result] = await this.aggregate([
+    { $match: { follower: followerId } },
+    { $lookup: { from: 'users', localField: 'following', foreignField: '_id', as: 'user' } },
+    { $unwind: '$user' },
+    { $match: { 'user.isActive': true } },
+    { $count: 'total' }
+  ]);
+  return Number(result?.total || 0);
 };
 
 function uniqueUsersById(users) {
@@ -97,25 +116,76 @@ function uniqueUsersById(users) {
   });
 }
 
+const buildVisibleUserMatch = ({ excludeUserIds = [], search = '' } = {}) => {
+  const conditions = [
+    { 'user.isActive': true },
+    { 'user.username': { $not: /^duo_/i } }
+  ];
+  const excludedObjectIds = (excludeUserIds || [])
+    .filter((value) => mongoose.Types.ObjectId.isValid(String(value)))
+    .map((value) => new mongoose.Types.ObjectId(String(value)));
+  if (excludedObjectIds.length) {
+    conditions.push({ 'user._id': { $nin: excludedObjectIds } });
+  }
+  const pattern = buildPrefixRegex(search);
+  if (pattern) {
+    conditions.push({
+      $or: [
+        { 'user.username': { $regex: pattern, $options: 'i' } },
+        { 'user.profile.displayName': { $regex: pattern, $options: 'i' } }
+      ]
+    });
+  }
+  return conditions.length === 1 ? conditions[0] : { $and: conditions };
+};
+
 /**
  * Static: Get followers with pagination
  */
-followSchema.statics.getFollowers = async function(userId, { page = 1, limit = 20 } = {}) {
+followSchema.statics.getFollowers = async function(userId, {
+  page = 1,
+  limit = 20,
+  excludeUserIds = [],
+  search = ''
+} = {}) {
   const skip = (page - 1) * limit;
-  const [docs, totalIds] = await Promise.all([
-    this.find({ following: userId })
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .populate('follower', 'username profile.displayName profile.avatar profile.bio profile.location userType createdAt')
-      .lean(),
-    this.distinct('follower', { following: userId })
+  const followingId = mongoose.Types.ObjectId.isValid(String(userId))
+    ? new mongoose.Types.ObjectId(String(userId))
+    : userId;
+  const [result = {}] = await this.aggregate([
+    { $match: { following: followingId } },
+    { $sort: { createdAt: -1, _id: 1 } },
+    { $lookup: { from: 'users', localField: 'follower', foreignField: '_id', as: 'user' } },
+    { $unwind: '$user' },
+    { $match: buildVisibleUserMatch({ excludeUserIds, search }) },
+    {
+      $facet: {
+        records: [
+          { $skip: skip },
+          { $limit: limit },
+          {
+            $project: {
+              _id: '$user._id',
+              username: '$user.username',
+              userType: '$user.userType',
+              profile: '$user.profile',
+              privacySettings: '$user.privacySettings',
+              blockedUsers: '$user.blockedUsers',
+              isActive: '$user.isActive',
+              createdAt: '$user.createdAt'
+            }
+          }
+        ],
+        metadata: [{ $count: 'total' }]
+      }
+    }
   ]);
-  const users = uniqueUsersById(docs.map(d => d.follower).filter(Boolean));
+  const users = uniqueUsersById(result.records || []);
+  const total = Number(result.metadata?.[0]?.total || 0);
   return {
     users,
-    total: totalIds.length,
-    pages: Math.ceil(totalIds.length / limit),
+    total,
+    pages: Math.ceil(total / limit),
     current: page
   };
 };
@@ -123,22 +193,50 @@ followSchema.statics.getFollowers = async function(userId, { page = 1, limit = 2
 /**
  * Static: Get following with pagination
  */
-followSchema.statics.getFollowing = async function(userId, { page = 1, limit = 20 } = {}) {
+followSchema.statics.getFollowing = async function(userId, {
+  page = 1,
+  limit = 20,
+  excludeUserIds = [],
+  search = ''
+} = {}) {
   const skip = (page - 1) * limit;
-  const [docs, totalIds] = await Promise.all([
-    this.find({ follower: userId })
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .populate('following', 'username profile.displayName profile.avatar profile.bio profile.location userType createdAt')
-      .lean(),
-    this.distinct('following', { follower: userId })
+  const followerId = mongoose.Types.ObjectId.isValid(String(userId))
+    ? new mongoose.Types.ObjectId(String(userId))
+    : userId;
+  const [result = {}] = await this.aggregate([
+    { $match: { follower: followerId } },
+    { $sort: { createdAt: -1, _id: 1 } },
+    { $lookup: { from: 'users', localField: 'following', foreignField: '_id', as: 'user' } },
+    { $unwind: '$user' },
+    { $match: buildVisibleUserMatch({ excludeUserIds, search }) },
+    {
+      $facet: {
+        records: [
+          { $skip: skip },
+          { $limit: limit },
+          {
+            $project: {
+              _id: '$user._id',
+              username: '$user.username',
+              userType: '$user.userType',
+              profile: '$user.profile',
+              privacySettings: '$user.privacySettings',
+              blockedUsers: '$user.blockedUsers',
+              isActive: '$user.isActive',
+              createdAt: '$user.createdAt'
+            }
+          }
+        ],
+        metadata: [{ $count: 'total' }]
+      }
+    }
   ]);
-  const users = uniqueUsersById(docs.map(d => d.following).filter(Boolean));
+  const users = uniqueUsersById(result.records || []);
+  const total = Number(result.metadata?.[0]?.total || 0);
   return {
     users,
-    total: totalIds.length,
-    pages: Math.ceil(totalIds.length / limit),
+    total,
+    pages: Math.ceil(total / limit),
     current: page
   };
 };

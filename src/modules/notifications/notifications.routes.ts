@@ -99,6 +99,8 @@ const {
 } = require(path.join(backendRootPath, "services", "pushDeviceService.js"));
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { trackDelivery, trackEvent } = require(path.join(backendRootPath, "services", "broadcastService.js"));
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { sanitizeNotificationsForViewer } = require(path.join(backendRootPath, "utils", "notificationPrivacy.js"));
 
 const serializePushToken = (entry: Record<string, unknown>) => {
   const token = typeof entry.token === "string" ? entry.token : "";
@@ -930,13 +932,13 @@ router.get("/", protect, async (req, res) => {
       };
     }
 
-    const notifications = await Notification.find(filter)
+    const notificationDocuments = await Notification.find(filter)
       .populate("sender", "username profile.displayName profile.avatar")
-      .populate("data.postId", "content.text")
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)
       .exec();
+    const notifications = await sanitizeNotificationsForViewer(notificationDocuments, req.user);
 
     const total = await Notification.countDocuments(filter);
     const unreadCount = await Notification.countDocuments(

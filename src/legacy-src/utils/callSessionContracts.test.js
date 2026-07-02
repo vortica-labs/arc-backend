@@ -69,11 +69,14 @@ assert(service.includes("actor !== callerId && actor !== calleeId"), 'actions mu
 assert(service.includes("actor !== calleeId"), 'accept/decline must be callee-scoped');
 assert(!service.includes("require('./apnsVoipPushService')"), 'call-state cleanup must not use PushKit-only transport');
 assert(controller.includes("emit('call-session-updated'"), 'REST actions must reconcile every device');
+assert(controller.includes("emit('call-accept'"), 'REST accept must wake the Web caller so it creates the offer');
+assert(controller.includes("'call_accept_forwarded'"), 'REST accept must expose timestamped signaling diagnostics');
 assert(routes.includes("router.get('/sessions/pending'"));
 assert(routes.includes("router.post('/sessions/:callId/accept'"));
 assert(routes.includes("router.post('/sessions/:callId/decline'"));
 assert(socket.includes('callSessionService.createCallSession'));
 assert(socket.includes('callSessionService.transitionCallSession'));
+assert(socket.includes('"signal_forwarded"'), 'Socket signaling forwarding must expose diagnostics');
 assert(socket.includes('nativeCallId: durableSession.nativeCallId'));
 assert(!socketBootstrap.includes('registerCallSocketHandlers'), 'unsafe target-ID call relay must not be mounted beside durable signaling');
 assert(socketBootstrap.includes('registerLegacySocketHandlers'));

@@ -6,6 +6,8 @@ const Tournament = require('../models/Tournament');
 const Notification = require('../models/Notification');
 const Story = require('../models/Story');
 const TeamRecruitment = require('../models/TeamRecruitment');
+const PlayerProfile = require('../models/PlayerProfile');
+const RecruitmentApplication = require('../models/RecruitmentApplication');
 const RandomConnection = require('../models/RandomConnection');
 const Feedback = require('../models/Feedback');
 const BoostCampaign = require('../models/BoostCampaign');
@@ -22,11 +24,16 @@ const MonetizationEligibility = require('../models/MonetizationEligibility');
 const CreatorEligibilityHistory = require('../models/CreatorEligibilityHistory');
 const MonetizationApplicationTimeline = require('../models/MonetizationApplicationTimeline');
 const HostVerificationApplication = require('../models/HostVerificationApplication');
+const Follow = require('../models/Follow');
+const FollowRequest = require('../models/FollowRequest');
 const mongoose = require('mongoose');
 const { createSystemNotification } = require('../utils/notificationService');
 const { EMAIL_INTENTS } = require('../utils/notificationChannelPolicy');
 const { enqueuePasswordSecurityEmail } = require('../utils/securityEmail');
 const { invalidateUserCache } = require('../middleware/auth');
+const { invalidateProfileCache } = require('../utils/profileCache');
+const { evictPresenceAudience } = require('../utils/presencePrivacy');
+const { disconnectUserSockets } = require('../utils/realtimePrivacy');
 const { PLATFORM_DEFAULT_CPM, getOrCreateCurrentCycle } = require('../services/CreatorEarningsCalculationService');
 const {
   applyManualDeliveryProgress,
@@ -38,7 +45,12 @@ const log = require('../utils/logger');
 const dayMs = 24 * 60 * 60 * 1000;
 
 const notificationEmail = (intent, eventType) => ({
-  email: { intent, eventType }
+  email: {
+    intent,
+    eventType,
+    templateKey: `admin_${eventType}`,
+    triggerSource: 'admin.system_notification'
+  }
 });
 
 const getDashboardRequestId = () => `admindash_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -621,7 +633,14 @@ const updateUserStatus = async (req, res) => {
       });
     }
 
-    await invalidateUserCache(userId);
+    await Promise.all([
+      invalidateUserCache(userId),
+      invalidateProfileCache(userId, user.username)
+    ]);
+    if (!isActive) {
+      evictPresenceAudience(global._arcSocketIO, userId);
+      await disconnectUserSockets(global._arcSocketIO, userId, 'account_suspended');
+    }
     await createSystemNotification(
       userId,
       isActive ? 'Account Access Restored' : 'Account Suspended',
@@ -663,13 +682,36 @@ const deleteUser = async (req, res) => {
       });
     }
 
-    // Delete user and related data
+    // Resolve owned recruitment IDs before deleting the account so dependent
+    // applications cannot survive as broken references.
+    const ownedRecruitmentIds = await TeamRecruitment.distinct('_id', { team: userId });
+
+    // Delete user and recruitment-owned data, and remove the user from embedded
+    // applicant/interest arrays owned by other accounts.
     await Promise.all([
       User.findByIdAndDelete(userId),
       Post.deleteMany({ author: userId }),
-      Message.deleteMany({ $or: [{ sender: userId }, { receiver: userId }] }),
-      Notification.deleteMany({ user: userId })
+      Message.deleteMany({ $or: [{ sender: userId }, { recipient: userId }] }),
+      Notification.deleteMany({ $or: [{ recipient: userId }, { sender: userId }] }),
+      TeamRecruitment.deleteMany({ team: userId }),
+      PlayerProfile.deleteMany({ player: userId }),
+      RecruitmentApplication.deleteMany({
+        $or: [
+          { applicant: userId },
+          { recruitment: { $in: ownedRecruitmentIds } }
+        ]
+      }),
+      TeamRecruitment.updateMany({}, { $pull: { applicants: { user: userId } } }),
+      PlayerProfile.updateMany({}, { $pull: { interestedTeams: { team: userId } } }),
+      Follow.deleteMany({ $or: [{ follower: userId }, { following: userId }] }),
+      FollowRequest.deleteMany({ $or: [{ requester: userId }, { target: userId }] })
     ]);
+    await Promise.all([
+      invalidateUserCache(userId),
+      invalidateProfileCache(userId, user.username)
+    ]);
+    evictPresenceAudience(global._arcSocketIO, userId);
+    await disconnectUserSockets(global._arcSocketIO, userId, 'account_deleted');
 
     res.json({
       success: true,
@@ -890,15 +932,23 @@ const updateReport = async (req, res) => {
           post.author,
           'Content Report Warning',
           'Your content was reported and reviewed. Please ensure it follows community guidelines.',
-          { type: 'content_report_warning', reportId: report._id },
-          notificationEmail(EMAIL_INTENTS.PLATFORM_CRITICAL, 'content_report_warning')
+          { type: 'content_report_warning', reportId: report._id }
         );
       }
     } else if (adminAction === 'ban_user') {
       const post = await Post.findById(report.targetId).select('author');
       if (post?.author) {
-        await User.findByIdAndUpdate(post.author, { isActive: false });
-        await invalidateUserCache(post.author);
+        const suspendedUser = await User.findByIdAndUpdate(
+          post.author,
+          { isActive: false },
+          { new: true }
+        ).select('username');
+        await Promise.all([
+          invalidateUserCache(post.author),
+          invalidateProfileCache(post.author, suspendedUser?.username)
+        ]);
+        evictPresenceAudience(global._arcSocketIO, post.author);
+        await disconnectUserSockets(global._arcSocketIO, post.author, 'account_suspended');
         await createSystemNotification(
           post.author,
           'Account Suspended',
@@ -1403,8 +1453,7 @@ const approveMonetizationApplication = async (req, res) => {
       application.user,
       'Monetization Approved',
       'Your creator monetization application has been approved. You can now add bank details and start earning.',
-      { type: 'monetization_approved', applicationId: application._id },
-      notificationEmail(EMAIL_INTENTS.CREATOR_STATUS, 'monetization_approved')
+      { type: 'monetization_approved', applicationId: application._id }
     );
 
     res.json({
@@ -1464,8 +1513,7 @@ const rejectMonetizationApplication = async (req, res) => {
       application.user,
       'Monetization Application Rejected',
       application.rejectionReason + (reapplyAfter ? ` You can re-apply after ${reapplyAfter.toLocaleDateString()}.` : ''),
-      { type: 'monetization_rejected', applicationId: application._id, reapplyAfter },
-      notificationEmail(EMAIL_INTENTS.CREATOR_STATUS, 'monetization_rejected')
+      { type: 'monetization_rejected', applicationId: application._id, reapplyAfter }
     );
 
     res.json({
@@ -1587,8 +1635,7 @@ const revokeMonetization = async (req, res) => {
       userId,
       'Creator Monetization Revoked',
       'Your creator monetization access has been revoked by the platform. Please contact support if you have questions.',
-      { type: 'monetization_revoked' },
-      notificationEmail(EMAIL_INTENTS.CREATOR_STATUS, 'monetization_revoked')
+      { type: 'monetization_revoked' }
     );
 
     res.json({ success: true, message: 'Monetization revoked successfully' });
@@ -1642,8 +1689,7 @@ const grantMonetization = async (req, res) => {
       userId,
       'Creator Monetization Granted',
       'Congratulations! Creator monetization has been enabled for your account. You can now add bank details and start earning.',
-      { type: 'monetization_granted' },
-      notificationEmail(EMAIL_INTENTS.CREATOR_STATUS, 'monetization_granted')
+      { type: 'monetization_granted' }
     );
 
     res.json({ success: true, message: 'Monetization granted successfully' });
@@ -1885,8 +1931,7 @@ const approveHostVerificationApplication = async (req, res) => {
       application.user,
       'Verified Host Application Approved',
       'Congratulations! Your Verified Host application has been approved. You can now host prize pool tournaments and scrims.',
-      { type: 'host_verification_approved', applicationId: application._id },
-      notificationEmail(EMAIL_INTENTS.HOST_STATUS, 'host_verification_approved')
+      { type: 'host_verification_approved', applicationId: application._id }
     );
 
     res.json({
@@ -1952,8 +1997,7 @@ const rejectHostVerificationApplication = async (req, res) => {
       application.user,
       'Verified Host Application Rejected',
       notificationMessage,
-      { type: 'host_verification_rejected', applicationId: application._id },
-      notificationEmail(EMAIL_INTENTS.HOST_STATUS, 'host_verification_rejected')
+      { type: 'host_verification_rejected', applicationId: application._id }
     );
 
     res.json({
@@ -2048,8 +2092,7 @@ const revokeHostVerification = async (req, res) => {
       userId,
       'Verified Host Status Revoked',
       'Your Verified Host status has been revoked by an administrator. Contact ARC support if you believe this was a mistake.',
-      { type: 'host_verification_revoked' },
-      notificationEmail(EMAIL_INTENTS.HOST_STATUS, 'host_verification_revoked')
+      { type: 'host_verification_revoked' }
     );
 
     res.json({
@@ -2262,8 +2305,7 @@ const suspendMonetization = async (req, res) => {
       userId,
       'Creator Monetization Suspended',
       String(reason),
-      { type: 'monetization_suspended' },
-      notificationEmail(EMAIL_INTENTS.CREATOR_STATUS, 'monetization_suspended')
+      { type: 'monetization_suspended' }
     );
     res.json({ success: true, message: 'Monetization suspended successfully' });
   } catch (error) {
@@ -2310,8 +2352,7 @@ const resumeMonetization = async (req, res) => {
       userId,
       'Creator Monetization Reactivated',
       'Your creator monetization access has been reactivated.',
-      { type: 'monetization_reactivated' },
-      notificationEmail(EMAIL_INTENTS.CREATOR_STATUS, 'monetization_reactivated')
+      { type: 'monetization_reactivated' }
     );
     res.json({ success: true, message: 'Monetization resumed successfully' });
   } catch (error) {

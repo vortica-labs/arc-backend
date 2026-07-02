@@ -35,8 +35,8 @@ RUN npm ci --omit=dev && npm cache clean --force
 # Compiled output
 COPY --from=build /app/dist ./dist
 
-# Legacy JS source — copied to src/legacy-src because runtime require paths
-# resolve relative to dist/ going 3 levels up, landing at /app/src/legacy-src/
+# Canonical legacy JS source. Compiled HTTP and queue workers both resolve this
+# tree through backendRootPath so they cannot load different policy versions.
 COPY --from=build /app/src/legacy-src ./src/legacy-src
 COPY --from=build /app/scripts ./scripts
 

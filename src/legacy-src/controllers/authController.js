@@ -1,14 +1,20 @@
 const User = require('../models/User');
 const OtpVerification = require('../models/OtpVerification');
 const Follow = require('../models/Follow');
+const FollowRequest = require('../models/FollowRequest');
+const ConnectionQueue = require('../models/ConnectionQueue');
 const { generateToken, generateRefreshToken } = require('../utils/jwt');
 const { uploadAvatar, uploadImage } = require('../utils/cloudinary');
 const { sendOTPEmail } = require('../utils/email');
 const { enqueuePasswordSecurityEmail } = require('../utils/securityEmail');
 const log = require('../utils/logger');
 const { invalidateUserCache } = require('../middleware/auth');
+const { invalidateProfileCache } = require('../utils/profileCache');
+const { evictPresenceAudience } = require('../utils/presencePrivacy');
+const { disconnectUserSockets } = require('../utils/realtimePrivacy');
 const { validateOnboardingProfile } = require('../utils/onboardingValidation');
 const { recordSuccessfulLogin } = require('../utils/userLoginAudit');
+const { normalizeMatchmakingGender } = require('../utils/randomConnectGender');
 
 const INVALID_LOGIN_MESSAGE = 'Invalid email or password.';
 
@@ -702,6 +708,25 @@ const updateProfile = async (req, res) => {
     userResponse.followersCount = await Follow.getFollowerCount(user._id).catch(() => user.followers?.length || 0);
     userResponse.followingCount = await Follow.getFollowingCount(user._id).catch(() => user.following?.length || 0);
 
+    // Profile data is part of matchmaking eligibility. Invalidate the auth
+    // snapshot and update a live queue row so gender changes take effect now,
+    // without waiting for cache expiry or requiring the user to rejoin.
+    await Promise.all([
+      invalidateUserCache(userId),
+      invalidateProfileCache(userId, req.user.username, user.username),
+      updates.gender !== undefined
+        ? ConnectionQueue.updateMany(
+          { userId, status: 'waiting' },
+          {
+            $set: {
+              gender: normalizeMatchmakingGender(user.profile?.gender),
+              updatedAt: new Date()
+            }
+          }
+        )
+        : Promise.resolve()
+    ]);
+
     res.status(200).json({
       success: true,
       message: 'Profile updated successfully',
@@ -884,8 +909,35 @@ const deleteAccount = async (req, res) => {
     user.isActive = false;
     user.deletedAt = new Date();
     await user.save();
+    const TeamRecruitment = require('../models/TeamRecruitment');
+    const PlayerProfile = require('../models/PlayerProfile');
+    const RecruitmentApplication = require('../models/RecruitmentApplication');
+    await Promise.all([
+      TeamRecruitment.updateMany(
+        { team: userId },
+        { $set: { status: 'closed', isActive: false } }
+      ),
+      PlayerProfile.updateMany(
+        { player: userId },
+        { $set: { status: 'inactive', isActive: false } }
+      ),
+      RecruitmentApplication.updateMany(
+        { applicant: userId },
+        { $set: { isActive: false } }
+      ),
+      TeamRecruitment.updateMany({}, { $pull: { applicants: { user: userId } } }),
+      PlayerProfile.updateMany({}, { $pull: { interestedTeams: { team: userId } } }),
+      Follow.deleteMany({ $or: [{ follower: userId }, { following: userId }] }),
+      FollowRequest.deleteMany({ $or: [{ requester: userId }, { target: userId }] })
+    ]);
     const { removeAllPushDevicesForUser } = require('../services/pushDeviceService');
     await removeAllPushDevicesForUser(userId);
+    await Promise.all([
+      invalidateUserCache(userId),
+      invalidateProfileCache(userId, user.username)
+    ]);
+    evictPresenceAudience(global._arcSocketIO, userId);
+    await disconnectUserSockets(global._arcSocketIO, userId, 'account_deleted');
 
     res.status(200).json({
       success: true,
@@ -991,6 +1043,7 @@ const completeProfile = async (req, res) => {
 
     // Authentication providers establish identity. Profile completion only
     // applies the same profile fields collected during OTP registration.
+    const previousUsername = user.username;
     user.userType = userType;
     user.username = username;
     user.profile = user.profile || {};
@@ -1020,7 +1073,10 @@ const completeProfile = async (req, res) => {
     }
 
     await user.save();
-    await invalidateUserCache(userId);
+    await Promise.all([
+      invalidateUserCache(userId),
+      invalidateProfileCache(userId, previousUsername, user.username)
+    ]);
 
     // Generate new token with updated username
     const token = generateToken({ id: user._id, username: user.username, userType: user.userType });

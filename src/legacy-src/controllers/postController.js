@@ -8,6 +8,24 @@ const { formatPostDTO } = require('../utils/dto');
 const { getRecommendedPosts, recordEngagementEvent } = require('../services/recommendationService');
 const { isActiveBoost } = require('../services/boostService');
 const log = require('../utils/logger');
+const { resolvePostAccess, filterPostsForViewer } = require('../utils/privacyPolicy');
+
+const rejectPrivatePost = (res, decision) => res.status(decision?.reason === 'not_found' ? 404 : 403).json({
+  success: false,
+  code: decision?.reason === 'not_found' ? 'POST_NOT_FOUND' : 'PRIVACY_RESTRICTED',
+  reason: decision?.reason || 'privacy_restricted',
+  message: decision?.reason === 'not_found' ? 'Post not found' : 'You do not have permission to access this post',
+  ...(decision?.privacyAccess ? { data: { privacyAccess: decision.privacyAccess } } : {})
+});
+
+const requireVisiblePost = async (req, res, post) => {
+  const decision = await resolvePostAccess({ post, viewer: req.user });
+  if (!decision.allowed) {
+    rejectPrivatePost(res, decision);
+    return null;
+  }
+  return decision;
+};
 
 function getRequestSource(req, post) {
   const requested = req.body?.source || req.query?.source || req.body?.deliverySource || req.query?.deliverySource;
@@ -355,10 +373,11 @@ const recordClipView = async (req, res) => {
     const completionRate = Math.min(1, Math.max(0, Number(req.body?.completionRate) || 0));
 
     const now = new Date();
-    const basePost = await Post.findById(postId).select('author isActive boostMeta boostExpiresAt');
+    const basePost = await Post.findById(postId).select('author visibility isActive hiddenByAdmin boostMeta boostExpiresAt');
     if (!basePost || basePost.isActive === false) {
       return res.status(404).json({ success: false, message: 'Post not found' });
     }
+    if (!await requireVisiblePost(req, res, basePost)) return;
     const source = getRequestSource(req, basePost);
     const campaignId = getBoostCampaignId(basePost, source);
     const metricsInc = {
@@ -434,7 +453,7 @@ const getPost = async (req, res) => {
     const postId = req.params.id;
 
     const post = await Post.findById(postId)
-      .populate('author', 'username profile.displayName profile.avatar profilePicture avatar userType')
+      .populate('author', 'username profile.displayName profile.avatar profilePicture avatar userType privacySettings blockedUsers isActive')
       .populate('likes.user', 'username profile.displayName profile.avatar profilePicture avatar')
       .populate('comments.user', 'username profile.displayName profile.avatar profilePicture avatar');
 
@@ -445,22 +464,8 @@ const getPost = async (req, res) => {
       });
     }
 
-    // Check visibility permissions
-    if (post.visibility === 'private' && post.author._id.toString() !== req.user?._id.toString()) {
-      return res.status(403).json({
-        success: false,
-        message: 'You do not have permission to view this post'
-      });
-    }
-
-    if (post.visibility === 'followers' && 
-        !req.user?.following.includes(post.author._id) && 
-        post.author._id.toString() !== req.user?._id.toString()) {
-      return res.status(403).json({
-        success: false,
-        message: 'You do not have permission to view this post'
-      });
-    }
+    const postPrivacyDecision = await requireVisiblePost(req, res, post);
+    if (!postPrivacyDecision) return;
 
     const viewerId = req.user?._id;
     const isGuest = req.user && req.user.userType === 'guest';
@@ -521,13 +526,14 @@ const toggleLike = async (req, res) => {
     const postId = req.params.id;
     const userId = req.user._id;
 
-    const existingPost = await Post.findById(postId).select('author likes isActive boostMeta boostExpiresAt');
+    const existingPost = await Post.findById(postId).select('author likes visibility isActive hiddenByAdmin boostMeta boostExpiresAt');
     if (!existingPost || existingPost.isActive === false) {
       return res.status(404).json({
         success: false,
         message: 'Post not found'
       });
     }
+    if (!await requireVisiblePost(req, res, existingPost)) return;
 
     const alreadyLiked = existingPost.likes.findIndex((like) => {
       const likeUser = like?.user?._id || like?.user;
@@ -555,7 +561,7 @@ const toggleLike = async (req, res) => {
     }
 
     const finalPost = await Post.findById(postId)
-      .populate('author', 'username profile.displayName profile.avatar profilePicture avatar userType')
+      .populate('author', 'username profile.displayName profile.avatar profilePicture avatar userType privacySettings blockedUsers isActive')
       .populate('likes.user', 'username profile.displayName profile.avatar profilePicture avatar')
       .populate('comments.user', 'username profile.displayName profile.avatar profilePicture avatar')
       .select('author content postType achievementInfo tags mentions likes comments shares attachedMusic visibility isActive hiddenByAdmin boostedAt boostExpiresAt views viewedBy createdAt updatedAt');
@@ -625,6 +631,11 @@ const addComment = async (req, res) => {
       });
     }
 
+    const visiblePost = await Post.findById(postId)
+      .select('author visibility isActive hiddenByAdmin');
+    if (!visiblePost) return res.status(404).json({ success: false, message: 'Post not found' });
+    if (!await requireVisiblePost(req, res, visiblePost)) return;
+
     // Add comment
     const comment = {
       user: userId,
@@ -647,6 +658,7 @@ const addComment = async (req, res) => {
         message: 'Post not found'
       });
     }
+
     const source = getRequestSource(req, post);
     const campaignId = getBoostCampaignId(post, source);
     await incrementAttributionMetric({ postId, source, campaignId, metric: 'Comments' });
@@ -693,6 +705,11 @@ const recordShare = async (req, res) => {
   try {
     const postId = req.params.id;
     const userId = req.user._id;
+
+    const visiblePost = await Post.findById(postId)
+      .select('author visibility isActive hiddenByAdmin');
+    if (!visiblePost) return res.status(404).json({ success: false, message: 'Post not found' });
+    if (!await requireVisiblePost(req, res, visiblePost)) return;
 
     const post = await Post.findOneAndUpdate(
       {
@@ -750,10 +767,12 @@ const toggleSave = async (req, res) => {
     const postId = req.params.id;
     const userId = req.user._id;
 
-    const post = await Post.findOne({ _id: postId, isActive: true }).select('author boostMeta boostExpiresAt');
+    const post = await Post.findOne({ _id: postId, isActive: true })
+      .select('author visibility isActive hiddenByAdmin boostMeta boostExpiresAt');
     if (!post) {
       return res.status(404).json({ success: false, message: 'Post not found' });
     }
+    if (!await requireVisiblePost(req, res, post)) return;
 
     const user = await User.findById(userId).select('savedPosts');
     if (!user) {
@@ -825,11 +844,12 @@ const getSavedPosts = async (req, res) => {
 
     const savedIds = savedEntries.map(item => item.post);
     const posts = await Post.find({ _id: { $in: savedIds }, isActive: true })
-      .populate('author', 'username profile.displayName profile.avatar profilePicture avatar userType')
+      .populate('author', 'username profile.displayName profile.avatar profilePicture avatar userType privacySettings blockedUsers isActive')
       .populate('likes.user', 'username profile.displayName profile.avatar profilePicture avatar')
       .populate('comments.user', 'username profile.displayName profile.avatar profilePicture avatar');
 
-    const postsById = new Map(posts.map(post => [post._id.toString(), post]));
+    const visiblePosts = await filterPostsForViewer(posts, req.user);
+    const postsById = new Map(visiblePosts.map(post => [post._id.toString(), post]));
     const orderedPosts = savedEntries
       .map(entry => {
         const post = postsById.get(entry.post.toString());
@@ -872,17 +892,18 @@ const getLikedPosts = async (req, res) => {
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
     const skip = (page - 1) * limit;
 
-    const [posts, total, user] = await Promise.all([
+    const [candidatePosts, user] = await Promise.all([
       Post.find({ isActive: true, 'likes.user': userId })
-        .populate('author', 'username profile.displayName profile.avatar profilePicture avatar userType')
+        .populate('author', 'username profile.displayName profile.avatar profilePicture avatar userType privacySettings blockedUsers isActive')
         .populate('likes.user', 'username profile.displayName profile.avatar profilePicture avatar')
         .populate('comments.user', 'username profile.displayName profile.avatar profilePicture avatar')
-        .sort({ 'likes.likedAt': -1, createdAt: -1 })
-        .skip(skip)
-        .limit(limit),
-      Post.countDocuments({ isActive: true, 'likes.user': userId }),
+        .sort({ 'likes.likedAt': -1, createdAt: -1 }),
       User.findById(userId).select('savedPosts').lean()
     ]);
+
+    const visiblePosts = await filterPostsForViewer(candidatePosts, req.user);
+    const total = visiblePosts.length;
+    const posts = visiblePosts.slice(skip, skip + limit);
 
     const savedIds = new Set((user?.savedPosts || []).map(item => item?.post?.toString()).filter(Boolean));
 
@@ -1029,6 +1050,7 @@ const reportPost = async (req, res) => {
         message: 'Post not found'
       });
     }
+    if (!await requireVisiblePost(req, res, post)) return;
 
     // Check if user is trying to report their own post
     if (post.author.toString() === userId.toString()) {
@@ -1116,6 +1138,7 @@ const trackInteraction = async (req, res) => {
         message: 'Post not found'
       });
     }
+    if (!await requireVisiblePost(req, res, post)) return;
 
     const normalizedType = interactionType === 'dwell_time' || interactionType === 'click'
       ? 'dwell'

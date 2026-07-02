@@ -6,6 +6,21 @@ const {
 const { createHash, randomUUID } = require('crypto');
 const log = require('./logger');
 
+const buildMessageNotificationBody = (senderName, messageKind = 'text', primaryMediaType = '') => {
+  const sender = String(senderName || 'Someone');
+  const mediaType = String(primaryMediaType || '').toLowerCase();
+  if (messageKind === 'media') {
+    if (mediaType === 'audio' || mediaType === 'voice') return `You received a voice message from ${sender}`;
+    if (mediaType === 'image' || mediaType === 'photo') return `You received an image from ${sender}`;
+    if (mediaType === 'video') return `You received a video from ${sender}`;
+    return `You received a media message from ${sender}`;
+  }
+  if (messageKind === 'shared_post') return `${sender} shared a post with you`;
+  if (messageKind === 'shared_profile') return `${sender} shared a profile with you`;
+  if (messageKind === 'reply') return `You received a reply from ${sender}`;
+  return `You received a new message from ${sender}`;
+};
+
 // Create like notification
 const createLikeNotification = async (recipientId, senderId, postId) => {
   try {
@@ -108,7 +123,11 @@ const createMessageNotification = async (recipientId, senderId, messageId, optio
       }
     };
     const notificationTitle = options.title || 'New Message';
-    const notificationMessage = options.message || `${sender.username} sent you a message`;
+    const notificationMessage = options.message || buildMessageNotificationBody(
+      sender?.username,
+      messageKind,
+      primaryMediaType
+    );
     const channels = resolveNotificationChannels(
       { type: 'message', data: notificationDataFields },
       recipient?.notificationSettings
@@ -224,8 +243,25 @@ const createTournamentNotification = async (recipientId, tournamentId, title, me
 // Create mention notification
 const createMentionNotification = async (recipientId, senderId, postId) => {
   try {
-    const sender = await require('../models/User').findById(senderId).select('username profile.displayName profile.avatar');
-    const post = await require('../models/Post').findById(postId).select('content.text');
+    const User = require('../models/User');
+    const Post = require('../models/Post');
+    const { resolvePostAccess } = require('./privacyPolicy');
+    const [sender, post, recipient] = await Promise.all([
+      User.findById(senderId).select('username profile.displayName profile.avatar'),
+      Post.findById(postId).select('author content.text visibility isActive hiddenByAdmin'),
+      User.findById(recipientId).select('username userType privacySettings blockedUsers isActive').lean()
+    ]);
+    if (!sender || !post || !recipient || recipient.isActive === false) return null;
+    const access = await resolvePostAccess({ post, viewer: recipient });
+    if (!access.allowed) {
+      log.info('Mention notification suppressed by current post privacy', {
+        recipientId: String(recipientId),
+        senderId: String(senderId),
+        postId: String(postId),
+        reason: access.reason
+      });
+      return null;
+    }
     
     const notificationData = {
       recipient: recipientId,
@@ -249,7 +285,12 @@ const createMentionNotification = async (recipientId, senderId, postId) => {
 const createSystemNotification = async (recipientId, title, message, data = {}, options = {}) => {
   try {
     const email = options?.email && typeof options.email === 'object'
-      ? { intent: options.email.intent, eventType: options.email.eventType }
+      ? {
+          intent: options.email.intent,
+          eventType: options.email.eventType,
+          templateKey: options.email.templateKey,
+          triggerSource: options.email.triggerSource
+        }
       : undefined;
     const notificationData = {
       recipient: recipientId,
@@ -274,5 +315,6 @@ module.exports = {
   createMessageNotification,
   createTournamentNotification,
   createSystemNotification,
-  createMentionNotification
+  createMentionNotification,
+  buildMessageNotificationBody
 };

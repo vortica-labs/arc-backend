@@ -440,7 +440,12 @@ const notifyLifecycle = async (membership, { title, message, action, source = 's
         title,
         message,
         process.env.CLIENT_URL ? `${process.env.CLIENT_URL.replace(/\/+$/, '')}/premium` : '',
-        { intent: EMAIL_INTENTS.PREMIUM_LIFECYCLE, eventType: action }
+        {
+          intent: EMAIL_INTENTS.PREMIUM_LIFECYCLE,
+          eventType: action,
+          templateKey: `premium_${action}`,
+          triggerSource: `premium.${source}`
+        }
       );
       outcomes.email = 'sent';
     } catch (error) {

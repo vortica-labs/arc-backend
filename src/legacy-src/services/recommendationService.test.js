@@ -4,7 +4,8 @@ const {
   encodeCursor,
   parseExcludedIds,
   scorePost,
-  selectDiversePosts
+  selectDiversePosts,
+  buildAudienceFilter
 } = require('./recommendationService');
 const { getOrganicViewCount } = require('./boostService');
 
@@ -86,5 +87,38 @@ const diverse = selectDiversePosts([
   { post: { ...basePost, _id: '507f1f77bcf86cd799439003', author: { _id: 'a2' }, tags: ['y'] }, score: 98 }
 ], 2, 'clips');
 assert.deepStrictEqual(diverse.map((item) => item.post.author._id), ['a1', 'a2']);
+
+const audienceRelationship = {
+  currentUserId: '507f1f77bcf86cd799439099',
+  followingIds: new Set(['507f1f77bcf86cd799439012']),
+  blockedEitherWayIds: new Set(),
+  invisiblePrivateAuthorIds: new Set()
+};
+const privateAudience = buildAudienceFilter({
+  user: { _id: audienceRelationship.currentUserId },
+  mode: 'feed',
+  relationship: audienceRelationship,
+  query: { visibility: 'private', author: '507f1f77bcf86cd799439012' }
+});
+assert.strictEqual(privateAudience.visibility, 'private');
+assert.strictEqual(privateAudience.author, '507f1f77bcf86cd799439012');
+assert(privateAudience.$and.some((condition) => condition.author === audienceRelationship.currentUserId), 'private visibility must remain owner-only');
+
+const followerAudience = buildAudienceFilter({
+  user: { _id: audienceRelationship.currentUserId },
+  mode: 'feed',
+  relationship: audienceRelationship,
+  query: { visibility: 'followers' }
+});
+assert.strictEqual(followerAudience.visibility, 'followers');
+assert(followerAudience.$and.some((condition) => Array.isArray(condition.$or)), 'followers visibility must retain relationship scope');
+
+const guestAudience = buildAudienceFilter({
+  user: null,
+  mode: 'feed',
+  relationship: { ...audienceRelationship, currentUserId: null },
+  query: { visibility: 'private' }
+});
+assert.strictEqual(guestAudience.visibility, 'public', 'guest filters cannot request private posts');
 
 console.log('recommendation service tests passed');

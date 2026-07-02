@@ -4,9 +4,37 @@ const { createAndEmitNotification } = require('../utils/notificationEmitter');
 const { calculateBGMIPoints } = require('../utils/bgmiPoints');
 const mongoose = require('mongoose');
 const log = require('../utils/logger');
+const { sanitizePublicScrim } = require('../utils/tournamentPublicDto');
 
 const uniqueRecipientIds = (values = []) =>
   Array.from(new Set(values.map((value) => String(value?._id || value)).filter(Boolean)));
+
+const idString = (value) => String(value?._id || value || '');
+
+const canReadScrimBroadcasts = async (scrim, userId) => {
+  const viewerId = idString(userId);
+  if (!viewerId || !scrim) return false;
+  if (idString(scrim.host) === viewerId) return true;
+  const participantIds = (scrim.registeredTeams || []).map(idString).filter(Boolean);
+  if (participantIds.includes(viewerId)) return true;
+  return Boolean(await User.exists({
+    _id: { $in: participantIds },
+    userType: 'team',
+    isActive: true,
+    $or: [
+      { 'teamInfo.members': { $elemMatch: { user: userId } } },
+      {
+        'teamInfo.rosters': {
+          $elemMatch: {
+            isActive: { $ne: false },
+            players: { $elemMatch: { user: userId, isActive: { $ne: false }, leftAt: null } }
+          }
+        }
+      },
+      { 'teamInfo.staff': { $elemMatch: { user: userId, isActive: { $ne: false }, leftAt: null } } }
+    ]
+  }));
+};
 
 const notifyScrimRecipients = async ({ scrim, recipients, sender, title, message, eventType, revision, extraData = {} }) => {
   const recipientIds = uniqueRecipientIds(recipients);
@@ -304,7 +332,7 @@ const getScrims = async (req, res) => {
     res.status(200).json({
       success: true,
       data: {
-        scrims,
+        scrims: scrims.map(sanitizePublicScrim),
         pagination: {
           page,
           limit,
@@ -359,10 +387,15 @@ const getScrim = async (req, res) => {
       await Scrim.populate(scrim.overallStandings.teams, { path: 'teamId', select: 'username profile.displayName profile.avatar' });
     }
 
+    const safeScrim = sanitizePublicScrim(scrim);
+    if (await canReadScrimBroadcasts(scrim, req.user?._id)) {
+      safeScrim.broadcasts = scrim.broadcasts || [];
+    }
+
     res.status(200).json({
       success: true,
       data: {
-        scrim
+        scrim: safeScrim
       }
     });
   } catch (error) {

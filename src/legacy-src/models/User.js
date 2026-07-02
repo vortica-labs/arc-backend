@@ -481,6 +481,33 @@ const userSchema = new mongoose.Schema({
     default: Date.now
   },
   privacySettings: {
+    // Canonical, cross-platform privacy contract. These fields intentionally
+    // have no schema default so legacy records continue to fall back to the
+    // aliases below until they are saved or migrated.
+    profileVisibility: {
+      type: String,
+      enum: ['public', 'followers', 'private'],
+      default: undefined
+    },
+    allowMessageFrom: {
+      type: String,
+      enum: ['everyone', 'followers', 'none'],
+      default: undefined
+    },
+    showOnlineStatus: {
+      type: Boolean,
+      default: undefined
+    },
+    allowFollowRequests: {
+      type: Boolean,
+      default: undefined
+    },
+    showPostsToFollowers: {
+      type: Boolean,
+      default: undefined
+    },
+    // Deprecated compatibility aliases. They are synchronized whenever the
+    // canonical settings endpoint writes this subdocument.
     accountType: {
       type: String,
       enum: ['public', 'private'],
@@ -731,6 +758,8 @@ userSchema.index({ isActive: 1, username: 1 }); // user list + search
 userSchema.index({ isActive: 1, createdAt: -1 }); // admin: new users
 userSchema.index({ isActive: 1, lastSeen: -1 }); // admin: active users
 userSchema.index({ isActive: 1, userType: 1, createdAt: -1 }); // filtered user lists
+userSchema.index({ isActive: 1, 'privacySettings.profileVisibility': 1, _id: 1 });
+userSchema.index({ isActive: 1, 'privacySettings.showPostsToFollowers': 1, _id: 1 });
 userSchema.index({ isActive: 1, isPremium: 1, _id: 1 });
 userSchema.index({ isActive: 1, isVerifiedHost: 1, _id: 1 });
 userSchema.index({ isActive: 1, creatorMonetizationStatus: 1, _id: 1 });
@@ -763,6 +792,31 @@ userSchema.pre('save', function(next) {
       this.playerInfo.joinedTeams = [];
     }
   }
+  next();
+});
+
+// New users and legacy documents saved after this release receive the complete
+// canonical privacy shape without changing the meaning of their old values.
+userSchema.pre('save', function(next) {
+  const privacy = this.privacySettings || {};
+  if (privacy.profileVisibility === undefined) {
+    privacy.profileVisibility = ['public', 'private'].includes(privacy.accountType)
+      ? privacy.accountType
+      : 'public';
+  }
+  if (privacy.allowMessageFrom === undefined) {
+    privacy.allowMessageFrom = ['nobody', 'none'].includes(privacy.whoCanMessage)
+      ? 'none'
+      : ['people_you_follow', 'following', 'followers'].includes(privacy.whoCanMessage)
+        ? 'followers'
+        : 'everyone';
+  }
+  if (privacy.showOnlineStatus === undefined) {
+    privacy.showOnlineStatus = privacy.showActivityStatus !== false;
+  }
+  if (privacy.allowFollowRequests === undefined) privacy.allowFollowRequests = true;
+  if (privacy.showPostsToFollowers === undefined) privacy.showPostsToFollowers = true;
+  this.privacySettings = privacy;
   next();
 });
 

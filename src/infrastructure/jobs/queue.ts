@@ -1,7 +1,9 @@
 import { Queue, Worker, type Job } from "bullmq";
 import { createHash, randomUUID } from "crypto";
+import path from "path";
 import { env } from "../../config/env";
 import { logger } from "../../config/logger";
+import { backendRootPath } from "../../modules/legacy/legacy.paths";
 
 // ── Queue names ────────────────────────────────────────────────────────────
 export const QUEUE_NAMES = {
@@ -31,41 +33,98 @@ export const broadcastQueue = new Queue(QUEUE_NAMES.BROADCAST, { connection });
 
 export type EmailDeliveryContext = {
   intent: string;
-  eventType?: string;
+  eventType: string;
   notificationType?: string;
+  templateKey?: string;
+  triggerSource?: string;
+  producerStack?: string;
 };
+
+type EmailPolicyResult = {
+  allowed: boolean;
+  intent?: string;
+  eventType?: string;
+  routineEventType?: string | null;
+  reason: string;
+};
+
+type EmailPolicyModule = {
+  evaluateEmailPolicy: (context?: Partial<EmailDeliveryContext>) => EmailPolicyResult;
+};
+
+type EmailAuditModule = {
+  captureEmailCallStack: () => string;
+  inferEmailTriggerSource: (stack?: string) => string;
+  buildEmailAuditContext: (input: Record<string, unknown>) => Record<string, unknown>;
+  sanitizeEmailAuditError: (error: unknown) => string;
+};
+
+// Load every legacy dependency from the canonical source tree. The compiled
+// worker previously resolved dist/legacy-src while HTTP routes resolved
+// src/legacy-src, allowing stale build artifacts to enforce a different email
+// policy from the request process.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const emailPolicy = require(path.join(backendRootPath, "utils", "notificationChannelPolicy.js")) as EmailPolicyModule;
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const emailAudit = require(path.join(backendRootPath, "utils", "emailAudit.js")) as EmailAuditModule;
 
 // ── Email Worker ───────────────────────────────────────────────────────────
 export const emailWorker = new Worker(
   QUEUE_NAMES.EMAIL,
   async (job: Job) => {
     const { to, subject, text, link, context } = job.data;
+    const policy = emailPolicy.evaluateEmailPolicy(context || {});
+    const audit = emailAudit.buildEmailAuditContext({
+      to,
+      intent: policy.intent || context?.intent,
+      eventType: policy.eventType || context?.eventType,
+      notificationType: context?.notificationType,
+      templateKey: context?.templateKey,
+      triggerSource: context?.triggerSource || "bullmq.email_worker",
+      producerStack: context?.producerStack
+    });
+    if (!policy.allowed) {
+      logger.info("Email job suppressed by channel policy", {
+        jobId: String(job.id || ""),
+        ...audit,
+        reason: policy.reason,
+        routineEventType: policy.routineEventType || ""
+      });
+      return { suppressed: true, reason: policy.reason };
+    }
+    const workerContext = {
+      ...(context || {}),
+      intent: policy.intent,
+      eventType: policy.eventType,
+      triggerSource: context?.triggerSource || "bullmq.email_worker"
+    };
     try {
       // Dynamic import to avoid loading nodemailer at module scope
-      const path = require("path");
-      const legacyRoot = path.resolve(__dirname, "..", "..", "legacy-src");
       // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const emailUtil = require(path.join(legacyRoot, "utils", "email.js"));
+      const emailUtil = require(path.join(backendRootPath, "utils", "email.js"));
 
       if (!emailUtil?.sendNotificationEmail) {
         throw new Error("Policy-aware email dispatcher is unavailable");
       }
-      const result = await emailUtil.sendNotificationEmail(to, subject, text, link, context || {});
+      const result = await emailUtil.sendNotificationEmail(to, subject, text, link, workerContext);
       if (result?.blocked) {
         logger.info("Email job suppressed by channel policy", {
           jobId: String(job.id || ""),
-          intent: context?.intent || "missing",
-          eventType: context?.eventType || context?.notificationType || "",
+          ...audit,
           reason: result.reason || "policy_blocked"
         });
         return { suppressed: true, reason: result.reason || "policy_blocked" };
       }
       if (!result?.sent) throw new Error(result?.error || "Email transport did not confirm delivery");
 
-      logger.info("Email sent via worker", { to, subject });
+      logger.info("Email sent via worker", { jobId: String(job.id || ""), ...audit });
       return { sent: true, messageId: result.messageId };
     } catch (error) {
-      logger.error("Email worker failed", { error: String(error), to, subject });
+      logger.error("Email worker failed", {
+        jobId: String(job.id || ""),
+        ...audit,
+        error: emailAudit.sanitizeEmailAuditError(error)
+      });
       throw error; // let BullMQ retry
     }
   },
@@ -81,16 +140,14 @@ export const notificationWorker = new Worker(
   QUEUE_NAMES.NOTIFICATION,
   async (job: Job) => {
     try {
-      const path = require("path");
-      const legacyRoot = path.resolve(__dirname, "..", "..", "legacy-src");
       if (job.name === "push-send") {
         // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const pushService = require(path.join(legacyRoot, "utils", "pushNotificationService.js"));
+        const pushService = require(path.join(backendRootPath, "utils", "pushNotificationService.js"));
         return pushService.retryPushDeliveryAttempts(job.data.attemptIds);
       }
       if (job.name === "push-receipts") {
         // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const pushService = require(path.join(legacyRoot, "utils", "pushNotificationService.js"));
+        const pushService = require(path.join(backendRootPath, "utils", "pushNotificationService.js"));
         const result = await pushService.reconcilePushDeliveryReceipts(
           job.data.attemptIds,
           String(job.id || "")
@@ -118,7 +175,7 @@ export const notificationWorker = new Worker(
       // individual events. The stable delivery key makes BullMQ retries safe:
       // in-app rows are deduplicated and push attempts reuse one request key.
       // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { createAndEmitNotification } = require(path.join(legacyRoot, "utils", "notificationEmitter.js"));
+      const { createAndEmitNotification } = require(path.join(backendRootPath, "utils", "notificationEmitter.js"));
       const failures: Array<{ recipientId: string; reason: string }> = [];
       let delivered = 0;
       const ids = Array.from(new Set((recipientIds as string[]).map(String).filter(Boolean)));
@@ -206,10 +263,8 @@ type BroadcastService = {
 };
 
 const loadBroadcastService = (): BroadcastService => {
-  const path = require("path");
-  const legacyRoot = path.resolve(__dirname, "..", "..", "legacy-src");
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  return require(path.join(legacyRoot, "services", "broadcastService.js")) as BroadcastService;
+  return require(path.join(backendRootPath, "services", "broadcastService.js")) as BroadcastService;
 };
 
 const broadcastJobId = (...parts: Array<string | number>): string =>
@@ -273,13 +328,39 @@ export const enqueueEmail = async (
   text: string,
   link?: string,
   context?: EmailDeliveryContext
-): Promise<void> => {
-  await emailQueue.add("send", { to, subject, text, link, context }, {
+): Promise<{ queued: boolean; blocked: boolean; reason?: string }> => {
+  const producerStack = context?.producerStack || emailAudit.captureEmailCallStack();
+  const typedContext = {
+    ...(context || {}),
+    producerStack,
+    triggerSource: context?.triggerSource || emailAudit.inferEmailTriggerSource(producerStack)
+  };
+  const policy = emailPolicy.evaluateEmailPolicy(typedContext);
+  const audit = emailAudit.buildEmailAuditContext({
+    to,
+    intent: policy.intent || typedContext.intent,
+    eventType: policy.eventType || typedContext.eventType,
+    notificationType: typedContext.notificationType,
+    templateKey: typedContext.templateKey,
+    triggerSource: typedContext.triggerSource,
+    producerStack
+  });
+  if (!policy.allowed) {
+    logger.info("Email queue submission suppressed by channel policy", {
+      ...audit,
+      reason: policy.reason,
+      routineEventType: policy.routineEventType || ""
+    });
+    return { queued: false, blocked: true, reason: policy.reason };
+  }
+  await emailQueue.add("send", { to, subject, text, link, context: typedContext }, {
     attempts: 3,
     backoff: { type: "exponential", delay: 5000 },
     removeOnComplete: 100,
     removeOnFail: 500
   });
+  logger.info("Email queued", audit);
+  return { queued: true, blocked: false };
 };
 
 /**
@@ -400,10 +481,8 @@ export const enqueueBroadcastReceipts = async (
   const scheduledAt = new Date(runAt);
   if (Number.isNaN(scheduledAt.getTime())) throw new Error("Invalid broadcast receipt run time");
   const digest = createHash("sha256").update(ids.join(",")).digest("hex").slice(0, 24);
-  const path = require("path");
-  const legacyRoot = path.resolve(__dirname, "..", "..", "legacy-src");
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const BroadcastPushReceipt = require(path.join(legacyRoot, "models", "BroadcastPushReceipt.js"));
+  const BroadcastPushReceipt = require(path.join(backendRootPath, "models", "BroadcastPushReceipt.js"));
   const broadcastIds = (await BroadcastPushReceipt.distinct("broadcast", { _id: { $in: ids } })).map(String);
   await broadcastQueue.add(
     "reconcile-receipts",
@@ -437,14 +516,12 @@ let broadcastRecoveryTimer: NodeJS.Timeout | null = null;
 
 const recoverDueBroadcasts = async (): Promise<void> => {
   try {
-    const path = require("path");
-    const legacyRoot = path.resolve(__dirname, "..", "..", "legacy-src");
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const Broadcast = require(path.join(legacyRoot, "models", "Broadcast.js"));
+    const Broadcast = require(path.join(backendRootPath, "models", "Broadcast.js"));
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const BroadcastPushReceipt = require(path.join(legacyRoot, "models", "BroadcastPushReceipt.js"));
+    const BroadcastPushReceipt = require(path.join(backendRootPath, "models", "BroadcastPushReceipt.js"));
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const PushDeliveryAttempt = require(path.join(legacyRoot, "models", "PushDeliveryAttempt.js"));
+    const PushDeliveryAttempt = require(path.join(backendRootPath, "models", "PushDeliveryAttempt.js"));
     const horizon = new Date(Date.now() + 5 * 60 * 1000);
     const staleLease = new Date(Date.now() - 15 * 60 * 1000);
 
@@ -473,7 +550,7 @@ const recoverDueBroadcasts = async (): Promise<void> => {
       }
     );
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const genericPushService = require(path.join(legacyRoot, "utils", "pushNotificationService.js"));
+    const genericPushService = require(path.join(backendRootPath, "utils", "pushNotificationService.js"));
     if (expiredGenericSendLeases.length) {
       await genericPushService.refreshPushDeliveryRequests(
         Array.from(new Set(expiredGenericSendLeases.map((attempt: { requestKey: string }) => attempt.requestKey)))

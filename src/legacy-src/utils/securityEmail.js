@@ -49,7 +49,12 @@ const enqueuePasswordSecurityEmail = async ({ to, eventType }) => {
     template.subject,
     template.text,
     securitySettingsUrl(),
-    { intent: EMAIL_INTENTS.SECURITY, eventType }
+    {
+      intent: EMAIL_INTENTS.SECURITY,
+      eventType,
+      templateKey: `security_${eventType}`,
+      triggerSource: 'security.password'
+    }
   );
   return { queued: true };
 };

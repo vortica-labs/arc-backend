@@ -1,6 +1,12 @@
 const nodemailer = require('nodemailer');
 const log = require('./logger');
 const { EMAIL_INTENTS, evaluateEmailPolicy } = require('./notificationChannelPolicy');
+const {
+  buildEmailAuditContext,
+  captureEmailCallStack,
+  hashEmailAuditValue,
+  sanitizeEmailAuditError
+} = require('./emailAudit');
 
 let transporter = null;
 
@@ -27,21 +33,45 @@ function getTransporter() {
 /**
  * Send a generic email
  */
-async function sendMail({ to, subject, text, html, intent, eventType, notificationType }) {
+async function sendMail({
+  to,
+  subject,
+  text,
+  html,
+  intent,
+  eventType,
+  notificationType,
+  templateKey,
+  triggerSource,
+  producerStack
+}) {
   const policy = evaluateEmailPolicy({ intent, eventType, notificationType });
+  const audit = buildEmailAuditContext({
+    to,
+    intent: policy.intent || intent,
+    eventType: policy.eventType || eventType,
+    notificationType,
+    templateKey,
+    triggerSource,
+    producerStack,
+    callStack: captureEmailCallStack()
+  });
   if (!policy.allowed) {
     log.info('Email suppressed by channel policy', {
-      intent: policy.intent || 'missing',
-      eventType: eventType || notificationType || '',
+      ...audit,
       reason: policy.reason,
       routineEventType: policy.routineEventType || ''
     });
     return { sent: false, blocked: true, reason: policy.reason };
   }
   const trans = getTransporter();
-  if (!trans) return { sent: false, error: 'Email not configured' };
+  if (!trans) {
+    log.warn('Email transport unavailable', audit);
+    return { sent: false, error: 'Email not configured' };
+  }
   try {
     const from = process.env.SMTP_FROM || process.env.SMTP_USER || 'ARC Gaming <noreply@arc.local>';
+    log.info('Email dispatch authorized', audit);
     const info = await trans.sendMail({
       from,
       to: Array.isArray(to) ? to.join(', ') : to,
@@ -49,15 +79,20 @@ async function sendMail({ to, subject, text, html, intent, eventType, notificati
       text: text || '',
       html: html || text
     });
+    log.info('Email provider accepted', {
+      ...audit,
+      providerMessageHash: hashEmailAuditValue(info.messageId)
+    });
     return { sent: true, messageId: info.messageId };
   } catch (err) {
-    console.error('Send mail error:', err);
-    return { sent: false, error: err.message };
+    const sanitizedError = sanitizeEmailAuditError(err);
+    log.error('Email provider rejected dispatch', { ...audit, error: sanitizedError });
+    return { sent: false, error: sanitizedError };
   }
 }
 
-async function sendTransactionalEmail({ to, subject, text, html, intent, eventType, notificationType }) {
-  return sendMail({ to, subject, text, html, intent, eventType, notificationType });
+async function sendTransactionalEmail(options) {
+  return sendMail(options);
 }
 
 /**
@@ -140,7 +175,10 @@ async function sendOTPEmail(to, otp, purpose = 'login') {
     text,
     html,
     intent: EMAIL_INTENTS.SECURITY,
-    eventType: `otp_${purpose}`
+    eventType: `otp_${purpose}`,
+    templateKey: 'security_otp',
+    triggerSource: 'auth.otp',
+    producerStack: captureEmailCallStack()
   });
 }
 
@@ -184,14 +222,14 @@ async function sendNotificationEmail(to, title, message, link, context = {}) {
     html,
     intent: context.intent,
     eventType: context.eventType,
-    notificationType: context.notificationType
+    notificationType: context.notificationType,
+    templateKey: context.templateKey || 'transactional_notification',
+    triggerSource: context.triggerSource,
+    producerStack: context.producerStack
   });
 }
 
 module.exports = {
-  getTransporter,
-  sendMail,
-  sendTransactionalEmail,
   sendOTPEmail,
   sendNotificationEmail,
   escapeHtml,

@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { body } from "express-validator";
-import { challengesController, protect } from "./challenges.legacy-adapters";
+import { challengesController, protect, publicOptionalAuth } from "./challenges.legacy-adapters";
 
 const router = Router();
 
@@ -55,13 +55,13 @@ const validateProgressUpdate = [
   body("progressValue").isNumeric().withMessage("Progress value must be a number").isFloat({ min: 0 }).withMessage("Progress value cannot be negative")
 ];
 
-router.get("/", challengesController.getChallenges);
-router.get("/:id", challengesController.getChallenge);
+router.get("/", publicOptionalAuth, challengesController.getChallenges);
+router.get("/my/challenges", protect, challengesController.getMyChallenges);
+router.get("/my/participations", protect, challengesController.getMyParticipations);
+router.get("/:id", publicOptionalAuth, challengesController.getChallenge);
 router.post("/", protect, ...validateChallenge, challengesController.createChallenge);
 router.post("/:id/join", protect, challengesController.joinChallenge);
 router.put("/:id/progress", protect, ...validateProgressUpdate, challengesController.updateProgress);
-router.get("/my/challenges", protect, challengesController.getMyChallenges);
-router.get("/my/participations", protect, challengesController.getMyParticipations);
 router.put("/:id", protect, challengesController.updateChallenge);
 router.delete("/:id", protect, challengesController.deleteChallenge);
 router.post("/:id/distribute-rewards", protect, challengesController.distributeRewards);

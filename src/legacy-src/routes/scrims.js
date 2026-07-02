@@ -11,18 +11,18 @@ const {
   deleteScrim,
   cancelScrim
 } = require('../controllers/scrimController');
-const { protect, optionalAuth } = require('../middleware/auth');
+const { protect, publicOptionalAuth } = require('../middleware/auth');
 
 // Scrim CRUD operations
 router.route('/')
-  .get(optionalAuth, getScrims)
+  .get(publicOptionalAuth, getScrims)
   .post(protect, createScrim);
 
 // Public shareable link route (must come before /:id route)
-router.get('/code/:code', getScrim);
+router.get('/code/:code', publicOptionalAuth, getScrim);
 
 router.route('/:id')
-  .get(getScrim)
+  .get(publicOptionalAuth, getScrim)
   .put(protect, updateScrim)
   .delete(protect, deleteScrim);
 
