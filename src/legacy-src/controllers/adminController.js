@@ -24,11 +24,16 @@ const MonetizationEligibility = require('../models/MonetizationEligibility');
 const CreatorEligibilityHistory = require('../models/CreatorEligibilityHistory');
 const MonetizationApplicationTimeline = require('../models/MonetizationApplicationTimeline');
 const HostVerificationApplication = require('../models/HostVerificationApplication');
+const Follow = require('../models/Follow');
+const FollowRequest = require('../models/FollowRequest');
 const mongoose = require('mongoose');
 const { createSystemNotification } = require('../utils/notificationService');
 const { EMAIL_INTENTS } = require('../utils/notificationChannelPolicy');
 const { enqueuePasswordSecurityEmail } = require('../utils/securityEmail');
 const { invalidateUserCache } = require('../middleware/auth');
+const { invalidateProfileCache } = require('../utils/profileCache');
+const { evictPresenceAudience } = require('../utils/presencePrivacy');
+const { disconnectUserSockets } = require('../utils/realtimePrivacy');
 const { PLATFORM_DEFAULT_CPM, getOrCreateCurrentCycle } = require('../services/CreatorEarningsCalculationService');
 const {
   applyManualDeliveryProgress,
@@ -40,7 +45,12 @@ const log = require('../utils/logger');
 const dayMs = 24 * 60 * 60 * 1000;
 
 const notificationEmail = (intent, eventType) => ({
-  email: { intent, eventType }
+  email: {
+    intent,
+    eventType,
+    templateKey: `admin_${eventType}`,
+    triggerSource: 'admin.system_notification'
+  }
 });
 
 const getDashboardRequestId = () => `admindash_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -623,7 +633,14 @@ const updateUserStatus = async (req, res) => {
       });
     }
 
-    await invalidateUserCache(userId);
+    await Promise.all([
+      invalidateUserCache(userId),
+      invalidateProfileCache(userId, user.username)
+    ]);
+    if (!isActive) {
+      evictPresenceAudience(global._arcSocketIO, userId);
+      await disconnectUserSockets(global._arcSocketIO, userId, 'account_suspended');
+    }
     await createSystemNotification(
       userId,
       isActive ? 'Account Access Restored' : 'Account Suspended',
@@ -685,8 +702,16 @@ const deleteUser = async (req, res) => {
         ]
       }),
       TeamRecruitment.updateMany({}, { $pull: { applicants: { user: userId } } }),
-      PlayerProfile.updateMany({}, { $pull: { interestedTeams: { team: userId } } })
+      PlayerProfile.updateMany({}, { $pull: { interestedTeams: { team: userId } } }),
+      Follow.deleteMany({ $or: [{ follower: userId }, { following: userId }] }),
+      FollowRequest.deleteMany({ $or: [{ requester: userId }, { target: userId }] })
     ]);
+    await Promise.all([
+      invalidateUserCache(userId),
+      invalidateProfileCache(userId, user.username)
+    ]);
+    evictPresenceAudience(global._arcSocketIO, userId);
+    await disconnectUserSockets(global._arcSocketIO, userId, 'account_deleted');
 
     res.json({
       success: true,
@@ -913,8 +938,17 @@ const updateReport = async (req, res) => {
     } else if (adminAction === 'ban_user') {
       const post = await Post.findById(report.targetId).select('author');
       if (post?.author) {
-        await User.findByIdAndUpdate(post.author, { isActive: false });
-        await invalidateUserCache(post.author);
+        const suspendedUser = await User.findByIdAndUpdate(
+          post.author,
+          { isActive: false },
+          { new: true }
+        ).select('username');
+        await Promise.all([
+          invalidateUserCache(post.author),
+          invalidateProfileCache(post.author, suspendedUser?.username)
+        ]);
+        evictPresenceAudience(global._arcSocketIO, post.author);
+        await disconnectUserSockets(global._arcSocketIO, post.author, 'account_suspended');
         await createSystemNotification(
           post.author,
           'Account Suspended',

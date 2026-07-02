@@ -76,6 +76,21 @@ const getUserIdString = (value) => {
   return value.toString();
 };
 
+const hasBlockedUser = (user, otherId) => {
+  const expected = getUserIdString(otherId);
+  return Array.isArray(user?.blockedUsers)
+    && user.blockedUsers.some((entry) => getUserIdString(entry) === expected);
+};
+
+const canPrivacyMatchUsers = (userA, userB) => Boolean(
+  userA
+  && userB
+  && userA.isActive !== false
+  && userB.isActive !== false
+  && !hasBlockedUser(userA, userB._id)
+  && !hasBlockedUser(userB, userA._id)
+);
+
 const getMembershipTier = (user) => user?.membership?.tier || 'free';
 
 const getPremiumSnapshot = (user) => ({
@@ -116,8 +131,6 @@ const buildConnectionPayload = (connection) => {
       displayName: p.displayName,
       avatar: p.avatar,
       videoEnabled: p.videoEnabled,
-      isPremium: Boolean(p.isPremium),
-      membershipTier: p.membershipTier || 'free',
       readyAt: p.readyAt || null
     })),
     selectedGame: obj.selectedGame || null,
@@ -403,11 +416,19 @@ const queueAndTryMatch = async ({
   // Authorization uses a short-lived cached user. Matchmaking gender must use
   // the canonical profile so a recent profile update cannot queue a stale or
   // empty value for several minutes.
-  const canonicalProfile = await User.findById(userId).select('profile.gender').lean();
+  const canonicalProfile = await User.findById(userId)
+    .select('profile.gender blockedUsers isActive')
+    .lean();
   if (!canonicalProfile) {
     throw createHttpError(404, {
       success: false,
       message: 'User profile not found'
+    });
+  }
+  if (canonicalProfile.isActive === false) {
+    throw createHttpError(403, {
+      success: false,
+      message: 'Random Connect is not available for inactive accounts'
     });
   }
   const userGender = normalizeMatchmakingGender(canonicalProfile.profile?.gender);
@@ -562,7 +583,8 @@ const queueAndTryMatch = async ({
   const matchOptions = {
     preferredGender: queuePreferredGender || null,
     currentGender: userGender,
-    currentEntry
+    currentEntry,
+    currentPrivacyUser: canonicalProfile
   };
 
   const match = await findMatch(userId, selectedGame, normalizedTags, matchOptions);
@@ -795,7 +817,12 @@ const scoreCandidate = ({ currentEntry, candidate, tags, selectedGame, currentGe
 const findMatch = async (userId, selectedGame, tags = [], options = {}) => {
   try {
     const userIdStr = userId.toString();
-    const { preferredGender, currentGender = '', currentEntry: providedCurrentEntry } = options;
+    const {
+      preferredGender,
+      currentGender = '',
+      currentEntry: providedCurrentEntry,
+      currentPrivacyUser: providedCurrentPrivacyUser
+    } = options;
     const currentEntry = providedCurrentEntry || await ConnectionQueue.findOne({ userId, status: 'waiting' }).lean();
     if (!currentEntry) return null;
     const normalizedCurrentEntry = {
@@ -831,15 +858,42 @@ const findMatch = async (userId, selectedGame, tags = [], options = {}) => {
       .limit(MATCH_BATCH_LIMIT)
       .lean();
 
+    const currentPrivacyUser = providedCurrentPrivacyUser || await User.findById(userId)
+      .select('_id blockedUsers isActive')
+      .lean();
+    if (!currentPrivacyUser || currentPrivacyUser.isActive === false) return null;
+    const candidateIds = potentialMatches.map((candidate) => candidate.userId).filter(Boolean);
+    const candidateUsers = candidateIds.length
+      ? await User.find({ _id: { $in: candidateIds }, isActive: { $ne: false } })
+        .select('_id blockedUsers isActive')
+        .lean()
+      : [];
+    const candidateUsersById = new Map(candidateUsers.map((candidate) => [
+      getUserIdString(candidate._id),
+      candidate
+    ]));
+    const privacyEligibleMatches = potentialMatches.filter((candidate) => {
+      const candidateUser = candidateUsersById.get(getUserIdString(candidate.userId));
+      const allowed = canPrivacyMatchUsers(currentPrivacyUser, candidateUser);
+      if (!allowed) {
+        logMatchDebug('Random Connect candidate rejected', {
+          userId: userIdStr,
+          candidateId: getUserIdString(candidate.userId),
+          reason: candidateUser ? 'blocked_relationship' : 'inactive_or_missing_user'
+        });
+      }
+      return allowed;
+    });
+
     logMatchDebug('Random Connect eligible candidates loaded', {
       userId: userIdStr,
       gender: normalizedCurrentEntry.gender || 'unspecified',
       preferredGender: normalizedCurrentEntry.preferredGender || 'any',
-      candidateCount: potentialMatches.length,
+      candidateCount: privacyEligibleMatches.length,
       fallbackExpanded: allowFallback
     });
 
-    const scored = potentialMatches
+    const scored = privacyEligibleMatches
       .map(candidate => scoreCandidate({
         currentEntry: normalizedCurrentEntry,
         candidate,
@@ -967,14 +1021,20 @@ const createConnectionForPair = async ({
   const user1Id = user1.userId || user1._id;
   const user2Id = user2.userId || user2._id;
   const [dbUser1, dbUser2, entitlement1, entitlement2] = await Promise.all([
-    User.findById(user1Id).select('username profile.displayName profile.avatar isPremium membership'),
-    User.findById(user2Id).select('username profile.displayName profile.avatar isPremium membership'),
+    User.findById(user1Id).select('username profile.displayName profile.avatar isPremium membership blockedUsers isActive'),
+    User.findById(user2Id).select('username profile.displayName profile.avatar isPremium membership blockedUsers isActive'),
     resolveRandomConnectEntitlement({ userId: user1Id, requestSource: 'matchmaking' }),
     resolveRandomConnectEntitlement({ userId: user2Id, requestSource: 'matchmaking' })
   ]);
 
   if (!dbUser1 || !dbUser2) {
     throw new Error('Matched user profile not found');
+  }
+  if (!canPrivacyMatchUsers(dbUser1, dbUser2)) {
+    const error = new Error('Matched users are no longer mutually eligible');
+    error.status = 409;
+    error.code = 'RANDOM_CONNECT_PRIVACY_CONFLICT';
+    throw error;
   }
 
   const policy = buildSessionPolicy(entitlement1, entitlement2);
@@ -1823,9 +1883,11 @@ module.exports = {
     buildCompatiblePreferenceQuery,
     isPremiumUser,
     buildSessionPolicy,
+    buildConnectionPayload,
     scoreCandidate,
     buildSessionPolicyPayload,
     buildGenderFilterUserIds,
+    canPrivacyMatchUsers,
     cleanupCommittedPairQueue,
     getEntitlementStatus
   }

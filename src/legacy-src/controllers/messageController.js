@@ -1,10 +1,26 @@
 const { Message, ChatRoom } = require('../models/Message');
 const User = require('../models/User');
+const Follow = require('../models/Follow');
 const Post = require('../models/Post');
 const Notification = require('../models/Notification');
 const { uploadMultipleFiles } = require('../utils/cloudinary');
 const { createMessageNotification } = require('../utils/notificationService');
+const { getCallSessionForParticipant } = require('../services/callSessionService');
 const log = require('../utils/logger');
+const {
+  idString,
+  normalizePrivacySettings,
+  resolvePrivacyAccess,
+  resolvePostAccess,
+  filterPostsForViewer
+} = require('../utils/privacyPolicy');
+const { revokeChatRoomAccess } = require('../utils/realtimePrivacy');
+const {
+  isCurrentGroupMember,
+  getGroupMembershipWindow,
+  groupHistoryBoundary,
+  canReadGroupMessageAt
+} = require('../utils/groupMembershipPrivacy');
 
 // Get io instance from server
 let io;
@@ -12,7 +28,7 @@ const setIoInstance = (ioInstance) => {
   io = ioInstance;
 };
 
-const sharedPostSelect = 'content.text content.media author likes comments shares createdAt postType';
+const sharedPostSelect = 'content.text content.media author likes comments shares createdAt postType visibility isActive hiddenByAdmin';
 const sharedPostAuthorSelect = 'username profile.displayName profile.avatar profilePicture avatar profileImage avatarUrl userType role';
 
 const getMessageKind = ({ media = [], sharedPost, sharedProfile, replyTo, forwardedFrom, invite }) => {
@@ -25,8 +41,8 @@ const getMessageKind = ({ media = [], sharedPost, sharedProfile, replyTo, forwar
   return 'text';
 };
 
-function formatActivityStatus(lastSeen, showActivityStatus) {
-  if (!showActivityStatus || !lastSeen) return null;
+function formatActivityStatus(lastSeen, privacySettings) {
+  if (!normalizePrivacySettings(privacySettings).showOnlineStatus || !lastSeen) return null;
   const diffMs = Date.now() - new Date(lastSeen).getTime();
   const diffMin = Math.floor(diffMs / 60000);
   if (diffMin < 5) return 'Active now';
@@ -36,6 +52,60 @@ function formatActivityStatus(lastSeen, showActivityStatus) {
   const diffDay = Math.floor(diffHr / 24);
   return `Active ${diffDay} day${diffDay !== 1 ? 's' : ''} ago`;
 }
+
+/**
+ * readBy is required internally for unread counters, but readAt is realtime
+ * activity metadata. Only expose another user's receipt when that user permits
+ * the authenticated viewer to see online activity.
+ */
+const redactMessageReadReceipts = async (messages, viewer) => {
+  const list = Array.isArray(messages) ? messages : [messages];
+  const viewerId = idString(viewer);
+  const readerIds = [...new Set(list.flatMap((message) => (
+    Array.isArray(message?.readBy) ? message.readBy.map((entry) => idString(entry?.user)) : []
+  )).filter((readerId) => readerId && readerId !== viewerId))];
+
+  const visibleReaderIds = new Set(viewerId ? [viewerId] : []);
+  if (readerIds.length > 0) {
+    const readers = await User.find({ _id: { $in: readerIds }, isActive: true })
+      .select('_id userType privacySettings blockedUsers isActive')
+      .lean();
+    const decisions = await Promise.all(readers.map(async (reader) => ({
+      readerId: idString(reader),
+      relationship: await resolvePrivacyAccess({
+        viewer,
+        targetUser: reader,
+        existingConversation: true
+      })
+    })));
+    decisions.forEach(({ readerId, relationship }) => {
+      if (relationship.access.canSeeOnlineStatus) visibleReaderIds.add(readerId);
+    });
+  }
+
+  list.forEach((message) => {
+    if (!Array.isArray(message?.readBy)) return;
+    message.readBy = message.readBy.filter((entry) => visibleReaderIds.has(idString(entry?.user)));
+  });
+  return messages;
+};
+
+const canAccessMessageForForwarding = async (message, userId) => {
+  if (!message) return false;
+  if (message.messageType !== 'group') {
+    return [message.sender, message.recipient]
+      .some((participant) => idString(participant) === idString(userId));
+  }
+  const chatRoom = await ChatRoom.findOne({
+    _id: message.chatRoom,
+    isActive: true,
+    'members.user': userId
+  }).select('members.user members.joinedAt createdAt').lean();
+  return canReadGroupMessageAt(
+    getGroupMembershipWindow(chatRoom, userId),
+    message.createdAt
+  );
+};
 
 // Send direct message
 const sendDirectMessage = async (req, res) => {
@@ -50,10 +120,12 @@ const sendDirectMessage = async (req, res) => {
     // Resolve recipient by username (preferred) or by id
     let recipient;
     if (recipientUsername && typeof recipientUsername === 'string' && recipientUsername.trim()) {
-      recipient = await User.findOne({ username: recipientUsername.trim(), isActive: true }).select('+privacySettings +following username isActive');
+      recipient = await User.findOne({ username: recipientUsername.trim(), isActive: true })
+        .select('username userType profile privacySettings blockedUsers isActive');
     } else if (recipientId) {
       const id = typeof recipientId === 'string' ? recipientId.replace(/^direct_/, '').trim() : String(recipientId);
-      if (id) recipient = await User.findById(id).select('+privacySettings +following username isActive');
+      if (id) recipient = await User.findById(id)
+        .select('username userType profile privacySettings blockedUsers isActive');
     }
     if (!recipientId && !recipientUsername) {
       return res.status(400).json({ success: false, message: 'Recipient (username or id) is required' });
@@ -72,38 +144,56 @@ const sendDirectMessage = async (req, res) => {
       });
     }
 
-    // DM privacy check: whoCanMessage
-    // Skip if recipient already initiated the conversation (sent a message to sender first)
-    const recipientPrivacy = recipient.privacySettings?.whoCanMessage || 'anyone';
-    if (recipientPrivacy !== 'anyone') {
-      const recipientInitiated = await Message.exists({
-        messageType: 'direct',
-        sender: recipientIdResolved,
-        recipient: senderId,
-        isDeleted: false
+    const existingConversation = Boolean(await Message.exists({
+      messageType: 'direct',
+      isDeleted: false,
+      $or: [
+        { sender: recipientIdResolved, recipient: senderId },
+        { sender: senderId, recipient: recipientIdResolved }
+      ]
+    }));
+    const recipientAccess = await resolvePrivacyAccess({
+      viewer: req.user,
+      targetUser: recipient,
+      existingConversation
+    });
+    if (!recipientAccess.access.canMessage) {
+      const reason = recipientAccess.blocked
+        ? 'blocked'
+        : recipientAccess.settings.allowMessageFrom === 'followers' ? 'not_follower' : 'messages_disabled';
+      return res.status(403).json({
+        success: false,
+        code: 'MESSAGE_PRIVACY_RESTRICTED',
+        reason,
+        message: reason === 'not_follower'
+          ? 'Only approved followers can start a conversation with this user'
+          : 'This user is not accepting new conversations',
+        targetUsername: recipient.username,
+        privacyAccess: recipientAccess.access
       });
-      if (!recipientInitiated) {
-        if (recipientPrivacy === 'nobody') {
-          return res.status(403).json({ success: false, reason: 'dm_privacy_blocked', targetUsername: recipient.username });
-        }
-        if (recipientPrivacy === 'people_you_follow') {
-          const recipientWithFollowing = await User.findById(recipientIdResolved).select('following');
-          const recipientFollowsSender = recipientWithFollowing.following && recipientWithFollowing.following.some(
-            id => id.toString() === senderId.toString()
-          );
-          if (!recipientFollowsSender) {
-            return res.status(403).json({ success: false, reason: 'dm_privacy_blocked', targetUsername: recipient.username });
-          }
-        }
-      }
     }
 
     // Handle shared post (rich preview in DM)
     let sharedPostObj = null;
     if (sharedPostId) {
-      const post = await Post.findById(sharedPostId).select('_id author content').lean();
+      const post = await Post.findById(sharedPostId)
+        .select('_id author content visibility isActive hiddenByAdmin')
+        .lean();
       if (!post) {
         return res.status(400).json({ success: false, message: 'Post not found' });
+      }
+      const postAccess = await resolvePostAccess({ post, viewer: req.user });
+      if (!postAccess.allowed) {
+        return res.status(403).json({ success: false, code: 'PRIVACY_RESTRICTED', reason: postAccess.reason, message: 'You cannot share this post' });
+      }
+      const recipientPostAccess = await resolvePostAccess({ post, viewer: recipient });
+      if (!recipientPostAccess.allowed) {
+        return res.status(403).json({
+          success: false,
+          code: 'RECIPIENT_POST_PRIVACY_RESTRICTED',
+          reason: recipientPostAccess.reason,
+          message: 'The recipient cannot access this post'
+        });
       }
       sharedPostObj = sharedPostId;
     }
@@ -111,9 +201,24 @@ const sendDirectMessage = async (req, res) => {
     // Handle shared profile (rich preview in DM)
     let sharedProfileObj = null;
     if (sharedProfileUsername) {
-      const profileUser = await User.findOne({ username: sharedProfileUsername, isActive: true }).select('_id username profile.displayName profile.avatar profile.bio').lean();
+      const profileUser = await User.findOne({ username: sharedProfileUsername, isActive: true })
+        .select('_id username userType profile privacySettings blockedUsers isActive')
+        .lean();
       if (!profileUser) {
         return res.status(400).json({ success: false, message: 'Profile not found' });
+      }
+      const profileAccess = await resolvePrivacyAccess({ viewer: req.user, targetUser: profileUser });
+      if (!profileAccess.access.canViewProfile) {
+        return res.status(403).json({ success: false, code: 'PRIVACY_RESTRICTED', reason: profileAccess.access.reason, message: 'You cannot share this profile' });
+      }
+      const recipientProfileAccess = await resolvePrivacyAccess({ viewer: recipient, targetUser: profileUser });
+      if (!recipientProfileAccess.access.canViewProfile) {
+        return res.status(403).json({
+          success: false,
+          code: 'RECIPIENT_PROFILE_PRIVACY_RESTRICTED',
+          reason: recipientProfileAccess.access.reason,
+          message: 'The recipient cannot access this profile'
+        });
       }
       sharedProfileObj = profileUser._id;
     }
@@ -124,13 +229,22 @@ const sendDirectMessage = async (req, res) => {
     
     if (forwardedFrom) {
       // Get the original message
-      const originalMessage = await Message.findById(forwardedFrom).populate('sender', 'username profile.displayName profile.avatar');
-      if (originalMessage) {
+      const originalMessage = await Message.findOne({
+        _id: forwardedFrom,
+        $or: [
+          { sender: senderId },
+          { recipient: senderId },
+          { 'readBy.user': senderId }
+        ]
+      }).populate('sender', 'username profile.displayName profile.avatar');
+      if (originalMessage && await canAccessMessageForForwarding(originalMessage, senderId)) {
         // Use original message content
         messageText = typeof originalMessage.content === 'string' 
           ? originalMessage.content 
           : (originalMessage.content?.text || '');
         mediaData = originalMessage.content?.media || [];
+      } else {
+        return res.status(400).json({ success: false, code: 'INVALID_FORWARD_TARGET', message: 'Message cannot be forwarded' });
       }
     } else {
       // Handle media uploads for new messages
@@ -196,6 +310,24 @@ const sendDirectMessage = async (req, res) => {
       messageData.sharedProfile = sharedProfileObj;
     }
 
+    if (replyTo) {
+      const replyMessage = await Message.exists({
+        _id: replyTo,
+        messageType: 'direct',
+        $or: [
+          { sender: senderId, recipient: recipientIdResolved },
+          { sender: recipientIdResolved, recipient: senderId }
+        ]
+      });
+      if (!replyMessage) {
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_REPLY_TARGET',
+          message: 'Reply target is not part of this conversation'
+        });
+      }
+    }
+
     const message = await Message.create(messageData);
     
     // Populate sender, recipient, sharedPost for rich preview
@@ -205,7 +337,7 @@ const sendDirectMessage = async (req, res) => {
       { path: 'replyTo', select: 'content.text sender', populate: { path: 'sender', select: 'username profile.displayName' } },
       { path: 'forwardedFrom', select: 'content.text content.media sender', populate: { path: 'sender', select: 'username profile.displayName profile.avatar' } },
       { path: 'sharedPost', select: sharedPostSelect, populate: { path: 'author', select: sharedPostAuthorSelect } },
-      { path: 'sharedProfile', select: 'username profile.displayName profile.avatar profile.bio' }
+      { path: 'sharedProfile', select: 'username profile.displayName profile.avatar' }
     ]);
 
     // Plain object so nested populated (e.g. sharedPost.author) serializes correctly in JSON/socket
@@ -294,7 +426,7 @@ const getDirectMessages = async (req, res) => {
     .populate('forwardedFrom.sender', 'username profile.displayName profile.avatar')
     .populate('sharedPost', sharedPostSelect)
     .populate('sharedPost.author', sharedPostAuthorSelect)
-    .populate('sharedProfile', 'username profile.displayName profile.avatar profile.bio')
+    .populate('sharedProfile', 'username profile.displayName profile.avatar')
     .populate('reactions.user', 'username profile.displayName')
     .sort({ createdAt: -1 })
     .skip(skip)
@@ -318,6 +450,17 @@ const getDirectMessages = async (req, res) => {
         }
       ]
     });
+
+    for (const message of messages) {
+      if (message.sharedPost) {
+        const access = await resolvePostAccess({ post: message.sharedPost, viewer: req.user });
+        if (!access.allowed) {
+          message.sharedPost = null;
+          message.sharedPostCaption = '';
+        }
+      }
+    }
+    await redactMessageReadReceipts(messages, req.user);
 
     res.status(200).json({
       success: true,
@@ -352,7 +495,7 @@ const createChatRoom = async (req, res) => {
 
     if (memberIds && memberIds.length > 0) {
       const validMembers = await User.find({ _id: { $in: memberIds }, isActive: true })
-        .select('username privacySettings following');
+        .select('username privacySettings blockedUsers');
       if (validMembers.length !== memberIds.length) {
         return res.status(400).json({
           success: false,
@@ -360,15 +503,24 @@ const createChatRoom = async (req, res) => {
         });
       }
 
+      const relationshipRestrictedIds = validMembers
+        .filter((member) => member.privacySettings?.whoCanAddToGroup === 'people_you_follow')
+        .map((member) => member._id);
+      const membersFollowingCreator = new Set((relationshipRestrictedIds.length > 0
+        ? await Follow.find({
+            follower: { $in: relationshipRestrictedIds },
+            following: creatorId
+          }).distinct('follower')
+        : []).map(String));
+
       for (const member of validMembers) {
         const privacy = member.privacySettings?.whoCanAddToGroup || 'anyone';
-        let blocked = false;
+        let blocked = (req.user.blockedUsers || []).some((id) => idString(id) === idString(member))
+          || (member.blockedUsers || []).some((id) => idString(id) === idString(creatorId));
         if (privacy === 'nobody') {
           blocked = true;
         } else if (privacy === 'people_you_follow') {
-          const followsCreator = member.following &&
-            member.following.some(id => id.toString() === creatorId.toString());
-          if (!followsCreator) blocked = true;
+          if (!membersFollowingCreator.has(member._id.toString())) blocked = true;
         }
         if (blocked) {
           blockedMembers.push({ _id: member._id, username: member.username });
@@ -452,7 +604,7 @@ const getChatRooms = async (req, res) => {
     const chatRooms = await ChatRoom.find({
       $or: [
         { 'members.user': userId, isActive: true },
-        { 'removedMembers.user': userId }
+        { 'removedMembers.user': userId, isActive: true }
       ]
     })
     .populate('members.user', 'username profile.displayName profile.avatar')
@@ -464,15 +616,23 @@ const getChatRooms = async (req, res) => {
 
     // Transform chat rooms to match frontend expectations
     const transformedChatRooms = await Promise.all(chatRooms.map(async (room) => {
+      const currentMember = isCurrentGroupMember(room, userId);
+      const membershipWindow = getGroupMembershipWindow(room, userId);
+      const historyBoundary = groupHistoryBoundary(membershipWindow);
       let lastVisibleMessage = room.lastMessage;
       const lastDeletedForUser = lastVisibleMessage?.deletedForUsers?.some?.(
         entry => entry.user && entry.user.toString() === userId.toString()
       );
-      if (lastVisibleMessage?.deletedForEveryone || lastDeletedForUser) {
+      const lastMessageOutsideMembership = Boolean(
+        lastVisibleMessage?.createdAt
+        && !canReadGroupMessageAt(membershipWindow, lastVisibleMessage.createdAt)
+      );
+      if (lastVisibleMessage?.deletedForEveryone || lastDeletedForUser || lastMessageOutsideMembership) {
         lastVisibleMessage = await Message.findOne({
           chatRoom: room._id,
           messageType: 'group',
           deletedForEveryone: { $ne: true },
+          ...historyBoundary,
           $or: [
             { deletedForUsers: { $exists: false } },
             { deletedForUsers: { $size: 0 } },
@@ -480,7 +640,6 @@ const getChatRooms = async (req, res) => {
           ]
         }).sort({ createdAt: -1 }).lean();
       }
-
       // Get unread count for this user (exclude messages sent by this user)
       const unreadCount = await Message.countDocuments({
         chatRoom: room._id,
@@ -488,6 +647,7 @@ const getChatRooms = async (req, res) => {
         sender: { $ne: userId },
         'readBy.user': { $ne: userId },
         deletedForEveryone: { $ne: true },
+        ...historyBoundary,
         $or: [
           { deletedForUsers: { $exists: false } },
           { deletedForUsers: { $size: 0 } },
@@ -503,6 +663,7 @@ const getChatRooms = async (req, res) => {
         'readBy.user': { $ne: userId },
         mentions: userId,
         deletedForEveryone: { $ne: true },
+        ...historyBoundary,
         $or: [
           { deletedForUsers: { $exists: false } },
           { deletedForUsers: { $size: 0 } },
@@ -513,15 +674,15 @@ const getChatRooms = async (req, res) => {
       return {
         _id: room._id,
         name: room.name,
-        description: room.description,
-        avatar: room.avatar,
+        description: currentMember ? room.description : '',
+        avatar: currentMember ? room.avatar : '',
         roomType: room.roomType,
         creator: {
           _id: room.creator._id,
           username: room.creator.username || room.creator.profile?.displayName,
           profile: room.creator.profile
         },
-        members: room.members.map(member => ({
+        members: currentMember ? room.members.map(member => ({
           user: {
             _id: member.user._id,
             username: member.user.username || member.user.profile?.displayName,
@@ -529,18 +690,20 @@ const getChatRooms = async (req, res) => {
           },
           role: member.role,
           joinedAt: member.joinedAt
-        })),
-        memberCount: room.members.length,
+        })) : [],
+        memberCount: currentMember ? room.members.length : 0,
         lastMessage: lastVisibleMessage ? {
           content: lastVisibleMessage.content,
           sender: lastVisibleMessage.sender,
           createdAt: lastVisibleMessage.createdAt
         } : null,
         unreadCount,
-        lastActivity: room.lastActivity,
+        lastActivity: lastVisibleMessage?.createdAt || membershipWindow?.from || null,
         isMentioned: !!isMentioned,
-        isRemoved: !room.members.some(m => m.user._id.toString() === userId.toString()),
-        memberPermissions: room.memberPermissions || { editGroupSettings: true, sendMessages: true, addMembers: true }
+        isRemoved: !currentMember,
+        memberPermissions: currentMember
+          ? (room.memberPermissions || { editGroupSettings: true, sendMessages: true, addMembers: true })
+          : { editGroupSettings: false, sendMessages: false, addMembers: false }
       };
     }));
 
@@ -554,7 +717,7 @@ const getChatRooms = async (req, res) => {
     const total = await ChatRoom.countDocuments({
       $or: [
         { 'members.user': userId, isActive: true },
-        { 'removedMembers.user': userId }
+        { 'removedMembers.user': userId, isActive: true }
       ]
     });
 
@@ -647,10 +810,16 @@ const getRecentConversations = async (req, res) => {
     const populatedConversations = await Promise.all(
       conversations.map(async (conv) => {
         const otherUser = await User.findById(conv._id)
-          .select('username profile.displayName profile.avatar role userType lastSeen privacySettings.showActivityStatus')
+          .select('username profile.displayName profile.avatar role userType lastSeen privacySettings blockedUsers isActive')
           .lean();
 
-        if (!otherUser) return null;
+        if (!otherUser || !otherUser.isActive) return null;
+
+        const presenceAccess = await resolvePrivacyAccess({
+          viewer: req.user,
+          targetUser: otherUser,
+          existingConversation: true
+        });
 
         // Get unread count
         const unreadCount = await Message.countDocuments({
@@ -673,7 +842,10 @@ const getRecentConversations = async (req, res) => {
             username: otherUser.username || otherUser.profile?.displayName,
             profilePicture: otherUser.profile?.avatar,
             role: otherUser.role || otherUser.userType,
-            activityStatus: formatActivityStatus(otherUser.lastSeen, otherUser.privacySettings?.showActivityStatus ?? true)
+            canSeeOnlineStatus: presenceAccess.access.canSeeOnlineStatus,
+            activityStatus: presenceAccess.access.canSeeOnlineStatus
+              ? formatActivityStatus(otherUser.lastSeen, otherUser.privacySettings)
+              : null
           }],
           lastMessage: {
             content: conv.lastMessage.content,
@@ -798,22 +970,61 @@ const sendGroupMessage = async (req, res) => {
     let sharedPostObj = null;
 
     if (sharedPostId) {
-      const post = await Post.findById(sharedPostId).select('_id author content').lean();
+      const post = await Post.findById(sharedPostId)
+        .select('_id author content visibility isActive hiddenByAdmin')
+        .lean();
       if (!post) {
         return res.status(400).json({ success: false, message: 'Post not found' });
+      }
+      const senderPostAccess = await resolvePostAccess({ post, viewer: req.user });
+      if (!senderPostAccess.allowed) {
+        return res.status(403).json({
+          success: false,
+          code: 'PRIVACY_RESTRICTED',
+          reason: senderPostAccess.reason,
+          message: 'You cannot share this post'
+        });
+      }
+
+      // This message is emitted once to the whole room. A rich preview is only
+      // safe when every active current member can view the source post.
+      const activeMembers = await User.find({
+        _id: { $in: chatRoom.members.map((member) => member.user) },
+        isActive: true
+      }).select('_id userType privacySettings blockedUsers isActive').lean();
+      const memberAccess = await Promise.all(activeMembers.map((member) => (
+        resolvePostAccess({ post, viewer: member })
+      )));
+      const unauthorizedMember = memberAccess.find((access) => !access.allowed);
+      if (unauthorizedMember) {
+        return res.status(403).json({
+          success: false,
+          code: 'GROUP_POST_PRIVACY_RESTRICTED',
+          reason: unauthorizedMember.reason,
+          message: 'This post is not visible to every active group member'
+        });
       }
       sharedPostObj = sharedPostId;
     }
     
     if (forwardedFrom) {
       // Get the original message
-      const originalMessage = await Message.findById(forwardedFrom).populate('sender', 'username profile.displayName profile.avatar');
-      if (originalMessage) {
+      const originalMessage = await Message.findOne({
+        _id: forwardedFrom,
+        $or: [
+          { sender: senderId },
+          { recipient: senderId },
+          { 'readBy.user': senderId }
+        ]
+      }).populate('sender', 'username profile.displayName profile.avatar');
+      if (originalMessage && await canAccessMessageForForwarding(originalMessage, senderId)) {
         // Use original message content
         messageText = typeof originalMessage.content === 'string' 
           ? originalMessage.content 
           : (originalMessage.content?.text || '');
         mediaData = originalMessage.content?.media || [];
+      } else {
+        return res.status(400).json({ success: false, code: 'INVALID_FORWARD_TARGET', message: 'Message cannot be forwarded' });
       }
     } else {
       // Handle media uploads for new messages
@@ -862,6 +1073,21 @@ const sendGroupMessage = async (req, res) => {
       messageData.sharedPost = sharedPostObj;
       if (sharedPostCaption && sharedPostCaption.trim()) {
         messageData.sharedPostCaption = sharedPostCaption.trim();
+      }
+    }
+
+    if (replyTo) {
+      const replyMessage = await Message.exists({
+        _id: replyTo,
+        messageType: 'group',
+        chatRoom: chatRoomId
+      });
+      if (!replyMessage) {
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_REPLY_TARGET',
+          message: 'Reply target is not part of this chat room'
+        });
       }
     }
 
@@ -1029,9 +1255,9 @@ const getGroupMessages = async (req, res) => {
       });
     }
 
-    const isMember = chatRoom.members.some(member => member.user.toString() === userId.toString());
+    const isMember = isCurrentGroupMember(chatRoom, userId);
     // Also allow removed members to view history (read-only)
-    const wasEverMember = isMember || 
+    const wasEverMember = isMember ||
       (chatRoom.removedMembers && chatRoom.removedMembers.some(m => m.user.toString() === userId.toString()));
     if (!wasEverMember) {
       return res.status(403).json({
@@ -1039,11 +1265,14 @@ const getGroupMessages = async (req, res) => {
         message: 'You are not a member of this chat room'
       });
     }
+    const membershipWindow = getGroupMembershipWindow(chatRoom, userId);
+    const historyBoundary = groupHistoryBoundary(membershipWindow);
 
     const messages = await Message.find({
       chatRoom: chatRoomId,
       messageType: 'group',
       deletedForEveryone: { $ne: true },
+      ...historyBoundary,
       $and: [
         {
           $or: [
@@ -1064,12 +1293,14 @@ const getGroupMessages = async (req, res) => {
     .populate('mentions', 'username profile.displayName profile.avatar')
     .sort({ createdAt: -1 })
     .skip(skip)
-    .limit(limit);
+    .limit(limit)
+    .lean();
 
     const total = await Message.countDocuments({
       chatRoom: chatRoomId,
       messageType: 'group',
       deletedForEveryone: { $ne: true },
+      ...historyBoundary,
       $and: [
         {
           $or: [
@@ -1080,6 +1311,17 @@ const getGroupMessages = async (req, res) => {
         }
       ]
     });
+
+    const sharedPosts = messages.map((message) => message.sharedPost).filter(Boolean);
+    const visibleSharedPosts = await filterPostsForViewer(sharedPosts, req.user);
+    const visibleSharedPostIds = new Set(visibleSharedPosts.map((post) => idString(post)));
+    for (const message of messages) {
+      if (message.sharedPost && !visibleSharedPostIds.has(idString(message.sharedPost))) {
+        message.sharedPost = null;
+        message.sharedPostCaption = '';
+      }
+    }
+    await redactMessageReadReceipts(messages, req.user);
 
     res.status(200).json({
       success: true,
@@ -1107,6 +1349,13 @@ const markMessagesAsRead = async (req, res) => {
     const { chatId, messageType } = req.body;
     const userId = req.user._id;
 
+    if (typeof chatId !== 'string' || !chatId.trim() || !['direct', 'group'].includes(messageType)) {
+      return res.status(400).json({
+        success: false,
+        message: 'A valid chatId and messageType are required'
+      });
+    }
+
     let filter = {
       'readBy.user': { $ne: userId },
       deletedForEveryone: { $ne: true },
@@ -1116,10 +1365,15 @@ const markMessagesAsRead = async (req, res) => {
         { deletedForUsers: { $not: { $elemMatch: { user: userId } } } }
       ]
     };
+    let groupMembershipWindow = null;
 
     if (messageType === 'direct') {
       // For direct messages, mark messages from the other user as read
       const otherUserId = chatId.replace('direct_', '');
+      const mongoose = require('mongoose');
+      if (!mongoose.Types.ObjectId.isValid(otherUserId)) {
+        return res.status(400).json({ success: false, message: 'Invalid direct conversation ID' });
+      }
       filter = {
         ...filter,
         messageType: 'direct',
@@ -1127,12 +1381,33 @@ const markMessagesAsRead = async (req, res) => {
         recipient: userId
       };
     } else {
+      const mongoose = require('mongoose');
+      if (!mongoose.Types.ObjectId.isValid(chatId)) {
+        return res.status(400).json({ success: false, message: 'Invalid chat room ID' });
+      }
+      const chatRoom = await ChatRoom.findOne({
+        _id: chatId,
+        isActive: true,
+        $or: [
+          { 'members.user': userId },
+          { 'removedMembers.user': userId }
+        ]
+      }).select('members.user members.joinedAt removedMembers.user removedMembers.joinedAt removedMembers.removedAt createdAt').lean();
+      if (!chatRoom) {
+        return res.status(403).json({
+          success: false,
+          code: 'MESSAGE_ACCESS_DENIED',
+          message: 'You cannot update messages in this chat room'
+        });
+      }
+      groupMembershipWindow = getGroupMembershipWindow(chatRoom, userId);
       // For group messages, mark all messages in the chat room as read (excluding own messages)
       filter = {
         ...filter,
         messageType: 'group',
         sender: { $ne: userId },
-        chatRoom: chatId
+        chatRoom: chatId,
+        ...groupHistoryBoundary(groupMembershipWindow)
       };
     }
 
@@ -1154,7 +1429,11 @@ const markMessagesAsRead = async (req, res) => {
       );
     } else {
       // For group chats, mark all unread message/mention notifications for this room
-      const roomMessages = await Message.find({ messageType: 'group', chatRoom: chatId }, '_id').lean();
+      const roomMessages = await Message.find({
+        messageType: 'group',
+        chatRoom: chatId,
+        ...groupHistoryBoundary(groupMembershipWindow)
+      }, '_id').lean();
       const roomMessageIds = roomMessages.map(m => m._id);
       await Notification.updateMany(
         { recipient: userId, type: { $in: ['message', 'mention'] }, isRead: false, 'data.messageId': { $in: roomMessageIds } },
@@ -1192,6 +1471,26 @@ const addReaction = async (req, res) => {
       return res.status(404).json({
         success: false,
         message: 'Message not found'
+      });
+    }
+
+    const isDirectParticipant = message.messageType === 'direct'
+      && [message.sender, message.recipient].some((participant) => idString(participant) === idString(userId));
+    let canAccessCurrentGroupMessage = false;
+    if (message.messageType === 'group' && message.chatRoom) {
+      const chatRoom = await ChatRoom.findOne({
+        _id: message.chatRoom,
+        isActive: true,
+        'members.user': userId
+      }).select('members.user members.joinedAt createdAt').lean();
+      const membershipWindow = getGroupMembershipWindow(chatRoom, userId);
+      canAccessCurrentGroupMessage = canReadGroupMessageAt(membershipWindow, message.createdAt);
+    }
+    if (!isDirectParticipant && !canAccessCurrentGroupMessage) {
+      return res.status(403).json({
+        success: false,
+        code: 'MESSAGE_ACCESS_DENIED',
+        message: 'You cannot react to this message'
       });
     }
 
@@ -1252,7 +1551,7 @@ const updateChatRoom = async (req, res) => {
     const { name, description } = req.body;
     const userId = req.user._id;
 
-    const chatRoom = await ChatRoom.findById(chatRoomId);
+    const chatRoom = await ChatRoom.findOne({ _id: chatRoomId, isActive: true });
     if (!chatRoom) {
       return res.status(404).json({
         success: false,
@@ -1424,7 +1723,7 @@ const addMemberToChatRoom = async (req, res) => {
     }
 
     // Check if user exists
-    const user = await User.findById(memberId).select('+following +privacySettings username isActive profile');
+    const user = await User.findById(memberId).select('+privacySettings username isActive profile blockedUsers');
     if (!user || !user.isActive) {
       return res.status(404).json({
         success: false,
@@ -1437,11 +1736,14 @@ const addMemberToChatRoom = async (req, res) => {
     if (targetPrivacy === 'nobody') {
       return res.status(403).json({ success: false, reason: 'privacy_blocked', targetUsername: user.username });
     }
+    const blockedRelationship = (req.user.blockedUsers || []).some((id) => idString(id) === idString(user))
+      || (user.blockedUsers || []).some((id) => idString(id) === idString(userId));
+    if (blockedRelationship) {
+      return res.status(403).json({ success: false, reason: 'privacy_blocked', targetUsername: user.username });
+    }
     if (targetPrivacy === 'people_you_follow') {
       // Check if the target user follows the adder
-      const targetFollowsAdder = user.following && user.following.some(
-        id => id.toString() === userId.toString()
-      );
+      const targetFollowsAdder = await Follow.isFollowing(user._id, userId);
       if (!targetFollowsAdder) {
         return res.status(403).json({ success: false, reason: 'privacy_blocked', targetUsername: user.username });
       }
@@ -1453,10 +1755,8 @@ const addMemberToChatRoom = async (req, res) => {
       role: 'member',
       joinedAt: new Date()
     });
-    // Remove from removedMembers if they were previously removed
-    if (chatRoom.removedMembers) {
-      chatRoom.removedMembers = chatRoom.removedMembers.filter(m => m.user.toString() !== memberId);
-    }
+    // Keep prior removedMembers epochs. Deleting them would let a rejoined user
+    // read messages sent while they were not a member.
     await chatRoom.save();
 
     // Send system message
@@ -1560,6 +1860,7 @@ const removeMemberFromChatRoom = async (req, res) => {
     }
 
     // Get removed member's display name for system message
+    const removedMembership = chatRoom.members[memberIndex];
     const removedMemberDoc = await require('../models/User').findById(memberId).select('username profile.displayName');
     const removedName = removedMemberDoc?.profile?.displayName || removedMemberDoc?.username || 'A member';
 
@@ -1567,7 +1868,11 @@ const removeMemberFromChatRoom = async (req, res) => {
     chatRoom.members.splice(memberIndex, 1);
     // Track in removedMembers for history access
     if (!chatRoom.removedMembers) chatRoom.removedMembers = [];
-    chatRoom.removedMembers.push({ user: memberId, removedAt: new Date() });
+    chatRoom.removedMembers.push({
+      user: memberId,
+      joinedAt: removedMembership.joinedAt || chatRoom.createdAt || new Date(),
+      removedAt: new Date()
+    });
     await chatRoom.save();
 
     // Send system message: "xyz has been removed from the group"
@@ -1591,6 +1896,7 @@ const removeMemberFromChatRoom = async (req, res) => {
         chatRoomId: chatRoom._id.toString(),
         removedUserId: memberId
       });
+      await revokeChatRoomAccess(io, chatRoom._id, memberId, 'removed_by_admin');
     }
 
     // Populate and transform for frontend
@@ -2129,7 +2435,7 @@ const deleteGroupMessage = async (req, res) => {
     const currentUserId = req.user._id;
 
     // Find the chat room
-    const chatRoom = await ChatRoom.findById(chatRoomId);
+    const chatRoom = await ChatRoom.findOne({ _id: chatRoomId, isActive: true });
     if (!chatRoom) {
       return res.status(404).json({
         success: false,
@@ -2148,9 +2454,15 @@ const deleteGroupMessage = async (req, res) => {
         message: 'You are not a member of this chat room'
       });
     }
+    const membershipWindow = getGroupMembershipWindow(chatRoom, currentUserId);
 
     // Find the message
-    const message = await Message.findById(messageId);
+    const message = await Message.findOne({
+      _id: messageId,
+      messageType: 'group',
+      chatRoom: chatRoomId,
+      ...groupHistoryBoundary(membershipWindow)
+    });
     if (!message) {
       return res.status(404).json({
         success: false,
@@ -2264,6 +2576,12 @@ const leaveGroup = async (req, res) => {
 
     // Remove member
     chatRoom.members.splice(memberIndex, 1);
+    if (!chatRoom.removedMembers) chatRoom.removedMembers = [];
+    chatRoom.removedMembers.push({
+      user: userId,
+      joinedAt: leavingMember.joinedAt || chatRoom.createdAt || new Date(),
+      removedAt: new Date()
+    });
     await chatRoom.save();
 
     // Send system message: "xyz left the group"
@@ -2283,6 +2601,7 @@ const leaveGroup = async (req, res) => {
         message: systemMessage
       });
       io.to(`chat-${chatRoomId}`).emit('memberLeft', { chatRoomId, userId: userId.toString() });
+      await revokeChatRoomAccess(io, chatRoomId, userId, 'left_group');
     }
 
     res.status(200).json({ success: true, message: 'Left group successfully' });
@@ -2295,15 +2614,69 @@ const leaveGroup = async (req, res) => {
 // Create a call summary message after a call ends
 const createCallSummary = async (req, res) => {
   try {
-    const { callType, outcome, durationSeconds, participantCount, recipientId, chatRoomId } = req.body;
+    const { callId, callType, outcome, durationSeconds, participantCount, recipientId, chatRoomId } = req.body || {};
     const senderId = req.user._id;
 
-    if (!callType || !outcome) {
-      return res.status(400).json({ success: false, message: 'callType and outcome are required' });
+    if (typeof callId !== 'string' || !/^[A-Za-z0-9:_-]{8,160}$/.test(callId)) {
+      return res.status(400).json({ success: false, message: 'A valid callId is required' });
+    }
+    if (!['voice', 'video'].includes(callType) || !['answered', 'missed', 'declined'].includes(outcome)) {
+      return res.status(400).json({ success: false, message: 'Valid callType and outcome are required' });
+    }
+    if (Boolean(recipientId) === Boolean(chatRoomId)) {
+      return res.status(400).json({ success: false, message: 'Exactly one of recipientId or chatRoomId is required' });
     }
 
-    if (!recipientId && !chatRoomId) {
-      return res.status(400).json({ success: false, message: 'recipientId or chatRoomId is required' });
+    let authorizedRecipientId = null;
+    let authorizedChatRoomId = null;
+    let maximumParticipantCount = 2;
+
+    if (recipientId) {
+      const session = await getCallSessionForParticipant(callId, senderId);
+      const callerId = idString(session.caller);
+      const calleeId = idString(session.callee);
+      const expectedRecipientId = idString(senderId) === callerId ? calleeId : callerId;
+      if (idString(recipientId) !== expectedRecipientId || session.callType !== callType) {
+        return res.status(403).json({
+          success: false,
+          code: 'CALL_SUMMARY_ACCESS_DENIED',
+          message: 'Call participants do not match the call session'
+        });
+      }
+      const targetUser = await User.findOne({ _id: expectedRecipientId, isActive: true })
+        .select('_id username userType profile privacySettings blockedUsers isActive')
+        .lean();
+      if (!targetUser) {
+        return res.status(404).json({ success: false, message: 'Call participant not found' });
+      }
+      const targetAccess = await resolvePrivacyAccess({
+        viewer: req.user,
+        targetUser,
+        existingConversation: true
+      });
+      if (targetAccess.blocked) {
+        return res.status(403).json({
+          success: false,
+          code: 'CALL_SUMMARY_ACCESS_DENIED',
+          message: 'Call summary delivery is not permitted'
+        });
+      }
+      authorizedRecipientId = expectedRecipientId;
+    } else {
+      const chatRoom = await ChatRoom.findOne({
+        _id: chatRoomId,
+        isActive: true,
+        'members.user': senderId
+      }).select('_id members.user').lean();
+      if (!chatRoom) {
+        return res.status(403).json({
+          success: false,
+          code: 'CALL_SUMMARY_ACCESS_DENIED',
+          message: 'You are not a member of this chat room'
+        });
+      }
+      authorizedChatRoomId = idString(chatRoom._id);
+      maximumParticipantCount = Math.max(1, chatRoom.members?.length || 1);
     }
 
     const baseSummaryText = outcome === 'answered'
@@ -2318,32 +2691,55 @@ const createCallSummary = async (req, res) => {
       messageType: 'call',
       content: { text: summaryText, media: [] },
       callSummary: {
+        callId,
         callType,
         outcome,
-        durationSeconds: durationSeconds || 0,
-        participantCount: participantCount || 0
+        durationSeconds: Math.max(0, Math.min(86400, Number(durationSeconds) || 0)),
+        participantCount: Math.max(1, Math.min(maximumParticipantCount, Number(participantCount) || 1))
       }
     };
 
-    if (recipientId) {
-      messageData.recipient = recipientId;
+    if (authorizedRecipientId) {
+      messageData.recipient = authorizedRecipientId;
     } else {
-      messageData.chatRoom = chatRoomId;
+      messageData.chatRoom = authorizedChatRoomId;
     }
 
-    const message = await Message.create(messageData);
+    let message = await Message.findOne({ messageType: 'call', 'callSummary.callId': callId });
+    let created = false;
+    if (!message) {
+      try {
+        message = await Message.create(messageData);
+        created = true;
+      } catch (error) {
+        if (error?.code !== 11000) throw error;
+        message = await Message.findOne({ messageType: 'call', 'callSummary.callId': callId });
+        if (!message) throw error;
+      }
+    }
+    if (idString(message.sender) !== idString(senderId)) {
+      return res.status(409).json({
+        success: false,
+        code: 'CALL_SUMMARY_CONFLICT',
+        message: 'Call summary already belongs to another participant'
+      });
+    }
     await message.populate('sender', 'username profile.displayName profile.avatar');
+
+    if (!created) {
+      return res.status(200).json({ success: true, data: { message, deduplicated: true } });
+    }
 
     // Emit real-time update to the relevant room
     if (io) {
-      if (recipientId) {
-        io.to(`user-${String(recipientId)}`).emit('newMessage', {
+      if (authorizedRecipientId) {
+        io.to(`user-${authorizedRecipientId}`).emit('newMessage', {
           chatId: `direct_${senderId}`,
           message
         });
       } else {
-        io.to(`chat-${chatRoomId}`).emit('newMessage', {
-          chatId: chatRoomId,
+        io.to(`chat-${authorizedChatRoomId}`).emit('newMessage', {
+          chatId: authorizedChatRoomId,
           message
         });
       }
@@ -2352,9 +2748,10 @@ const createCallSummary = async (req, res) => {
     res.status(201).json({ success: true, data: { message } });
   } catch (error) {
     log.error('createCallSummary error:', { error: String(error) });
-    res.status(500).json({
+    const status = Number(error?.statusCode || 500);
+    res.status(status).json({
       success: false,
-      message: 'Failed to create call summary',
+      message: status >= 500 ? 'Failed to create call summary' : error.message,
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
@@ -2535,17 +2932,25 @@ const getGroupInvitePreview = async (req, res) => {
   try {
     const { inviteToken } = req.params;
     const chatRoom = await ChatRoom.findOne({ inviteToken, isActive: true })
-      .select('name avatar members')
+      .select('name avatar members.user settings.allowInvites settings.maxMembers')
       .lean();
     if (!chatRoom) {
       return res.status(404).json({ success: false, message: 'Invalid or expired invite link' });
+    }
+    if (chatRoom.settings?.allowInvites === false) {
+      return res.status(410).json({ success: false, message: 'This invite link is no longer active' });
+    }
+    const maxMembers = Math.max(1, Number(chatRoom.settings?.maxMembers) || 100);
+    if ((chatRoom.members || []).length >= maxMembers) {
+      return res.status(409).json({ success: false, message: 'This group is full' });
     }
     res.json({
       success: true,
       group: {
         name: chatRoom.name,
         avatar: chatRoom.avatar || null,
-        memberCount: chatRoom.members.length
+        memberCount: chatRoom.members.length,
+        canJoin: true
       }
     });
   } catch (err) {
@@ -2627,17 +3032,22 @@ const joinGroupViaInvite = async (req, res) => {
     if (!chatRoom) {
       return res.status(404).json({ success: false, message: 'Invalid or expired invite link' });
     }
+    if (chatRoom.settings?.allowInvites === false) {
+      return res.status(410).json({ success: false, message: 'This invite link is no longer active' });
+    }
 
     // Already a member?
     if (chatRoom.members.some(m => m.user.toString() === userId.toString())) {
       return res.json({ success: true, alreadyMember: true, chatRoomId: chatRoom._id });
     }
+    const maxMembers = Math.max(1, Number(chatRoom.settings?.maxMembers) || 100);
+    if (chatRoom.members.length >= maxMembers) {
+      return res.status(409).json({ success: false, message: 'This group is full' });
+    }
 
     // Add member
     chatRoom.members.push({ user: userId, role: 'member', joinedAt: new Date() });
-    if (chatRoom.removedMembers) {
-      chatRoom.removedMembers = chatRoom.removedMembers.filter(m => m.user.toString() !== userId.toString());
-    }
+    // Keep prior membership epochs for history authorization.
     await chatRoom.save();
 
     // System message
@@ -2685,30 +3095,31 @@ const sendGroupInviteDM = async (req, res) => {
     }
 
     // Verify target user exists and is active
-    const targetUser = await User.findById(targetUserId).select('username isActive privacySettings following');
+    const targetUser = await User.findById(targetUserId)
+      .select('username userType profile privacySettings blockedUsers isActive');
     if (!targetUser || !targetUser.isActive) {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
 
-    // DM privacy check — respect whoCanMessage even for invite DMs
-    const dmPrivacy = targetUser.privacySettings?.whoCanMessage || 'anyone';
-    if (dmPrivacy === 'nobody') {
+    const existingConversation = Boolean(await Message.exists({
+      messageType: 'direct',
+      isDeleted: false,
+      $or: [
+        { sender: targetUserId, recipient: callerId },
+        { sender: callerId, recipient: targetUserId }
+      ]
+    }));
+    const targetAccess = await resolvePrivacyAccess({ viewer: req.user, targetUser, existingConversation });
+    if (!targetAccess.access.canMessage) {
+      const reason = targetAccess.settings.allowMessageFrom === 'followers' ? 'not_follower' : 'messages_disabled';
       return res.status(403).json({
         success: false,
-        reason: 'dm_privacy_blocked',
-        message: `${targetUser.username} doesn't accept messages from anyone.`
+        code: 'MESSAGE_PRIVACY_RESTRICTED',
+        reason,
+        message: reason === 'not_follower'
+          ? `${targetUser.username} only accepts messages from approved followers.`
+          : `${targetUser.username} is not accepting new conversations.`
       });
-    }
-    if (dmPrivacy === 'people_you_follow') {
-      const followsCaller = targetUser.following &&
-        targetUser.following.some(id => id.toString() === callerId.toString());
-      if (!followsCaller) {
-        return res.status(403).json({
-          success: false,
-          reason: 'dm_privacy_blocked',
-          message: `${targetUser.username} only accepts messages from people they follow.`
-        });
-      }
     }
 
     // Retrieve or generate invite token
@@ -2777,6 +3188,27 @@ const reportMessage = async (req, res) => {
 
     const message = await Message.findById(messageId);
     if (!message) {
+      return res.status(404).json({ success: false, message: 'Message not found' });
+    }
+
+    const directParticipant = message.messageType !== 'group'
+      && [message.sender, message.recipient].some((participant) => idString(participant) === idString(reporterId));
+    let groupParticipant = false;
+    if (message.messageType === 'group' && message.chatRoom) {
+      const chatRoom = await ChatRoom.findOne({ _id: message.chatRoom, isActive: true })
+        .select('members.user members.joinedAt removedMembers.user removedMembers.joinedAt removedMembers.removedAt createdAt')
+        .lean();
+      if (chatRoom) {
+        groupParticipant = isCurrentGroupMember(chatRoom, reporterId);
+        if (!groupParticipant) {
+          const membershipWindow = getGroupMembershipWindow(chatRoom, reporterId);
+          groupParticipant = canReadGroupMessageAt(membershipWindow, message.createdAt);
+        }
+      }
+    }
+    if (!directParticipant && !groupParticipant) {
+      // Deliberately use the same response as an unknown ID to avoid a message
+      // existence oracle for non-participants.
       return res.status(404).json({ success: false, message: 'Message not found' });
     }
 

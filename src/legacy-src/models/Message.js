@@ -211,6 +211,9 @@ const chatRoomSchema = new mongoose.Schema({
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User'
     },
+    joinedAt: {
+      type: Date
+    },
     removedAt: {
       type: Date,
       default: Date.now

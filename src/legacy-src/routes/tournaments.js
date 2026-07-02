@@ -46,7 +46,7 @@ const {
   openRegistration,
   getHostingLimits
 } = require('../controllers/tournamentController');
-const { protect, optionalAuth } = require('../middleware/auth');
+const { protect, publicOptionalAuth } = require('../middleware/auth');
 
 // Most routes require authentication, but GET tournaments should be public
 // router.use(protect); // Commented out to allow public access to some routes
@@ -56,17 +56,17 @@ router.get('/hosting-limits', protect, getHostingLimits);
 
 // Tournament CRUD operations
 router.route('/')
-  .get(optionalAuth, getTournaments) // Public access but optional auth for hosted/participating filters
+  .get(publicOptionalAuth, getTournaments) // Public access; validate and attach a supplied token
   .post(protect, createTournament); // Requires authentication
 
 // Public shareable link route (must come before /:id route)
-router.get('/code/:code', getTournament); // Public access - shareable link
+router.get('/code/:code', publicOptionalAuth, getTournament); // Public access - shareable link
 
 // Get tournament by name and host username
-router.get('/by-name/:tournamentName/:hostUsername', getTournamentByName); // Public access for guest users
+router.get('/by-name/:tournamentName/:hostUsername', publicOptionalAuth, getTournamentByName); // Public access for guest users
 
 router.route('/:id')
-  .get(getTournament) // Public access for guest users
+  .get(publicOptionalAuth, getTournament) // Public access for guest users
   .put(protect, updateTournament)
   .delete(protect, deleteTournament);
 

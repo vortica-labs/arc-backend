@@ -1,16 +1,16 @@
 import { Router } from "express";
-import { optionalAuth, protect, scrimController } from "./scrims.legacy-adapters";
+import { protect, publicOptionalAuth, scrimController } from "./scrims.legacy-adapters";
 
 const router = Router();
 
 router.route("/")
-  .get(optionalAuth, scrimController.getScrims)
+  .get(publicOptionalAuth, scrimController.getScrims)
   .post(protect, scrimController.createScrim);
 
-router.get("/code/:code", scrimController.getScrim);
+router.get("/code/:code", publicOptionalAuth, scrimController.getScrim);
 
 router.route("/:id")
-  .get(scrimController.getScrim)
+  .get(publicOptionalAuth, scrimController.getScrim)
   .put(protect, scrimController.updateScrim)
   .delete(protect, scrimController.deleteScrim);
 

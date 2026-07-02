@@ -1,8 +1,80 @@
 const Challenge = require('../models/Challenge');
 const ChallengeParticipation = require('../models/ChallengeParticipation');
 const User = require('../models/User');
+const Follow = require('../models/Follow');
 const safeAsyncHandler = require('../utils/safeAsyncHandler');
 const log = require('../utils/logger');
+const mongoose = require('mongoose');
+const { resolvePrivacyAccess, minimalProfile } = require('../utils/privacyPolicy');
+
+const idString = (value) => String(value?._id || value || '');
+const isGuestViewer = (viewer) => !viewer?._id || viewer.userType === 'guest';
+
+const serializeChallenge = (value, { includeParticipants = false } = {}) => {
+  const challenge = value?.toObject
+    ? value.toObject({ virtuals: true })
+    : JSON.parse(JSON.stringify(value || {}));
+  if (challenge.creator && typeof challenge.creator === 'object') {
+    challenge.creator = minimalProfile(challenge.creator);
+  }
+  challenge.participantCount = Array.isArray(challenge.participants)
+    ? challenge.participants.length
+    : Number(challenge.participantCount ?? challenge.stats?.totalParticipants ?? 0);
+  if (!includeParticipants) {
+    delete challenge.participants;
+  } else {
+    challenge.participants = (challenge.participants || []).map((entry) => ({
+      ...entry,
+      user: entry?.user && typeof entry.user === 'object' ? minimalProfile(entry.user) : entry?.user
+    }));
+  }
+  return challenge;
+};
+
+const canAccessChallengeVisibility = ({ visibility, isSelf = false, isFollower = false }) => {
+  const normalized = ['public', 'followers', 'private'].includes(visibility)
+    ? visibility
+    : 'private';
+  return Boolean(
+    isSelf
+    || normalized === 'public'
+    || (normalized === 'followers' && isFollower)
+  );
+};
+
+const resolveChallengeAccess = async ({ challenge, viewer }) => {
+  const creatorId = idString(challenge?.creator);
+  const creator = challenge?.creator?.privacySettings
+    ? challenge.creator
+    : await User.findById(creatorId)
+      .select('username userType profile privacySettings blockedUsers isActive')
+      .lean();
+  if (!creator || creator.isActive === false) return { allowed: false, reason: 'not_found', creator: null };
+  const relationship = await resolvePrivacyAccess({ viewer, targetUser: creator });
+  if (!relationship.access.canViewProfile) {
+    return { allowed: false, reason: relationship.access.reason, creator, relationship };
+  }
+  const allowed = canAccessChallengeVisibility({
+    visibility: challenge.visibility,
+    isSelf: relationship.isSelf,
+    isFollower: relationship.isFollower
+  });
+  return {
+    allowed,
+    reason: allowed ? 'allowed' : 'challenge_visibility',
+    creator,
+    relationship
+  };
+};
+
+const rejectChallengePrivacy = (res, access) => res.status(
+  access?.reason === 'not_found' ? 404 : 403
+).json({
+  success: false,
+  code: access?.reason === 'not_found' ? 'CHALLENGE_NOT_FOUND' : 'PRIVACY_RESTRICTED',
+  reason: access?.reason || 'privacy_restricted',
+  message: access?.reason === 'not_found' ? 'Challenge not found' : 'You do not have access to this challenge'
+});
 
 // Create a new challenge (Creator only)
 const createChallenge = safeAsyncHandler(async (req, res) => {
@@ -35,7 +107,7 @@ const createChallenge = safeAsyncHandler(async (req, res) => {
   // Validate dates
   const start = new Date(startDate);
   const end = new Date(endDate);
-  
+
   if (start >= end) {
     return res.status(400).json({
       success: false,
@@ -93,6 +165,8 @@ const getChallenges = safeAsyncHandler(async (req, res) => {
     sortOrder = 'desc'
   } = req.query;
 
+  const pageNumber = Math.max(1, parseInt(page, 10) || 1);
+  const pageLimit = Math.min(50, Math.max(1, parseInt(limit, 10) || 10));
   const query = {};
 
   // Apply filters
@@ -100,53 +174,171 @@ const getChallenges = safeAsyncHandler(async (req, res) => {
   if (category) query.category = category;
   if (challengeType) query.challengeType = challengeType;
   if (status) query.status = status;
-  if (creator) query.creator = creator;
+  if (creator) {
+    query.creator = mongoose.Types.ObjectId.isValid(String(creator))
+      ? new mongoose.Types.ObjectId(String(creator))
+      : null;
+  }
 
   // Search functionality
   if (search) {
+    const escapedSearch = String(search).trim().slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     query.$or = [
-      { title: { $regex: search, $options: 'i' } },
-      { description: { $regex: search, $options: 'i' } },
-      { tags: { $in: [new RegExp(search, 'i')] } }
+      { title: { $regex: escapedSearch, $options: 'i' } },
+      { description: { $regex: escapedSearch, $options: 'i' } },
+      { tags: { $in: [new RegExp(escapedSearch, 'i')] } }
     ];
   }
 
-  // Visibility filter (only show public challenges or user's own)
-  if (req.user) {
-    query.$or = [
-      { visibility: 'public' },
-      { creator: req.user._id },
-      { 
-        visibility: 'followers',
-        creator: { $in: req.user.following || [] }
+  const allowedSortFields = new Set(['createdAt', 'startDate', 'endDate', 'title', 'stats.totalParticipants']);
+  const safeSortBy = allowedSortFields.has(String(sortBy)) ? String(sortBy) : 'createdAt';
+  const sortOptions = { [safeSortBy]: sortOrder === 'asc' ? 1 : -1, _id: 1 };
+  const hasViewer = !isGuestViewer(req.user);
+  const viewerId = hasViewer ? new mongoose.Types.ObjectId(String(req.user._id)) : null;
+  const viewerRecord = hasViewer
+    ? await User.findById(viewerId).select('blockedUsers').lean()
+    : null;
+  const viewerBlockedIds = (viewerRecord?.blockedUsers || [])
+    .filter((value) => mongoose.Types.ObjectId.isValid(String(value)))
+    .map((value) => new mongoose.Types.ObjectId(String(value)));
+  const creatorVisibility = {
+    $switch: {
+      branches: [
+        {
+          case: { $in: ['$__creator.privacySettings.profileVisibility', ['public', 'followers', 'private']] },
+          then: '$__creator.privacySettings.profileVisibility'
+        },
+        {
+          case: {
+            $and: [
+              { $eq: [{ $type: '$__creator.privacySettings.profileVisibility' }, 'missing'] },
+              {
+                $or: [
+                  { $eq: ['$__creator.privacySettings.accountType', 'public'] },
+                  { $eq: [{ $type: '$__creator.privacySettings.accountType' }, 'missing'] }
+                ]
+              }
+            ]
+          },
+          then: 'public'
+        }
+      ],
+      default: 'private'
+    }
+  };
+
+  const pipeline = [
+    { $match: query },
+    {
+      $lookup: {
+        from: User.collection.name,
+        let: { creatorId: '$creator' },
+        pipeline: [
+          { $match: { $expr: { $eq: ['$_id', '$$creatorId'] } } },
+          { $match: { isActive: true } },
+          { $limit: 1 }
+        ],
+        as: '__creator'
       }
-    ];
-  } else {
-    query.visibility = 'public';
-  }
+    },
+    { $unwind: '$__creator' },
+    ...(hasViewer ? [{
+      $lookup: {
+        from: Follow.collection.name,
+        let: { creatorId: '$creator' },
+        pipeline: [
+          {
+            $match: {
+              $expr: {
+                $and: [
+                  { $eq: ['$follower', viewerId] },
+                  { $eq: ['$following', '$$creatorId'] }
+                ]
+              }
+            }
+          },
+          { $limit: 1 }
+        ],
+        as: '__viewerFollow'
+      }
+    }] : []),
+    {
+      $match: {
+        $expr: hasViewer
+          ? {
+              $and: [
+                { $not: [{ $in: ['$creator', viewerBlockedIds] }] },
+                { $not: [{ $in: [viewerId, { $ifNull: ['$__creator.blockedUsers', []] }] }] },
+                {
+                  $or: [
+                    { $eq: ['$creator', viewerId] },
+                    { $eq: [creatorVisibility, 'public'] },
+                    { $gt: [{ $size: '$__viewerFollow' }, 0] }
+                  ]
+                },
+                {
+                  $or: [
+                    { $eq: ['$creator', viewerId] },
+                    { $eq: ['$visibility', 'public'] },
+                    {
+                      $and: [
+                        { $eq: ['$visibility', 'followers'] },
+                        { $gt: [{ $size: '$__viewerFollow' }, 0] }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          : {
+              $and: [
+                { $eq: [creatorVisibility, 'public'] },
+                { $eq: ['$visibility', 'public'] }
+              ]
+            }
+      }
+    },
+    {
+      $addFields: {
+        creator: {
+          _id: '$__creator._id',
+          username: '$__creator.username',
+          userType: '$__creator.userType',
+          profile: {
+            displayName: '$__creator.profile.displayName',
+            avatar: '$__creator.profile.avatar'
+          }
+        },
+        participantCount: { $size: { $ifNull: ['$participants', []] } }
+      }
+    },
+    { $project: { participants: 0, __creator: 0, __viewerFollow: 0 } },
+    {
+      $facet: {
+        records: [
+          { $sort: sortOptions },
+          { $skip: (pageNumber - 1) * pageLimit },
+          { $limit: pageLimit }
+        ],
+        metadata: [{ $count: 'total' }]
+      }
+    }
+  ];
 
-  const sortOptions = {};
-  sortOptions[sortBy] = sortOrder === 'desc' ? -1 : 1;
-
-  const challenges = await Challenge.find(query)
-    .populate('creator', 'username profile.displayName profile.avatar')
-    .sort(sortOptions)
-    .limit(limit * 1)
-    .skip((page - 1) * limit)
-    .lean();
-
-  const total = await Challenge.countDocuments(query);
+  const [result = {}] = await Challenge.aggregate(pipeline);
+  const challenges = (result.records || []).map((challenge) => serializeChallenge(challenge));
+  const total = Number(result.metadata?.[0]?.total || 0);
 
   res.json({
     success: true,
     data: {
       challenges,
       pagination: {
-        currentPage: parseInt(page),
-        totalPages: Math.ceil(total / limit),
+        currentPage: pageNumber,
+        totalPages: Math.ceil(total / pageLimit),
         totalChallenges: total,
-        hasNext: page < Math.ceil(total / limit),
-        hasPrev: page > 1
+        hasNext: pageNumber < Math.ceil(total / pageLimit),
+        hasPrev: pageNumber > 1
       }
     }
   });
@@ -155,9 +347,12 @@ const getChallenges = safeAsyncHandler(async (req, res) => {
 // Get single challenge
 const getChallenge = safeAsyncHandler(async (req, res) => {
   const { id } = req.params;
+  if (!mongoose.Types.ObjectId.isValid(String(id))) {
+    return res.status(404).json({ success: false, message: 'Challenge not found' });
+  }
 
   const challenge = await Challenge.findById(id)
-    .populate('creator', 'username profile.displayName profile.avatar')
+    .populate('creator', 'username userType profile.displayName profile.avatar privacySettings blockedUsers isActive')
     .populate('participants.user', 'username profile.displayName profile.avatar');
 
   if (!challenge) {
@@ -167,14 +362,8 @@ const getChallenge = safeAsyncHandler(async (req, res) => {
     });
   }
 
-  // Check visibility
-  if (challenge.visibility === 'private' && 
-      (!req.user || challenge.creator._id.toString() !== req.user._id.toString())) {
-    return res.status(403).json({
-      success: false,
-      message: 'Access denied'
-    });
-  }
+  const access = await resolveChallengeAccess({ challenge, viewer: req.user });
+  if (!access.allowed) return rejectChallengePrivacy(res, access);
 
   // Increment view count
   challenge.stats.views += 1;
@@ -182,7 +371,7 @@ const getChallenge = safeAsyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: challenge
+    data: serializeChallenge(challenge, { includeParticipants: access.relationship?.isSelf === true })
   });
 });
 
@@ -190,14 +379,21 @@ const getChallenge = safeAsyncHandler(async (req, res) => {
 const joinChallenge = safeAsyncHandler(async (req, res) => {
   const { id } = req.params;
   const userId = req.user._id;
+  if (!mongoose.Types.ObjectId.isValid(String(id))) {
+    return res.status(404).json({ success: false, message: 'Challenge not found' });
+  }
 
-  const challenge = await Challenge.findById(id);
+  const challenge = await Challenge.findById(id)
+    .populate('creator', 'username userType profile.displayName profile.avatar privacySettings blockedUsers isActive');
   if (!challenge) {
     return res.status(404).json({
       success: false,
       message: 'Challenge not found'
     });
   }
+
+  const access = await resolveChallengeAccess({ challenge, viewer: req.user });
+  if (!access.allowed) return rejectChallengePrivacy(res, access);
 
   // Check if challenge is active
   if (challenge.status !== 'active') {
@@ -225,7 +421,7 @@ const joinChallenge = safeAsyncHandler(async (req, res) => {
 
   try {
     await challenge.addParticipant(userId);
-    
+
     // Create participation record
     const participation = new ChallengeParticipation({
       challenge: challenge._id,
@@ -234,7 +430,7 @@ const joinChallenge = safeAsyncHandler(async (req, res) => {
         targetValue: challenge.requirements.targetValue
       }
     });
-    
+
     await participation.save();
     await participation.populate('participant', 'username profile.displayName profile.avatar');
 
@@ -386,7 +582,7 @@ const updateChallenge = safeAsyncHandler(async (req, res) => {
     'requirements', 'rewards', 'startDate', 'endDate', 'visibility',
     'tags', 'creatorSettings', 'media', 'status'
   ];
-  
+
   const updateData = {};
   allowedGeneralUpdates.forEach(field => {
     if (req.body[field] !== undefined) {
@@ -399,7 +595,7 @@ const updateChallenge = safeAsyncHandler(async (req, res) => {
     const allowedActiveUpdates = ['description', 'media', 'creatorSettings'];
     const updateKeys = Object.keys(updateData);
     const hasRestrictedUpdate = updateKeys.some(key => !allowedActiveUpdates.includes(key));
-    
+
     if (hasRestrictedUpdate) {
       return res.status(400).json({
         success: false,
@@ -490,15 +686,15 @@ const distributeRewards = safeAsyncHandler(async (req, res) => {
 
   try {
     await challenge.distributeRewards();
-    
+
     // Update participation records
     await ChallengeParticipation.updateMany(
-      { 
+      {
         challenge: challenge._id,
         'progress.completed': true,
         'rewards.claimed': false
       },
-      { 
+      {
         'rewards.claimed': true,
         'rewards.claimedAt': new Date()
       }
@@ -529,5 +725,9 @@ module.exports = {
   getMyParticipations,
   updateChallenge,
   deleteChallenge,
-  distributeRewards
+  distributeRewards,
+  _private: {
+    canAccessChallengeVisibility,
+    serializeChallenge
+  }
 };

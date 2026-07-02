@@ -2,20 +2,32 @@ const User = require('../models/User');
 const Post = require('../models/Post');
 const Tournament = require('../models/Tournament');
 const Follow = require('../models/Follow');
+const FollowRequest = require('../models/FollowRequest');
 const { createFollowNotification, createMessageNotification } = require('../utils/notificationService');
 const RosterInvite = require('../models/RosterInvite');
 const StaffInvite = require('../models/StaffInvite');
 const LeaveRequest = require('../models/LeaveRequest');
 const { createAndEmitNotification } = require('../utils/notificationEmitter');
 const { formatUserDTO, formatPostDTO } = require('../utils/dto');
-const { getJson, setJson, del } = require('../utils/redisCache');
+const { getJson, setJson } = require('../utils/redisCache');
+const { profileCacheKey, invalidateProfileCache } = require('../utils/profileCache');
+const { publishPrivacySettingsUpdate, evictPresenceAudience, removePresenceSubscription } = require('../utils/presencePrivacy');
 const { invalidateUserCache } = require('../middleware/auth');
 const log = require('../utils/logger');
 const { normalizeQuerySearch, buildPrefixRegex } = require('../utils/searchQuery');
+const {
+  PROFILE_VISIBILITY,
+  MESSAGE_AUDIENCE,
+  normalizePrivacySettings,
+  canonicalToLegacyAliases,
+  buildPrivacyAccess,
+  resolvePrivacyAccess,
+  minimalProfile,
+  privacySettingsResponse
+} = require('../utils/privacyPolicy');
 
 // ── Redis Profile Cache helpers ──
 const PROFILE_CACHE_TTL = 300; // 5 minutes
-const profileCacheKey = (id) => `profile:${id}`;
 const TEAM_CACHE_TTL = 300; // 5 minutes
 const teamCacheKey = (id) => `team:membership:${id}`;
 
@@ -49,26 +61,25 @@ const getUsers = async (req, res) => {
     if (lookingForTeam === 'true') filter['playerInfo.lookingForTeam'] = true;
     if (recruiting === 'true') filter['teamInfo.recruitingFor.0'] = { $exists: true };
 
-    if (excludeFollowing && viewerId && !isGuest) {
+    if (viewerId && !isGuest) {
       const [followedIds, currentUser, usersBlockingViewer] = await Promise.all([
-        Follow.find({ follower: viewerId }).distinct('following'),
+        excludeFollowing ? Follow.find({ follower: viewerId }).distinct('following') : Promise.resolve([]),
         User.findById(viewerId).select('blockedUsers').lean(),
         User.find({ blockedUsers: viewerId }).select('_id').lean(),
       ]);
       const excludedIds = [
-        viewerId,
-        ...followedIds,
+        ...(excludeFollowing ? [viewerId, ...followedIds] : []),
         ...(currentUser?.blockedUsers || []),
         ...usersBlockingViewer.map(user => user._id),
       ];
-      andConditions.push({ _id: { $nin: excludedIds } });
+      if (excludedIds.length > 0) andConditions.push({ _id: { $nin: excludedIds } });
     }
 
     // If searching for followers, filter to only show users that the current user follows
     if (followers === 'true' && req.user) {
-      const currentUser = await User.findById(req.user._id).select('following');
-      if (currentUser && currentUser.following.length > 0) {
-        filter._id = { $in: currentUser.following };
+      const followedIds = await Follow.find({ follower: req.user._id }).distinct('following');
+      if (followedIds.length > 0) {
+        filter._id = { $in: followedIds };
       } else {
         // If user has no followers, return empty array
         return res.status(200).json({
@@ -100,8 +111,6 @@ const getUsers = async (req, res) => {
 
     const users = await User.find(filter)
       .select('-password -email')
-      .populate('followers', 'username profile.displayName profile.avatar')
-      .populate('following', 'username profile.displayName profile.avatar')
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit);
@@ -109,9 +118,12 @@ const getUsers = async (req, res) => {
     const total = await User.countDocuments(filter);
 
     const userIds = users.map(u => u._id);
-    const [viewerFollows, followerCounts, followingCounts] = await Promise.all([
+    const [viewerFollows, pendingFollowRequests, followerCounts, followingCounts] = await Promise.all([
       viewerId && !isGuest
         ? Follow.find({ follower: viewerId, following: { $in: userIds } }).select('following').lean()
+        : Promise.resolve([]),
+      viewerId && !isGuest
+        ? FollowRequest.find({ requester: viewerId, target: { $in: userIds }, status: 'pending' }).select('target').lean()
         : Promise.resolve([]),
       Promise.all(users.map(u =>
         Follow.getFollowerCount(u._id).catch(() => Array.isArray(u.followers) ? u.followers.length : 0)
@@ -121,18 +133,38 @@ const getUsers = async (req, res) => {
       )),
     ]);
     const viewerFollowingIds = new Set(viewerFollows.map(f => f.following.toString()));
+    const pendingTargetIds = new Set(pendingFollowRequests.map(request => request.target.toString()));
 
     res.status(200).json({
       success: true,
       data: {
         users: users.map((u, index) => {
-          const dto = formatUserDTO(u, isGuest, false);
           const id = u._id.toString();
-          dto.isFollowing = viewerId && id !== viewerId.toString()
+          const isSelf = Boolean(viewerId && id === viewerId.toString());
+          const isFollowing = Boolean(viewerId && !isSelf
             ? viewerFollowingIds.has(id)
-            : false;
-          dto.followersCount = followerCounts[index];
-          dto.followingCount = followingCounts[index];
+            : false);
+          const privacyAccess = buildPrivacyAccess({
+            settings: u.privacySettings,
+            isSelf,
+            isFollower: isFollowing
+          });
+          const dto = privacyAccess.restricted
+            ? minimalProfile(u)
+            : formatUserDTO(u, isGuest, isSelf, privacyAccess.canSeeOnlineStatus);
+          if (!isSelf) delete dto.privacySettings;
+          const followRequestPending = pendingTargetIds.has(id);
+          dto.privacyAccess = {
+            ...privacyAccess,
+            canFollow: privacyAccess.canFollow && !followRequestPending && !isFollowing,
+            followRequestPending
+          };
+          dto.isFollowing = isFollowing;
+          dto.followStatus = isFollowing ? 'accepted' : followRequestPending ? 'pending' : 'none';
+          if (!privacyAccess.restricted) {
+            dto.followersCount = followerCounts[index];
+            dto.followingCount = followingCounts[index];
+          }
           return dto;
         }),
         pagination: {
@@ -170,6 +202,11 @@ const getLiveTournamentHistory = async (req, res) => {
         success: false,
         message: 'User not found'
       });
+    }
+
+    const tournamentPrivacy = await resolvePrivacyAccess({ viewer: req.user, targetUser: user });
+    if (!tournamentPrivacy.access.canViewProfile) {
+      return privacyDenied(res, user, tournamentPrivacy.access, 'Tournament history is private');
     }
 
     const userId = user._id;
@@ -249,6 +286,11 @@ const getUserTournamentHistory = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Player not found' });
     }
 
+    const tournamentPrivacy = await resolvePrivacyAccess({ viewer: req.user, targetUser: user });
+    if (!tournamentPrivacy.access.canViewProfile) {
+      return privacyDenied(res, user, tournamentPrivacy.access, 'Tournament history is private');
+    }
+
     let history = user.playerInfo?.tournamentHistory || [];
 
     // Apply filters
@@ -317,6 +359,39 @@ const getUser = async (req, res) => {
           message: 'User not found'
         });
       }
+    }
+
+    const privacyRelationship = await resolvePrivacyAccess({ viewer: req.user, targetUser: user });
+    if (privacyRelationship.blocked) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+    const isGuest = !req.user || req.user.userType === 'guest';
+    const isSelf = privacyRelationship.isSelf;
+    const pendingFollowRequest = !isSelf && req.user?._id
+      ? await FollowRequest.exists({ requester: req.user._id, target: user._id, status: 'pending' })
+      : null;
+
+    if (privacyRelationship.access.restricted) {
+      const restrictedResponse = {
+        success: true,
+        data: {
+          user: minimalProfile(user),
+          recentPosts: [],
+          relationship: {
+            isFollowing: privacyRelationship.isFollower,
+            isFollowedBy: false,
+            isSelf: false,
+            followStatus: pendingFollowRequest ? 'pending' : 'none'
+          },
+          privacyAccess: {
+            ...privacyRelationship.access,
+            canFollow: privacyRelationship.access.canFollow && !pendingFollowRequest && !privacyRelationship.isFollower,
+            followRequestPending: Boolean(pendingFollowRequest)
+          },
+          stats: { followersCount: 0, followingCount: 0, postsCount: 0 }
+        }
+      };
+      return res.status(200).json(restrictedResponse);
     }
 
     // Populate team information if it's a team
@@ -526,14 +601,20 @@ const getUser = async (req, res) => {
     }
     
     // Get user's recent posts
-    const recentPosts = await Post.find({ 
-      author: user._id, 
-      isActive: true,
-      visibility: { $in: ['public', 'followers'] }
-    })
-    .populate('author', 'username profile.displayName profile.avatar profilePicture avatar userType')
-    .sort({ createdAt: -1 })
-    .limit(5);
+    const allowedPostVisibilities = isSelf
+      ? ['public', 'followers', 'private']
+      : privacyRelationship.isFollower ? ['public', 'followers'] : ['public'];
+    const recentPosts = privacyRelationship.access.canViewPosts
+      ? await Post.find({
+          author: user._id,
+          isActive: true,
+          hiddenByAdmin: { $ne: true },
+          visibility: { $in: allowedPostVisibilities }
+        })
+        .populate('author', 'username profile.displayName profile.avatar profilePicture avatar userType')
+        .sort({ createdAt: -1 })
+        .limit(5)
+      : [];
 
     let isBlockedByMe = false;
     if (req.user) {
@@ -543,8 +624,6 @@ const getUser = async (req, res) => {
       }
     }
 
-    const isGuest = req.user && req.user.userType === 'guest';
-    const isSelf = req.user && req.user._id && !isGuest && req.user._id.toString() === user._id.toString();
     const [
       followersCount,
       followingCount,
@@ -554,25 +633,38 @@ const getUser = async (req, res) => {
     ] = await Promise.all([
       Follow.getFollowerCount(user._id).catch(() => user.followers ? user.followers.length : 0),
       Follow.getFollowingCount(user._id).catch(() => user.following ? user.following.length : 0),
-      Post.countDocuments({ author: user._id, isActive: true }).catch(() => 0),
-      requestingUserId && !isGuest && !isSelf
-        ? Follow.isFollowing(requestingUserId, user._id).catch(() => false)
-        : Promise.resolve(false),
+      privacyRelationship.access.canViewPosts
+        ? Post.countDocuments({
+            author: user._id,
+            isActive: true,
+            hiddenByAdmin: { $ne: true },
+            visibility: { $in: allowedPostVisibilities }
+          }).catch(() => 0)
+        : Promise.resolve(0),
+      Promise.resolve(privacyRelationship.isFollower),
       requestingUserId && !isGuest && !isSelf
         ? Follow.isFollowing(user._id, requestingUserId).catch(() => false)
         : Promise.resolve(false),
     ]);
 
+    const profileDto = formatUserDTO(user, isGuest, isSelf, privacyRelationship.access.canSeeOnlineStatus);
+    if (!isSelf) delete profileDto.privacySettings;
     const responseData = {
       success: true,
       data: {
-        user: formatUserDTO(user, isGuest, isSelf),
+        user: profileDto,
         isBlockedByMe,
         recentPosts: recentPosts.map(p => formatPostDTO(p, isGuest, isSelf)),
         relationship: {
           isFollowing,
           isFollowedBy,
-          isSelf: !!isSelf
+          isSelf: !!isSelf,
+          followStatus: isFollowing ? 'accepted' : pendingFollowRequest ? 'pending' : 'none'
+        },
+        privacyAccess: {
+          ...privacyRelationship.access,
+          canFollow: privacyRelationship.access.canFollow && !pendingFollowRequest && !privacyRelationship.isFollower,
+          followRequestPending: Boolean(pendingFollowRequest)
         },
         stats: {
           followersCount,
@@ -598,7 +690,40 @@ const getUser = async (req, res) => {
   }
 };
 
-// Follow/Unfollow user — dual-writes to Follow collection + User arrays
+const invalidateFollowCaches = async (currentUserId, targetUserId) => {
+  const [currentUser, targetUser] = await Promise.all([
+    User.findById(currentUserId).select('username').lean(),
+    User.findById(targetUserId).select('username').lean()
+  ]);
+  await Promise.all([
+    invalidateUserCache(currentUserId),
+    invalidateUserCache(targetUserId),
+    invalidateProfileCache(
+      currentUserId,
+      targetUserId,
+      currentUser?.username,
+      targetUser?.username
+    )
+  ]);
+};
+
+const persistFollow = async (followerId, targetId) => {
+  await Promise.all([
+    Follow.follow(followerId, targetId),
+    User.updateOne({ _id: followerId }, { $addToSet: { following: targetId } }),
+    User.updateOne({ _id: targetId }, { $addToSet: { followers: followerId } })
+  ]);
+};
+
+const persistUnfollow = async (followerId, targetId) => {
+  await Promise.all([
+    Follow.unfollow(followerId, targetId),
+    User.updateOne({ _id: followerId }, { $pull: { following: targetId } }),
+    User.updateOne({ _id: targetId }, { $pull: { followers: followerId } })
+  ]);
+};
+
+// Follow/unfollow with explicit pending requests for non-public profiles.
 const toggleFollow = async (req, res) => {
   try {
     const targetUserId = req.params.id;
@@ -611,8 +736,9 @@ const toggleFollow = async (req, res) => {
       });
     }
 
-    // Check target exists (lean, minimal fields)
-    const targetUser = await User.findById(targetUserId).select('isActive').lean();
+    const targetUser = await User.findById(targetUserId)
+      .select('isActive username profile privacySettings blockedUsers')
+      .lean();
     if (!targetUser || !targetUser.isActive) {
       return res.status(404).json({
         success: false,
@@ -620,61 +746,113 @@ const toggleFollow = async (req, res) => {
       });
     }
 
-    // Check follow state via Follow collection (single indexed query)
     const isFollowing = await Follow.isFollowing(currentUserId, targetUserId);
-
-    if (isFollowing) {
-      // Unfollow — remove from Follow collection + atomic pull from User arrays
+    if (req.method === 'DELETE') {
       await Promise.all([
-        Follow.unfollow(currentUserId, targetUserId),
-        User.updateOne({ _id: currentUserId }, { $pull: { following: targetUserId } }),
-        User.updateOne({ _id: targetUserId }, { $pull: { followers: currentUserId } })
+        isFollowing ? persistUnfollow(currentUserId, targetUserId) : Promise.resolve(),
+        FollowRequest.updateMany(
+          { requester: currentUserId, target: targetUserId, status: 'pending' },
+          { $set: { status: 'cancelled', resolvedAt: new Date() } }
+        )
       ]);
-    } else {
-      // Follow — insert into Follow collection + atomic addToSet on User arrays
-      await Promise.all([
-        Follow.follow(currentUserId, targetUserId),
-        User.updateOne({ _id: currentUserId }, { $addToSet: { following: targetUserId } }),
-        User.updateOne({ _id: targetUserId }, { $addToSet: { followers: currentUserId } })
-      ]);
-
-      // Await the canonical producer so the durable push attempt is persisted
-      // before the follow response is acknowledged.
-      try {
-        await createFollowNotification(targetUserId, currentUserId);
-      } catch (notificationError) {
-        log.error('Follow notification delivery failed', {
-          error: String(notificationError),
-          senderId: String(currentUserId),
-          recipientId: String(targetUserId)
-        });
+      await invalidateFollowCaches(currentUserId, targetUserId);
+      const postUnfollowPrivacy = await resolvePrivacyAccess({ viewer: req.user, targetUser });
+      if (!postUnfollowPrivacy.access.canSeeOnlineStatus) {
+        removePresenceSubscription(req.app?.get?.('io') || global._arcSocketIO, currentUserId, targetUserId);
       }
+      return res.status(200).json({
+        success: true,
+        message: isFollowing ? 'User unfollowed' : 'Follow request cancelled',
+        data: {
+          isFollowing: false,
+          followStatus: 'none',
+          followersCount: await Follow.getFollowerCount(targetUserId)
+        }
+      });
     }
 
-    // Invalidate caches — delete both ObjectId-keyed AND username-keyed entries
-    // because clients can request profiles by either identifier and they cache separately
-    const [cuUser, tuUser] = await Promise.all([
-      User.findById(currentUserId).select('username').lean(),
-      User.findById(targetUserId).select('username').lean(),
-    ]);
-    await Promise.all([
-      invalidateUserCache(currentUserId),
-      invalidateUserCache(targetUserId),
-      del(profileCacheKey(String(currentUserId))),
-      del(profileCacheKey(String(targetUserId))),
-      cuUser?.username ? del(profileCacheKey(cuUser.username)) : Promise.resolve(),
-      tuUser?.username ? del(profileCacheKey(tuUser.username)) : Promise.resolve(),
-    ]);
+    if (isFollowing) {
+      return res.status(200).json({
+        success: true,
+        message: 'Already following this user',
+        data: {
+          isFollowing: true,
+          followStatus: 'accepted',
+          followersCount: await Follow.getFollowerCount(targetUserId)
+        }
+      });
+    }
 
-    // Get updated count from Follow collection (cheap indexed count)
-    const followersCount = await Follow.getFollowerCount(targetUserId);
+    const relationship = await resolvePrivacyAccess({ viewer: req.user, targetUser });
+    if (relationship.blocked) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+    if (!relationship.access.canFollow) {
+      return res.status(403).json({
+        success: false,
+        code: 'FOLLOW_REQUESTS_DISABLED',
+        reason: 'follow_requests_disabled',
+        message: 'This user is not accepting follow requests'
+      });
+    }
 
-    res.status(200).json({
+    if (relationship.settings.profileVisibility !== 'public') {
+      let request = await FollowRequest.findOne({ requester: currentUserId, target: targetUserId, status: 'pending' });
+      if (!request) {
+        try {
+          request = await FollowRequest.findOneAndUpdate(
+            { requester: currentUserId, target: targetUserId, status: 'pending' },
+            { $setOnInsert: { requester: currentUserId, target: targetUserId, status: 'pending' } },
+            { upsert: true, new: true, setDefaultsOnInsert: true }
+          );
+        } catch (error) {
+          if (error?.code !== 11000) throw error;
+          request = await FollowRequest.findOne({ requester: currentUserId, target: targetUserId, status: 'pending' });
+          if (!request) throw error;
+        }
+        await createAndEmitNotification({
+          recipient: targetUserId,
+          sender: currentUserId,
+          type: 'follow',
+          title: 'New follow request',
+          message: `${req.user.profile?.displayName || req.user.username || 'Someone'} requested to follow you.`,
+          data: {
+            deepLink: '/settings/privacy?section=follow-requests',
+            customData: {
+              eventType: 'follow_request',
+              followRequestId: String(request._id),
+              notificationDedupeKey: `follow-request:${request._id}`,
+              pushRequestId: `follow-request:${request._id}`
+            }
+          }
+        }).catch((notificationError) => {
+          log.error('Follow request notification delivery failed', { error: String(notificationError) });
+        });
+      }
+      return res.status(202).json({
+        success: true,
+        message: 'Follow request sent',
+        data: {
+          isFollowing: false,
+          followStatus: 'pending',
+          followRequestId: request._id,
+          followersCount: await Follow.getFollowerCount(targetUserId)
+        }
+      });
+    }
+
+    await persistFollow(currentUserId, targetUserId);
+    await invalidateFollowCaches(currentUserId, targetUserId);
+    await createFollowNotification(targetUserId, currentUserId).catch((notificationError) => {
+      log.error('Follow notification delivery failed', { error: String(notificationError) });
+    });
+    return res.status(200).json({
       success: true,
-      message: isFollowing ? 'User unfollowed' : 'User followed',
+      message: 'User followed',
       data: {
-        isFollowing: !isFollowing,
-        followersCount
+        isFollowing: true,
+        followStatus: 'accepted',
+        followersCount: await Follow.getFollowerCount(targetUserId)
       }
     });
 
@@ -687,56 +865,92 @@ const toggleFollow = async (req, res) => {
   }
 };
 
+const getTargetPrivacy = async (req, identifier) => {
+  const target = identifier && /^[0-9a-fA-F]{24}$/.test(String(identifier))
+    ? await User.findById(identifier).select('username userType profile privacySettings blockedUsers isActive')
+    : await User.findOne({ username: identifier }).select('username userType profile privacySettings blockedUsers isActive');
+  if (!target || !target.isActive) return null;
+  const relationship = await resolvePrivacyAccess({ viewer: req.user, targetUser: target });
+  return { target, relationship };
+};
+
+const getViewerListExclusions = async (viewer) => {
+  if (!viewer?._id || viewer.userType === 'guest') return [];
+  const [viewerRecord, usersBlockingViewer] = await Promise.all([
+    User.findById(viewer._id).select('blockedUsers').lean(),
+    User.find({ blockedUsers: viewer._id, isActive: true }).select('_id').lean()
+  ]);
+  return [
+    ...(viewerRecord?.blockedUsers || []),
+    ...usersBlockingViewer.map((user) => user._id)
+  ];
+};
+
+const privacyDenied = (res, target, privacyAccess, message = 'This content is private') => res.status(403).json({
+  success: false,
+  code: 'PRIVACY_RESTRICTED',
+  reason: privacyAccess?.reason || 'privacy_restricted',
+  message,
+  data: { user: minimalProfile(target), privacyAccess }
+});
+
 // Get user's followers — queries Follow collection instead of populating User arrays
 const getFollowers = async (req, res) => {
   try {
     const userId = req.params.id;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
     const search = normalizeQuerySearch(
       req.query.search !== undefined ? req.query.search : req.query.q
     );
 
-    // Use Follow model for efficient paginated query
-    const result = await Follow.getFollowers(userId, { page, limit });
-
-    let followers = result.users;
-
-    // Exclude duo teams and apply search filter
-    followers = followers.filter(f => f && !f.username?.startsWith('duo_'));
-    if (search) {
-      const searchLower = search.toLowerCase();
-      followers = followers.filter(follower =>
-        follower.username?.toLowerCase().startsWith(searchLower) ||
-        (follower.profile?.displayName && follower.profile.displayName.toLowerCase().startsWith(searchLower))
-      );
+    const targetPrivacy = await getTargetPrivacy(req, userId);
+    if (!targetPrivacy) return res.status(404).json({ success: false, message: 'User not found' });
+    if (!targetPrivacy.relationship.access.canViewFollowers) {
+      return privacyDenied(res, targetPrivacy.target, targetPrivacy.relationship.access);
     }
+
+    // Apply block and search constraints before pagination/counting. Filtering
+    // afterwards produced short pages and leaked hidden relationship totals.
+    const excludeUserIds = await getViewerListExclusions(req.user);
+    const result = await Follow.getFollowers(targetPrivacy.target._id, { page, limit, search, excludeUserIds });
+    const followers = result.users;
 
     const isGuest = req.user && req.user.userType === 'guest';
     const viewerId = req.user?._id;
-    const viewerFollows = viewerId && !isGuest && followers.length > 0
-      ? await Follow.find({
-          follower: viewerId,
-          following: { $in: followers.map(f => f._id) }
-        }).select('following').lean()
-      : [];
+    const [viewerFollows, pendingRequests] = viewerId && !isGuest && followers.length > 0
+      ? await Promise.all([
+          Follow.find({ follower: viewerId, following: { $in: followers.map(f => f._id) } }).select('following').lean(),
+          FollowRequest.find({ requester: viewerId, target: { $in: followers.map(f => f._id) }, status: 'pending' }).select('target').lean()
+        ])
+      : [[], []];
     const viewerFollowingIds = new Set(viewerFollows.map(f => f.following.toString()));
+    const pendingIds = new Set(pendingRequests.map(request => request.target.toString()));
+
+    const followerDtos = await Promise.all(followers.map(async (f) => {
+      const relationship = await resolvePrivacyAccess({ viewer: req.user, targetUser: f });
+      if (relationship.blocked) return null;
+      const dto = relationship.access.restricted ? minimalProfile(f) : formatUserDTO(f, isGuest, false, relationship.access.canSeeOnlineStatus);
+      delete dto.privacySettings;
+      dto.privacyAccess = relationship.access;
+      const id = f._id.toString();
+      dto.isFollowing = Boolean(viewerId && id !== viewerId.toString() && viewerFollowingIds.has(id));
+      const followRequestPending = pendingIds.has(id);
+      dto.followStatus = dto.isFollowing ? 'accepted' : followRequestPending ? 'pending' : 'none';
+      dto.privacyAccess = { ...dto.privacyAccess, canFollow: dto.privacyAccess.canFollow && !followRequestPending && !dto.isFollowing, followRequestPending };
+      return dto;
+    }));
+    const visibleFollowerDtos = followerDtos.filter(Boolean);
 
     res.status(200).json({
       success: true,
       data: {
-        followers: followers.map(f => {
-          const dto = formatUserDTO(f, isGuest, false);
-          const id = f._id.toString();
-          dto.isFollowing = viewerId && id !== viewerId.toString()
-            ? viewerFollowingIds.has(id)
-            : false;
-          return dto;
-        }),
+        followers: visibleFollowerDtos,
+        privacyAccess: targetPrivacy.relationship.access,
         pagination: {
           current: page,
           total: result.pages,
-          count: followers.length,
+          count: visibleFollowerDtos.length,
           totalFollowers: result.total
         }
       }
@@ -755,40 +969,57 @@ const getFollowers = async (req, res) => {
 const getFollowing = async (req, res) => {
   try {
     const userId = req.params.id;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const search = normalizeQuerySearch(
+      req.query.search !== undefined ? req.query.search : req.query.q
+    );
 
-    // Use Follow model for efficient paginated query
-    const result = await Follow.getFollowing(userId, { page, limit });
+    const targetPrivacy = await getTargetPrivacy(req, userId);
+    if (!targetPrivacy) return res.status(404).json({ success: false, message: 'User not found' });
+    if (!targetPrivacy.relationship.access.canViewFollowers) {
+      return privacyDenied(res, targetPrivacy.target, targetPrivacy.relationship.access);
+    }
 
-    // Exclude duo teams
-    const following = result.users.filter(f => f && !f.username?.startsWith('duo_'));
+    const excludeUserIds = await getViewerListExclusions(req.user);
+    const result = await Follow.getFollowing(targetPrivacy.target._id, { page, limit, search, excludeUserIds });
+    const following = result.users;
 
     const isGuest = req.user && req.user.userType === 'guest';
     const viewerId = req.user?._id;
-    const viewerFollows = viewerId && !isGuest && following.length > 0
-      ? await Follow.find({
-          follower: viewerId,
-          following: { $in: following.map(f => f._id) }
-        }).select('following').lean()
-      : [];
+    const [viewerFollows, pendingRequests] = viewerId && !isGuest && following.length > 0
+      ? await Promise.all([
+          Follow.find({ follower: viewerId, following: { $in: following.map(f => f._id) } }).select('following').lean(),
+          FollowRequest.find({ requester: viewerId, target: { $in: following.map(f => f._id) }, status: 'pending' }).select('target').lean()
+        ])
+      : [[], []];
     const viewerFollowingIds = new Set(viewerFollows.map(f => f.following.toString()));
+    const pendingIds = new Set(pendingRequests.map(request => request.target.toString()));
+
+    const followingDtos = await Promise.all(following.map(async (f) => {
+      const relationship = await resolvePrivacyAccess({ viewer: req.user, targetUser: f });
+      if (relationship.blocked) return null;
+      const dto = relationship.access.restricted ? minimalProfile(f) : formatUserDTO(f, isGuest, false, relationship.access.canSeeOnlineStatus);
+      delete dto.privacySettings;
+      dto.privacyAccess = relationship.access;
+      const id = f._id.toString();
+      dto.isFollowing = Boolean(viewerId && id !== viewerId.toString() && viewerFollowingIds.has(id));
+      const followRequestPending = pendingIds.has(id);
+      dto.followStatus = dto.isFollowing ? 'accepted' : followRequestPending ? 'pending' : 'none';
+      dto.privacyAccess = { ...dto.privacyAccess, canFollow: dto.privacyAccess.canFollow && !followRequestPending && !dto.isFollowing, followRequestPending };
+      return dto;
+    }));
+    const visibleFollowingDtos = followingDtos.filter(Boolean);
 
     res.status(200).json({
       success: true,
       data: {
-        following: following.map(f => {
-          const dto = formatUserDTO(f, isGuest, false);
-          const id = f._id.toString();
-          dto.isFollowing = viewerId && id !== viewerId.toString()
-            ? viewerFollowingIds.has(id)
-            : false;
-          return dto;
-        }),
+        following: visibleFollowingDtos,
+        privacyAccess: targetPrivacy.relationship.access,
         pagination: {
           current: page,
           total: result.pages,
-          count: following.length,
+          count: visibleFollowingDtos.length,
           totalFollowing: result.total
         }
       }
@@ -825,7 +1056,7 @@ const getUserPosts = async (req, res) => {
       user = await User.findOne({ username: identifier });
     }
     
-    if (!user) {
+    if (!user || !user.isActive) {
       return res.status(404).json({
         success: false,
         message: 'User not found'
@@ -833,23 +1064,19 @@ const getUserPosts = async (req, res) => {
     }
 
     const userId = user._id.toString();
-
-    // Build visibility filter
-    let visibilityFilter = ['public'];
-    
-    // If viewing own posts, include all visibility levels
-    if (req.user && req.user._id.toString() === userId) {
-      visibilityFilter = ['public', 'followers', 'private'];
-    } 
-    // If following the user, include followers posts
-    else if (req.user && Array.isArray(req.user.following) && req.user.following.some(f => f.toString() === userId)) {
-      visibilityFilter = ['public', 'followers'];
+    const relationship = await resolvePrivacyAccess({ viewer: req.user, targetUser: user });
+    if (!relationship.access.canViewPosts) {
+      return privacyDenied(res, user, relationship.access, 'Posts are not available for this account');
     }
+    const visibilityFilter = relationship.isSelf
+      ? ['public', 'followers', 'private']
+      : relationship.isFollower ? ['public', 'followers'] : ['public'];
 
     if (process.env.NODE_ENV === 'development') { console.log('Visibility filter:', visibilityFilter);}
     const posts = await Post.find({
       author: user._id,
       isActive: true,
+      hiddenByAdmin: { $ne: true },
       visibility: { $in: visibilityFilter }
     })
     .populate('author', 'username profile.displayName profile.avatar profilePicture avatar userType')
@@ -863,6 +1090,7 @@ const getUserPosts = async (req, res) => {
     const total = await Post.countDocuments({
       author: user._id,
       isActive: true,
+      hiddenByAdmin: { $ne: true },
       visibility: { $in: visibilityFilter }
     });
 
@@ -872,6 +1100,7 @@ const getUserPosts = async (req, res) => {
       success: true,
       data: {
         posts: posts.map(p => formatPostDTO(p, isGuest, req.user && req.user._id && !isGuest && p.author && p.author._id && p.author._id.toString() === req.user._id.toString())),
+        privacyAccess: relationship.access,
         pagination: {
           current: page,
           total: Math.ceil(total / limit),
@@ -906,7 +1135,7 @@ const getUserClips = async (req, res) => {
       user = await User.findOne({ username: identifier });
     }
 
-    if (!user) {
+    if (!user || !user.isActive) {
       return res.status(404).json({
         success: false,
         message: 'User not found'
@@ -914,16 +1143,18 @@ const getUserClips = async (req, res) => {
     }
 
     const userId = user._id.toString();
-    let visibilityFilter = ['public'];
-    if (req.user && req.user._id.toString() === userId) {
-      visibilityFilter = ['public', 'followers', 'private'];
-    } else if (req.user && Array.isArray(req.user.following) && req.user.following.some(f => f.toString() === userId)) {
-      visibilityFilter = ['public', 'followers'];
+    const relationship = await resolvePrivacyAccess({ viewer: req.user, targetUser: user });
+    if (!relationship.access.canViewClips) {
+      return privacyDenied(res, user, relationship.access, 'Clips are not available for this account');
     }
+    const visibilityFilter = relationship.isSelf
+      ? ['public', 'followers', 'private']
+      : relationship.isFollower ? ['public', 'followers'] : ['public'];
 
     const filter = {
       author: user._id,
       isActive: true,
+      hiddenByAdmin: { $ne: true },
       visibility: { $in: visibilityFilter },
       'content.media': { $elemMatch: { type: 'video' } }
     };
@@ -944,6 +1175,7 @@ const getUserClips = async (req, res) => {
       success: true,
       data: {
         posts: posts.map(p => formatPostDTO(p, isGuest, req.user && req.user._id && !isGuest && p.author && p.author._id && p.author._id.toString() === req.user._id.toString())),
+        privacyAccess: relationship.access,
         pagination: {
           current: page,
           total: Math.ceil(total / limit),
@@ -2079,11 +2311,38 @@ const clashRoyaleAPI = require('../utils/clashRoyaleAPI');
 const sendInviteMessage = async (teamId, playerId, inviteType, inviteData) => {
   try {
     const { Message } = require('../models/Message');
-    const team = await User.findById(teamId);
-    const player = await User.findById(playerId);
+    const [team, player] = await Promise.all([
+      User.findOne({ _id: teamId, isActive: true })
+        .select('username userType profile privacySettings blockedUsers isActive'),
+      User.findOne({ _id: playerId, isActive: true })
+        .select('username userType profile privacySettings blockedUsers isActive')
+    ]);
     
     if (!team || !player) {
       throw new Error('Team or player not found');
+    }
+
+    const existingConversation = Boolean(await Message.exists({
+      messageType: 'direct',
+      isDeleted: false,
+      $or: [
+        { sender: teamId, recipient: playerId },
+        { sender: playerId, recipient: teamId }
+      ]
+    }));
+    const playerAccess = await resolvePrivacyAccess({
+      viewer: team,
+      targetUser: player,
+      existingConversation
+    });
+    if (!playerAccess.access.canMessage) {
+      log.info('Team invite DM suppressed by recipient privacy', {
+        teamId: String(teamId),
+        playerId: String(playerId),
+        inviteType,
+        reason: playerAccess.blocked ? 'blocked' : playerAccess.settings.allowMessageFrom
+      });
+      return null;
     }
 
     let messageText = '';
@@ -3242,8 +3501,30 @@ const blockUser = async (req, res) => {
     currentUser.followers = (currentUser.followers || []).filter(id => id.toString() !== targetUserId);
     targetUser.followers = (targetUser.followers || []).filter(id => id.toString() !== currentUserId.toString());
     targetUser.following = (targetUser.following || []).filter(id => id.toString() !== currentUserId.toString());
-    await currentUser.save();
-    await targetUser.save();
+    await Promise.all([
+      currentUser.save(),
+      targetUser.save(),
+      Follow.deleteMany({
+        $or: [
+          { follower: currentUserId, following: targetUserId },
+          { follower: targetUserId, following: currentUserId }
+        ]
+      }),
+      FollowRequest.updateMany(
+        {
+          status: 'pending',
+          $or: [
+            { requester: currentUserId, target: targetUserId },
+            { requester: targetUserId, target: currentUserId }
+          ]
+        },
+        { $set: { status: 'cancelled', resolvedAt: new Date() } }
+      )
+    ]);
+    await invalidateFollowCaches(currentUserId, targetUserId);
+    const presenceIo = req.app?.get?.('io') || global._arcSocketIO;
+    removePresenceSubscription(presenceIo, currentUserId, targetUserId);
+    removePresenceSubscription(presenceIo, targetUserId, currentUserId);
     res.status(200).json({ success: true, message: 'User blocked' });
   } catch (error) {
     log.error('Block user error:', { error: String(error) });
@@ -3268,6 +3549,7 @@ const unblockUser = async (req, res) => {
     if (!currentUser.blockedUsers) currentUser.blockedUsers = [];
     currentUser.blockedUsers = currentUser.blockedUsers.filter(id => id.toString() !== targetUserId);
     await currentUser.save();
+    await invalidateFollowCaches(currentUserId, targetUserId);
     res.status(200).json({ success: true, message: 'User unblocked' });
   } catch (error) {
     log.error('Unblock user error:', { error: String(error) });
@@ -3332,32 +3614,11 @@ const getAvatar = async (req, res) => {
 // Get privacy settings for the authenticated user
 const getPrivacySettings = async (req, res) => {
   try {
-    const defaults = { accountType: 'public', whoCanMessage: 'anyone', showActivityStatus: true, whoCanAddToGroup: 'anyone' };
-    const privacySettings = req.user.privacySettings
-      ? { ...defaults, ...req.user.privacySettings.toObject() }
-      : defaults;
-
-    // Legacy value fallback map for whoCanMessage
-    const whoCanMessageLegacyMap = {
-      'everyone': 'anyone',
-      'following': 'people_you_follow',
-      'followers': 'nobody',
-    };
-    if (whoCanMessageLegacyMap[privacySettings.whoCanMessage]) {
-      privacySettings.whoCanMessage = whoCanMessageLegacyMap[privacySettings.whoCanMessage];
-    }
-
-    // Legacy value fallback map for whoCanAddToGroup
-    const whoCanAddToGroupLegacyMap = {
-      'everyone': 'anyone',
-      'following': 'people_you_follow',
-      'followers': 'nobody',
-    };
-    if (whoCanAddToGroupLegacyMap[privacySettings.whoCanAddToGroup]) {
-      privacySettings.whoCanAddToGroup = whoCanAddToGroupLegacyMap[privacySettings.whoCanAddToGroup];
-    }
-
-    res.status(200).json({ success: true, privacySettings });
+    const user = await User.findById(req.user._id).select('privacySettings').lean();
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    return res.status(200).json(privacySettingsResponse(user.privacySettings, {
+      whoCanAddToGroup: user.privacySettings?.whoCanAddToGroup || 'anyone'
+    }));
   } catch (error) {
     res.status(500).json({ success: false, message: 'Failed to fetch privacy settings' });
   }
@@ -3366,50 +3627,187 @@ const getPrivacySettings = async (req, res) => {
 // Update privacy settings for the authenticated user
 const updatePrivacySettings = async (req, res) => {
   try {
-    const { accountType, whoCanMessage, showActivityStatus, whoCanAddToGroup } = req.body;
-    const update = {};
+    if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+      return res.status(400).json({ success: false, message: 'Privacy settings must be an object' });
+    }
+    if (Object.keys(req.body).length === 0) {
+      return res.status(400).json({ success: false, message: 'At least one privacy setting is required' });
+    }
+    const allowedKeys = new Set([
+      'profileVisibility', 'allowMessageFrom', 'showOnlineStatus',
+      'allowFollowRequests', 'showPostsToFollowers',
+      'accountType', 'whoCanMessage', 'showActivityStatus', 'whoCanAddToGroup'
+    ]);
+    const unknownKey = Object.keys(req.body).find((key) => !allowedKeys.has(key));
+    if (unknownKey) {
+      return res.status(400).json({ success: false, message: `Unknown privacy setting: ${unknownKey}` });
+    }
 
-    if (accountType !== undefined) {
-      if (!['public', 'private'].includes(accountType)) {
-        return res.status(400).json({ success: false, message: "accountType must be 'public' or 'private'" });
-      }
-      update['privacySettings.accountType'] = accountType;
+    const currentUser = await User.findById(req.user._id).select('username privacySettings');
+    if (!currentUser) return res.status(404).json({ success: false, message: 'User not found' });
+    const current = normalizePrivacySettings(currentUser.privacySettings);
+    const incomingCanonical = {
+      ...current,
+      ...(req.body.profileVisibility !== undefined
+        ? { profileVisibility: req.body.profileVisibility }
+        : req.body.accountType !== undefined ? { profileVisibility: req.body.accountType } : {}),
+      ...(req.body.allowMessageFrom !== undefined
+        ? { allowMessageFrom: req.body.allowMessageFrom }
+        : req.body.whoCanMessage !== undefined ? { allowMessageFrom: req.body.whoCanMessage } : {}),
+      ...(req.body.showOnlineStatus !== undefined
+        ? { showOnlineStatus: req.body.showOnlineStatus }
+        : req.body.showActivityStatus !== undefined ? { showOnlineStatus: req.body.showActivityStatus } : {}),
+      ...(req.body.allowFollowRequests !== undefined ? { allowFollowRequests: req.body.allowFollowRequests } : {}),
+      ...(req.body.showPostsToFollowers !== undefined ? { showPostsToFollowers: req.body.showPostsToFollowers } : {})
+    };
+
+    if (!PROFILE_VISIBILITY.includes(String(incomingCanonical.profileVisibility))) {
+      return res.status(400).json({ success: false, message: "profileVisibility must be 'public', 'followers', or 'private'" });
     }
-    if (whoCanMessage !== undefined) {
-      if (!['anyone', 'people_you_follow', 'nobody'].includes(whoCanMessage)) {
-        return res.status(400).json({ success: false, message: "whoCanMessage must be 'anyone', 'people_you_follow', or 'nobody'" });
+    if (!MESSAGE_AUDIENCE.includes(String(incomingCanonical.allowMessageFrom))) {
+      const legacyAllowed = ['anyone', 'people_you_follow', 'nobody'];
+      if (!legacyAllowed.includes(String(incomingCanonical.allowMessageFrom))) {
+        return res.status(400).json({ success: false, message: "allowMessageFrom must be 'everyone', 'followers', or 'none'" });
       }
-      update['privacySettings.whoCanMessage'] = whoCanMessage;
     }
-    if (whoCanAddToGroup !== undefined) {
-      if (!['anyone', 'people_you_follow', 'nobody'].includes(whoCanAddToGroup)) {
+    for (const key of ['showOnlineStatus', 'allowFollowRequests', 'showPostsToFollowers']) {
+      if (typeof incomingCanonical[key] !== 'boolean') {
+        return res.status(400).json({ success: false, message: `${key} must be a boolean` });
+      }
+    }
+
+    const canonical = normalizePrivacySettings(incomingCanonical);
+    const legacy = canonicalToLegacyAliases(canonical);
+    const update = {};
+    Object.entries(canonical).forEach(([key, value]) => { update[`privacySettings.${key}`] = value; });
+    Object.entries(legacy).forEach(([key, value]) => { update[`privacySettings.${key}`] = value; });
+
+    if (req.body.whoCanAddToGroup !== undefined) {
+      if (!['anyone', 'people_you_follow', 'nobody'].includes(req.body.whoCanAddToGroup)) {
         return res.status(400).json({ success: false, message: "whoCanAddToGroup must be 'anyone', 'people_you_follow', or 'nobody'" });
       }
-      update['privacySettings.whoCanAddToGroup'] = whoCanAddToGroup;
-    }
-    if (showActivityStatus !== undefined) {
-      if (typeof showActivityStatus !== 'boolean') {
-        return res.status(400).json({ success: false, message: 'showActivityStatus must be a boolean' });
-      }
-      update['privacySettings.showActivityStatus'] = showActivityStatus;
+      update['privacySettings.whoCanAddToGroup'] = req.body.whoCanAddToGroup;
     }
 
     const user = await User.findByIdAndUpdate(
       req.user._id,
       { $set: update },
       { new: true, runValidators: true }
-    ).select('privacySettings');
+    ).select('username privacySettings');
 
-    const defaults = { accountType: 'public', whoCanMessage: 'anyone', whoCanAddToGroup: 'anyone', showActivityStatus: true };
-    const privacySettings = user.privacySettings
-      ? { ...defaults, ...user.privacySettings.toObject() }
-      : defaults;
+    await Promise.all([
+      invalidateUserCache(req.user._id),
+      invalidateProfileCache(req.user._id, user?.username)
+    ]);
+    const io = req.app?.get?.('io') || global._arcSocketIO;
+    publishPrivacySettingsUpdate(io, req.user._id);
+    evictPresenceAudience(io, req.user._id);
 
-    res.status(200).json({ success: true, privacySettings });
+    return res.status(200).json(privacySettingsResponse(user.privacySettings, {
+      whoCanAddToGroup: user.privacySettings?.whoCanAddToGroup || 'anyone'
+    }));
   } catch (error) {
     res.status(500).json({ success: false, message: 'Failed to update privacy settings' });
   }
 };
+
+const getFollowRequests = async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const filter = { target: req.user._id, status: 'pending' };
+    const requesterIds = await FollowRequest.find(filter).distinct('requester');
+    const activeRequesterIds = await User.find({ _id: { $in: requesterIds }, isActive: true }).distinct('_id');
+    await FollowRequest.updateMany(
+      { ...filter, requester: { $nin: activeRequesterIds } },
+      { $set: { status: 'cancelled', resolvedAt: new Date() } }
+    );
+    const [requests, total] = await Promise.all([
+      FollowRequest.find(filter)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .populate({
+          path: 'requester',
+          match: { isActive: true },
+          select: 'username userType profile.displayName profile.avatar'
+        })
+        .lean(),
+      FollowRequest.countDocuments(filter)
+    ]);
+    return res.json({
+      success: true,
+      data: {
+        requests: requests.filter((request) => request.requester),
+        pagination: { current: page, total: Math.ceil(total / limit), count: requests.filter((request) => request.requester).length, totalRequests: total }
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: 'Failed to fetch follow requests' });
+  }
+};
+
+const resolveFollowRequest = async (req, res, status) => {
+  try {
+    const resolvedAt = new Date();
+    const request = await FollowRequest.findOneAndUpdate({
+      _id: req.params.requestId,
+      target: req.user._id,
+      status: 'pending'
+    }, {
+      $set: { status, resolvedAt }
+    }, { new: true });
+    if (!request) return res.status(404).json({ success: false, message: 'Follow request not found' });
+
+    if (status === 'accepted') {
+      const requesterStillActive = await User.exists({ _id: request.requester, isActive: true });
+      if (!requesterStillActive) {
+        request.status = 'cancelled';
+        await request.save();
+        return res.status(404).json({ success: false, message: 'Follow request not found' });
+      }
+      try {
+        await persistFollow(request.requester, request.target);
+      } catch (error) {
+        await FollowRequest.updateOne(
+          { _id: request._id, status: 'accepted', resolvedAt },
+          { $set: { status: 'pending' }, $unset: { resolvedAt: 1 } }
+        );
+        throw error;
+      }
+    }
+    await invalidateFollowCaches(request.requester, request.target);
+
+    if (status === 'accepted') {
+      await createAndEmitNotification({
+        recipient: request.requester,
+        sender: request.target,
+        type: 'follow',
+        title: 'Follow request accepted',
+        message: `${req.user.profile?.displayName || req.user.username || 'Someone'} accepted your follow request.`,
+        data: {
+          deepLink: `/user/${req.user.username}`,
+          customData: {
+            eventType: 'follow_acceptance',
+            followRequestId: String(request._id),
+            notificationDedupeKey: `follow-accepted:${request._id}`,
+            pushRequestId: `follow-accepted:${request._id}`
+          }
+        }
+      }).catch(() => {});
+    }
+
+    return res.json({
+      success: true,
+      data: { requestId: request._id, status, isFollowing: status === 'accepted' }
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: 'Failed to update follow request' });
+  }
+};
+
+const acceptFollowRequest = (req, res) => resolveFollowRequest(req, res, 'accepted');
+const rejectFollowRequest = (req, res) => resolveFollowRequest(req, res, 'rejected');
 
 const notificationSettingDefaults = {
   pushEnabled: true,
@@ -3512,53 +3910,33 @@ const getDmPrivacy = async (req, res) => {
     const targetUserId = req.params.userId;
     const callerId = req.user._id;
 
-    const targetUser = await User.findById(targetUserId).select('privacySettings following');
-    if (!targetUser) {
+    const targetUser = await User.findById(targetUserId)
+      .select('username userType profile privacySettings blockedUsers isActive');
+    if (!targetUser || !targetUser.isActive) {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
-
-    const whoCanMessage = targetUser.privacySettings && targetUser.privacySettings.whoCanMessage;
-
-    // If target already initiated a conversation with caller, always allow replies
-    if (whoCanMessage && whoCanMessage !== 'anyone') {
-      const { Message } = require('../models/Message');
-      const targetInitiated = await Message.exists({
-        messageType: 'direct',
-        sender: targetUserId,
-        recipient: callerId,
-        isDeleted: false
-      });
-      if (targetInitiated) {
-        return res.status(200).json({ success: true, canMessage: true, reason: 'allowed' });
-      }
-    }
-
-    let canMessage;
-    let reason;
-
-    if (!whoCanMessage || whoCanMessage === 'anyone') {
-      canMessage = true;
-      reason = 'allowed';
-    } else if (whoCanMessage === 'people_you_follow') {
-      const following = targetUser.following || [];
-      const callerIdStr = callerId.toString();
-      const isFollowing = following.some(id => id.toString() === callerIdStr);
-      if (isFollowing) {
-        canMessage = true;
-        reason = 'allowed';
-      } else {
-        canMessage = false;
-        reason = 'not_following';
-      }
-    } else if (whoCanMessage === 'nobody') {
-      canMessage = false;
-      reason = 'privacy_blocked';
-    } else {
-      canMessage = true;
-      reason = 'allowed';
-    }
-
-    return res.status(200).json({ success: true, canMessage, reason });
+    const { Message } = require('../models/Message');
+    const existingConversation = Boolean(await Message.exists({
+      messageType: 'direct',
+      isDeleted: false,
+      $or: [
+        { sender: targetUserId, recipient: callerId },
+        { sender: callerId, recipient: targetUserId }
+      ]
+    }));
+    const relationship = await resolvePrivacyAccess({ viewer: req.user, targetUser, existingConversation });
+    const reason = relationship.access.canMessage
+      ? existingConversation ? 'existing_conversation' : 'allowed'
+      : relationship.blocked
+        ? 'blocked'
+        : relationship.settings.allowMessageFrom === 'followers' ? 'not_follower' : 'messages_disabled';
+    return res.status(200).json({
+      success: true,
+      canMessage: relationship.access.canMessage,
+      code: relationship.access.canMessage ? 'MESSAGE_ALLOWED' : 'MESSAGE_PRIVACY_RESTRICTED',
+      reason,
+      privacyAccess: relationship.access
+    });
   } catch (error) {
     return res.status(500).json({ success: false, message: 'Failed to get DM privacy' });
   }
@@ -3574,6 +3952,9 @@ module.exports = {
   getLiveTournamentHistory,
   getUserTournamentHistory,
   toggleFollow,
+  getFollowRequests,
+  acceptFollowRequest,
+  rejectFollowRequest,
   getFollowers,
   getFollowing,
   getUserPosts,

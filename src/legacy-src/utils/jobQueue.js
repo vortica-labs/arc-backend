@@ -11,6 +11,12 @@
 const log = require('./logger');
 const { createHash, randomUUID } = require('crypto');
 const { evaluateEmailPolicy } = require('./notificationChannelPolicy');
+const {
+  buildEmailAuditContext,
+  captureEmailCallStack,
+  inferEmailTriggerSource,
+  sanitizeEmailAuditError
+} = require('./emailAudit');
 
 let _enqueueEmail = null;
 let _enqueueBulkNotifications = null;
@@ -80,7 +86,8 @@ const removeBroadcastJobs = async (broadcastId) => {
 
 /**
  * Enqueue an email to be sent in the background.
- * Falls back to direct sending if queue is unavailable.
+ * Uses direct delivery only before a queue function has been injected. Once
+ * BullMQ is active, enqueue errors are surfaced to avoid ambiguous duplicates.
  * @param {string} to
  * @param {string} subject
  * @param {string} text
@@ -88,28 +95,55 @@ const removeBroadcastJobs = async (broadcastId) => {
  * @param {{intent: string, eventType?: string, notificationType?: string}} [context]
  */
 const enqueueEmail = async (to, subject, text, link, context = {}) => {
+  const producerStack = context.producerStack || captureEmailCallStack();
+  const triggerSource = context.triggerSource || inferEmailTriggerSource(producerStack);
   const policy = evaluateEmailPolicy(context);
+  const audit = buildEmailAuditContext({
+    to,
+    intent: policy.intent || context.intent,
+    eventType: policy.eventType || context.eventType,
+    notificationType: context.notificationType,
+    templateKey: context.templateKey,
+    triggerSource,
+    producerStack
+  });
   if (!policy.allowed) {
     log.info('Email queue submission suppressed by channel policy', {
-      intent: policy.intent || 'missing',
-      eventType: context.eventType || context.notificationType || '',
+      ...audit,
       reason: policy.reason,
       routineEventType: policy.routineEventType || ''
     });
     return { queued: false, blocked: true, reason: policy.reason };
   }
-  const typedContext = { ...context, intent: policy.intent };
+  const typedContext = {
+    ...context,
+    intent: policy.intent,
+    eventType: policy.eventType,
+    triggerSource,
+    producerStack,
+    templateKey: context.templateKey || 'transactional_notification'
+  };
+  log.info('Email queue submission authorized', audit);
 
   if (_enqueueEmail) {
     try {
       await _enqueueEmail(to, subject, text, link, typedContext);
       return { queued: true, blocked: false };
-    } catch {
-      // Fall through to direct send
+    } catch (error) {
+      // An enqueue acknowledgement can be lost after Redis accepted the job.
+      // Sending synchronously here could therefore deliver the same email
+      // twice. Surface the queue failure and let the caller/recovery path retry
+      // with durable state instead of opening a second delivery path.
+      log.error('Email queue submission failed', {
+        ...audit,
+        error: sanitizeEmailAuditError(error)
+      });
+      throw error;
     }
   }
 
-  // Fallback: send directly (blocking but ensures delivery)
+  // Bootstrap/test fallback only. Production injects BullMQ before accepting
+  // requests, so there is exactly one active delivery path.
   const { sendNotificationEmail } = require('./email');
   const result = await sendNotificationEmail(to, subject, text, link, typedContext);
   if (!result?.sent && !result?.blocked) {

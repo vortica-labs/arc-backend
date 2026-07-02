@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { EMAIL_INTENTS, evaluateEmailPolicy } = require('./notificationChannelPolicy');
 
 const root = path.resolve(__dirname, '..');
 const read = (relativePath) => fs.readFileSync(path.join(root, relativePath), 'utf8');
@@ -24,6 +25,33 @@ assert(!recruitment.includes('EMAIL_INTENTS.'), 'recruitment activity must remai
 
 assert(premium.includes('intent: EMAIL_INTENTS.PREMIUM_LIFECYCLE'));
 assert(premium.includes('eventType: action'));
+for (const eventType of [
+  'activation',
+  'renewal',
+  'plan_change',
+  'cancellation',
+  'access_removal',
+  'resume',
+  'auto_renew_change',
+  'refund',
+  'activated',
+  'charged',
+  'cancelled',
+  'paused',
+  'resumed',
+  'pending',
+  'halted',
+  'completed',
+  'expired',
+  'expiration'
+]) {
+  assert(premium.includes(`'${eventType}'`), `missing premium lifecycle producer event: ${eventType}`);
+  assert.equal(
+    evaluateEmailPolicy({ intent: EMAIL_INTENTS.PREMIUM_LIFECYCLE, eventType }).allowed,
+    true,
+    `premium lifecycle event is not registered: ${eventType}`
+  );
+}
 
 const requiredAdminIntents = [
   'EMAIL_INTENTS.ACCOUNT_LIFECYCLE',
@@ -31,6 +59,22 @@ const requiredAdminIntents = [
 ];
 for (const intent of requiredAdminIntents) {
   assert(admin.includes(intent), `admin critical outcomes must opt into ${intent}`);
+}
+
+for (const [intent, eventType] of [
+  [EMAIL_INTENTS.ACCOUNT_LIFECYCLE, 'account_restored'],
+  [EMAIL_INTENTS.ACCOUNT_LIFECYCLE, 'account_suspended'],
+  [EMAIL_INTENTS.ACCOUNT_LIFECYCLE, 'report_account_suspended'],
+  [EMAIL_INTENTS.PAYMENT_TRANSACTIONAL, 'payout_held'],
+  [EMAIL_INTENTS.PAYMENT_TRANSACTIONAL, 'withdrawal_approved'],
+  [EMAIL_INTENTS.PAYMENT_TRANSACTIONAL, 'withdrawal_rejected'],
+  [EMAIL_INTENTS.PAYMENT_TRANSACTIONAL, 'creator_payout_approved'],
+  [EMAIL_INTENTS.PAYMENT_TRANSACTIONAL, 'creator_payout_processing'],
+  [EMAIL_INTENTS.PAYMENT_TRANSACTIONAL, 'creator_payout_paid'],
+  [EMAIL_INTENTS.PAYMENT_TRANSACTIONAL, 'creator_payout_rejected'],
+  [EMAIL_INTENTS.PAYMENT_TRANSACTIONAL, 'creator_payout_cancelled']
+]) {
+  assert.equal(evaluateEmailPolicy({ intent, eventType }).allowed, true, `admin transactional event is not registered: ${eventType}`);
 }
 
 for (const disabledIntent of [

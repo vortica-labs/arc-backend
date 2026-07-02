@@ -6,6 +6,7 @@ const mongoose = require('mongoose');
 const safeAsyncHandler = require('../utils/safeAsyncHandler');
 const log = require('../utils/logger');
 const { createAndEmitNotification } = require('../utils/notificationEmitter');
+const { resolvePrivacyAccess } = require('../utils/privacyPolicy');
 const {
   TEAM_RECRUITMENT_STATUSES,
   PLAYER_PROFILE_STATUSES,
@@ -283,7 +284,9 @@ const getTeamRecruitments = safeAsyncHandler(async (req, res) => {
     sortBy: safeSortBy,
     sortDirection,
     page,
-    limit
+    limit,
+    viewerId: req.user?._id,
+    viewerBlockedIds: req.user?.blockedUsers
   });
   const totalPages = Math.ceil(total / limit);
 
@@ -309,7 +312,7 @@ const getTeamRecruitment = safeAsyncHandler(async (req, res) => {
     .populate({
       path: 'team',
       match: getValidRecruitmentOwnerMatch('team'),
-      select: 'username profile.displayName profile.avatar profile.bio teamInfo.teamType'
+      select: 'username userType isActive profile privacySettings blockedUsers teamInfo.teamType'
     });
 
   if (!recruitment || !recruitment.team || !isTeamRecruitmentStructurallyValid(recruitment)) {
@@ -320,6 +323,16 @@ const getTeamRecruitment = safeAsyncHandler(async (req, res) => {
   }
 
   const isOwner = sameId(recruitment.team, req.user?._id);
+  const teamPrivacy = await resolvePrivacyAccess({ viewer: req.user, targetUser: recruitment.team });
+  if (!isOwner && !teamPrivacy.access.canViewProfile) {
+    return res.status(403).json({
+      success: false,
+      code: 'PRIVACY_RESTRICTED',
+      reason: teamPrivacy.access.reason,
+      message: 'This recruitment profile is private',
+      data: { privacyAccess: teamPrivacy.access }
+    });
+  }
   if (!isOwner && !isRecruitmentLive(recruitment)) {
     return res.status(404).json({
       success: false,
@@ -672,7 +685,9 @@ const getPlayerProfiles = safeAsyncHandler(async (req, res) => {
     sortBy: safeSortBy,
     sortDirection,
     page,
-    limit
+    limit,
+    viewerId: req.user?._id,
+    viewerBlockedIds: req.user?.blockedUsers
   });
   const totalPages = Math.ceil(total / limit);
 
@@ -698,7 +713,7 @@ const getPlayerProfile = safeAsyncHandler(async (req, res) => {
     .populate({
       path: 'player',
       match: getValidRecruitmentOwnerMatch('player'),
-      select: 'username profile.displayName profile.avatar profile.bio'
+      select: 'username userType isActive profile privacySettings blockedUsers'
     });
 
   if (!profile || !profile.player || !isPlayerProfileStructurallyValid(profile)) {
@@ -709,6 +724,16 @@ const getPlayerProfile = safeAsyncHandler(async (req, res) => {
   }
 
   const isOwner = sameId(profile.player, req.user?._id);
+  const playerPrivacy = await resolvePrivacyAccess({ viewer: req.user, targetUser: profile.player });
+  if (!isOwner && !playerPrivacy.access.canViewProfile) {
+    return res.status(403).json({
+      success: false,
+      code: 'PRIVACY_RESTRICTED',
+      reason: playerPrivacy.access.reason,
+      message: 'This recruitment profile is private',
+      data: { privacyAccess: playerPrivacy.access }
+    });
+  }
   if (!isOwner && !isPlayerProfileLive(profile)) {
     return res.status(404).json({
       success: false,
@@ -880,7 +905,7 @@ const applyToRecruitment = safeAsyncHandler(async (req, res) => {
   const recruitment = await findTeamRecruitmentByIdentifier(recruitmentId).populate({
     path: 'team',
     match: getValidRecruitmentOwnerMatch('team'),
-    select: 'username profile.displayName profile.avatar'
+    select: 'username userType profile.displayName profile.avatar privacySettings blockedUsers isActive'
   });
   if (!recruitment || !recruitment.team || !isTeamRecruitmentStructurallyValid(recruitment)) {
     return res.status(404).json({
@@ -891,6 +916,11 @@ const applyToRecruitment = safeAsyncHandler(async (req, res) => {
 
   if (sameId(recruitment.team, applicantId)) {
     return res.status(403).json({ success: false, message: 'You cannot apply to your own recruitment post' });
+  }
+
+  const teamPrivacy = await resolvePrivacyAccess({ viewer: req.user, targetUser: recruitment.team });
+  if (!teamPrivacy.access.canViewProfile) {
+    return res.status(404).json({ success: false, message: 'Recruitment post not found' });
   }
 
   if (!isRecruitmentLive(recruitment)) {
@@ -1056,7 +1086,7 @@ const showInterestInProfile = safeAsyncHandler(async (req, res) => {
   const profile = await findPlayerProfileByIdentifier(profileId).populate({
     path: 'player',
     match: getValidRecruitmentOwnerMatch('player'),
-    select: 'username profile.displayName profile.avatar'
+    select: 'username userType profile.displayName profile.avatar privacySettings blockedUsers isActive'
   });
   if (!profile || !profile.player || !isPlayerProfileStructurallyValid(profile)) {
     return res.status(404).json({
@@ -1067,6 +1097,11 @@ const showInterestInProfile = safeAsyncHandler(async (req, res) => {
 
   if (sameId(profile.player, teamId)) {
     return res.status(403).json({ success: false, message: 'You cannot show interest in your own profile' });
+  }
+
+  const playerPrivacy = await resolvePrivacyAccess({ viewer: req.user, targetUser: profile.player });
+  if (!playerPrivacy.access.canViewProfile) {
+    return res.status(404).json({ success: false, message: 'Player profile not found' });
   }
 
   if (!isPlayerProfileLive(profile)) {

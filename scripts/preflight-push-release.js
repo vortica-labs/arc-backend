@@ -17,6 +17,10 @@ const run = (script, args = []) => {
 };
 
 const main = async () => {
+  // Refuse to activate an image whose generated worker, canonical policy, or
+  // social producers can reach email outside the exact transactional catalog.
+  run('verify-email-policy-release.js');
+
   // ECS stores production credentials in Secrets Manager rather than directly
   // in the task definition. Load them before spawning any verifier/migration,
   // then inherit the hydrated environment into each child process.

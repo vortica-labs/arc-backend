@@ -5,6 +5,8 @@ const { uploadMultipleFiles } = require('../utils/cloudinary');
 const { STORY_MAX_SECONDS, processStoryVideo } = require('../utils/videoProcessing');
 const log = require('../utils/logger');
 const mongoose = require('mongoose');
+const Follow = require('../models/Follow');
+const { resolvePrivacyAccess, minimalProfile } = require('../utils/privacyPolicy');
 
 const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
 const MAX_CLIENT_UPLOAD_ID_LENGTH = 96;
@@ -15,6 +17,23 @@ const STORY_DEBUG_ENABLED = process.env.STORY_DEBUG === 'true' || process.env.NO
 const storyDebug = (event, payload = {}) => {
   if (!STORY_DEBUG_ENABLED) return;
   log.info(`Story:${event}`, payload);
+};
+
+const rejectStoryPrivacy = (res, target, privacyAccess) => res.status(403).json({
+  success: false,
+  code: 'PRIVACY_RESTRICTED',
+  reason: privacyAccess?.reason || 'privacy_restricted',
+  message: 'Stories are not available for this account',
+  data: { user: minimalProfile(target), privacyAccess }
+});
+
+const getStoryAuthorAccess = async (viewer, authorValue) => {
+  const authorId = toIdStr(authorValue?._id || authorValue);
+  const author = authorValue?.privacySettings
+    ? authorValue
+    : await User.findById(authorId).select('username userType profile privacySettings blockedUsers isActive').lean();
+  if (!author || author.isActive === false) return null;
+  return { author, relationship: await resolvePrivacyAccess({ viewer, targetUser: author }) };
 };
 
 const setStoryNoStoreHeaders = (res) => {
@@ -107,14 +126,20 @@ const getStory = async (req, res) => {
     const story = await Story.findOne(buildActiveStoryQuery({
       _id: storyId,
       createdAt: { $gte: since }
-    })).populate('author', 'username profile.displayName profile.avatar profilePicture').lean();
+    })).populate('author', 'username userType profile profilePicture privacySettings blockedUsers isActive').lean();
     if (!story) {
       return res.status(404).json({ success: false, message: 'Story not found or expired' });
     }
+    const authorAccess = await getStoryAuthorAccess(req.user, story.author);
+    if (!authorAccess) return res.status(404).json({ success: false, message: 'Story not found or expired' });
+    if (!authorAccess.relationship.access.canViewStories) {
+      return rejectStoryPrivacy(res, authorAccess.author, authorAccess.relationship.access);
+    }
     const counts = await getStoryViewCountMap([story._id]);
+    const safeStory = { ...story, author: minimalProfile(story.author) };
     return res.json({
       success: true,
-      data: { story: { ...story, viewCount: counts.get(toIdStr(story._id)) || 0 } }
+      data: { story: { ...safeStory, viewCount: counts.get(toIdStr(story._id)) || 0 } }
     });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message || 'Failed to fetch story' });
@@ -223,9 +248,9 @@ const getStoriesFeed = async (req, res) => {
     const since = new Date(Date.now() - TWENTY_FOUR_HOURS_MS);
     const myId = req.user._id;
     const myIdStr = myId.toString();
-    const followingIds = (req.user.following || []).map((id) => (typeof id === 'string' ? id : id.toString()));
+    const followingIds = await Follow.find({ follower: myId }).distinct('following');
     const allowedIds = [myIdStr];
-    followingIds.forEach((id) => {
+    followingIds.map(toIdStr).forEach((id) => {
       if (!id || id === myIdStr) return;
       try {
         if (mongoose.Types.ObjectId.isValid(id) && String(new mongoose.Types.ObjectId(id)) === id) {
@@ -233,7 +258,15 @@ const getStoriesFeed = async (req, res) => {
         }
       } catch (_) { /* skip invalid id */ }
     });
-    const allowedObjectIds = allowedIds.map((id) => new mongoose.Types.ObjectId(id));
+    const candidateUsers = await User.find({ _id: { $in: allowedIds }, isActive: true })
+      .select('username userType profile privacySettings blockedUsers isActive')
+      .lean();
+    const allowedAfterPrivacy = [];
+    for (const candidate of candidateUsers) {
+      const relationship = await resolvePrivacyAccess({ viewer: req.user, targetUser: candidate });
+      if (relationship.access.canViewStories) allowedAfterPrivacy.push(toIdStr(candidate._id));
+    }
+    const allowedObjectIds = allowedAfterPrivacy.map((id) => new mongoose.Types.ObjectId(id));
 
     const usersWithStories = await Story.aggregate([
       { $match: buildActiveStoryQuery({ author: { $in: allowedObjectIds }, createdAt: { $gte: since } }) },
@@ -259,7 +292,10 @@ const getStoriesFeed = async (req, res) => {
           author: {
             _id: '$userDoc._id',
             username: '$userDoc.username',
-            profile: '$userDoc.profile',
+            profile: {
+              displayName: '$userDoc.profile.displayName',
+              avatar: '$userDoc.profile.avatar'
+            },
             profilePicture: '$userDoc.profilePicture'
           }
         }
@@ -339,6 +375,11 @@ const getUserStories = async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(userId)) {
       return res.status(400).json({ success: false, message: 'Invalid user id' });
     }
+    const authorAccess = await getStoryAuthorAccess(req.user, userId);
+    if (!authorAccess) return res.status(404).json({ success: false, message: 'User not found' });
+    if (!authorAccess.relationship.access.canViewStories) {
+      return rejectStoryPrivacy(res, authorAccess.author, authorAccess.relationship.access);
+    }
     const since = new Date(Date.now() - TWENTY_FOUR_HOURS_MS);
     const isOwnStoryList = toIdStr(userId) === toIdStr(req.user._id);
     const query = Story.find(buildActiveStoryQuery({
@@ -385,9 +426,17 @@ const viewStory = async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(storyId)) {
       return res.status(400).json({ success: false, message: 'Invalid story id' });
     }
-    const story = await Story.findOne(buildActiveStoryQuery({ _id: storyId })).select('author').lean();
+    const story = await Story.findOne(buildActiveStoryQuery({
+      _id: storyId,
+      createdAt: { $gte: new Date(Date.now() - TWENTY_FOUR_HOURS_MS) }
+    })).select('author').lean();
     if (!story) {
       return res.status(404).json({ success: false, message: 'Story not found' });
+    }
+    const authorAccess = await getStoryAuthorAccess(req.user, story.author);
+    if (!authorAccess) return res.status(404).json({ success: false, message: 'Story not found' });
+    if (!authorAccess.relationship.access.canViewStories) {
+      return rejectStoryPrivacy(res, authorAccess.author, authorAccess.relationship.access);
     }
     const userId = toIdStr(req.user._id);
     const authorId = toIdStr(story.author);

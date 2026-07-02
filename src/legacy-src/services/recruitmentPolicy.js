@@ -1,3 +1,5 @@
+const mongoose = require('mongoose');
+
 const TEAM_RECRUITMENT_STATUSES = Object.freeze(['active', 'paused', 'closed', 'filled']);
 const PLAYER_PROFILE_STATUSES = Object.freeze(['active', 'paused', 'inactive']);
 const TEAM_APPLICATION_STATUSES = Object.freeze(['reviewed', 'shortlisted', 'rejected', 'accepted']);
@@ -16,6 +18,11 @@ const toPlainObject = (value) => {
 
 const serializeTeamRecruitment = (value) => {
   const recruitment = toPlainObject(value);
+  if (recruitment.team && typeof recruitment.team === 'object') {
+    delete recruitment.team.privacySettings;
+    delete recruitment.team.blockedUsers;
+    delete recruitment.team.lastSeen;
+  }
   const applicants = Array.isArray(recruitment.applicants) ? recruitment.applicants : [];
   const explicitCount = Number(recruitment.applicantCount);
   recruitment.applicantCount = Number.isFinite(explicitCount) ? explicitCount : applicants.length;
@@ -25,6 +32,11 @@ const serializeTeamRecruitment = (value) => {
 
 const serializePlayerProfile = (value, { includeInterestedTeams = false } = {}) => {
   const profile = toPlainObject(value);
+  if (profile.player && typeof profile.player === 'object') {
+    delete profile.player.privacySettings;
+    delete profile.player.blockedUsers;
+    delete profile.player.lastSeen;
+  }
   const interestedTeams = Array.isArray(profile.interestedTeams) ? profile.interestedTeams : [];
   const explicitCount = Number(profile.interestedTeamsCount);
   profile.interestedTeamsCount = Number.isFinite(explicitCount) ? explicitCount : interestedTeams.length;
@@ -145,6 +157,94 @@ const isValidRecruitmentOwner = (owner, expectedUserType) => Boolean(
   && owner.username.trim()
 );
 
+const effectiveProfileVisibilityExpression = {
+  $switch: {
+    branches: [
+      {
+        case: { $in: ['$privacySettings.profileVisibility', ['public', 'followers', 'private']] },
+        then: '$privacySettings.profileVisibility'
+      },
+      {
+        case: {
+          $and: [
+            { $eq: [{ $type: '$privacySettings.profileVisibility' }, 'missing'] },
+            {
+              $or: [
+                { $eq: ['$privacySettings.accountType', 'public'] },
+                { $eq: [{ $type: '$privacySettings.accountType' }, 'missing'] }
+              ]
+            }
+          ]
+        },
+        then: 'public'
+      }
+    ],
+    default: 'private'
+  }
+};
+
+const DEFAULT_RECRUITMENT_OWNER_PROJECTION = Object.freeze({
+  _id: 1,
+  username: 1,
+  userType: 1,
+  isActive: 1,
+  'profile.displayName': 1,
+  'profile.avatar': 1,
+  privacySettings: 1,
+  blockedUsers: 1
+});
+
+const buildRecruitmentOwnerPrivacyStages = ({ viewerId, viewerBlockedIds = [], followCollectionName = 'follows' } = {}) => {
+  const hasViewer = viewerId && mongoose.Types.ObjectId.isValid(String(viewerId));
+  if (!hasViewer) {
+    return [{ $match: { $expr: { $eq: [effectiveProfileVisibilityExpression, 'public'] } } }];
+  }
+  const viewerObjectId = new mongoose.Types.ObjectId(String(viewerId));
+  const blockedObjectIds = (viewerBlockedIds || [])
+    .filter((id) => mongoose.Types.ObjectId.isValid(String(id)))
+    .map((id) => new mongoose.Types.ObjectId(String(id)));
+  return [
+    {
+      $lookup: {
+        from: followCollectionName,
+        let: { ownerId: '$_id' },
+        pipeline: [
+          {
+            $match: {
+              $expr: {
+                $and: [
+                  { $eq: ['$follower', viewerObjectId] },
+                  { $eq: ['$following', '$$ownerId'] }
+                ]
+              }
+            }
+          },
+          { $limit: 1 }
+        ],
+        as: '__viewerFollow'
+      }
+    },
+    {
+      $match: {
+        $expr: {
+          $and: [
+            { $not: [{ $in: ['$_id', blockedObjectIds] }] },
+            { $not: [{ $in: [viewerObjectId, { $ifNull: ['$blockedUsers', []] }] }] },
+            {
+              $or: [
+                { $eq: ['$_id', viewerObjectId] },
+                { $eq: [effectiveProfileVisibilityExpression, 'public'] },
+                { $gt: [{ $size: '$__viewerFollow' }, 0] }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    { $project: { __viewerFollow: 0 } }
+  ];
+};
+
 /**
  * Canonical list query for TeamRecruitment and PlayerProfile. Owner validity
  * is applied before sorting, pagination, and counting so a failed population
@@ -160,7 +260,11 @@ const listCanonicalRecruitmentRecords = async ({
   sortBy,
   sortDirection,
   page,
-  limit
+  limit,
+  viewerId,
+  viewerBlockedIds,
+  followCollectionName,
+  ownerProjection = DEFAULT_RECRUITMENT_OWNER_PROJECTION
 }) => {
   const countSource = countField === 'applicantCount' ? 'applicants' : 'interestedTeams';
   const sort = sortBy === 'createdAt'
@@ -175,14 +279,8 @@ const listCanonicalRecruitmentRecords = async ({
         pipeline: [
           { $match: { $expr: { $eq: ['$_id', '$$ownerId'] } } },
           { $match: getValidRecruitmentOwnerMatch(expectedUserType) },
-          {
-            $project: {
-              _id: 1,
-              username: 1,
-              'profile.displayName': 1,
-              'profile.avatar': 1
-            }
-          }
+          ...buildRecruitmentOwnerPrivacyStages({ viewerId, viewerBlockedIds, followCollectionName }),
+          { $project: ownerProjection }
         ],
         as: '__validOwner'
       }
@@ -370,6 +468,7 @@ module.exports = {
   isTeamRecruitmentStructurallyValid,
   isPlayerProfileStructurallyValid,
   listCanonicalRecruitmentRecords,
+  buildRecruitmentOwnerPrivacyStages,
   listCanonicalRecruitmentApplications,
   isUnexpired,
   sameId,

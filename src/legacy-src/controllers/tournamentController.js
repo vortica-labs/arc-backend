@@ -10,6 +10,10 @@ const crypto = require('crypto');
 const log = require('../utils/logger');
 const { normalizeQuerySearch, buildPrefixRegex } = require('../utils/searchQuery');
 const { getRedisClient } = require('../utils/redisCache');
+const {
+  minimalTournamentUser,
+  sanitizePublicTournament
+} = require('../utils/tournamentPublicDto');
 
 const uniqueNotificationRecipients = (values = []) =>
   Array.from(new Set(values.map((value) => String(value?._id || value)).filter(Boolean)));
@@ -146,7 +150,60 @@ const checkAndMarkCompletedTournaments = async (tournament) => {
   return tournament;
 };
 
+const idString = (value) => String(value?._id || value || '');
+
+const isDirectTournamentParticipant = (tournament, userId) => {
+  const expected = idString(userId);
+  if (!expected || !tournament) return false;
+  return idString(tournament.host) === expected
+    || (tournament.participants || []).some((participant) => idString(participant) === expected)
+    || (tournament.teams || []).some((team) => idString(team) === expected);
+};
+
+const hasActiveMembershipInTeams = async (teamIds, userId) => {
+  const ids = (teamIds || []).map(idString).filter(Boolean);
+  if (!ids.length || !userId) return false;
+  return Boolean(await User.exists({
+    _id: { $in: ids },
+    userType: 'team',
+    isActive: true,
+    $or: [
+      { 'teamInfo.members': { $elemMatch: { user: userId } } },
+      {
+        'teamInfo.rosters': {
+          $elemMatch: {
+            isActive: { $ne: false },
+            players: { $elemMatch: { user: userId, isActive: { $ne: false }, leftAt: null } }
+          }
+        }
+      },
+      { 'teamInfo.staff': { $elemMatch: { user: userId, isActive: { $ne: false }, leftAt: null } } }
+    ]
+  }));
+};
+
+const canReadTournamentMessages = async (tournament, userId) => (
+  isDirectTournamentParticipant(tournament, userId)
+  || hasActiveMembershipInTeams(tournament?.teams, userId)
+);
+
+const canReadGroupMessages = async (tournament, group, userId) => {
+  if (idString(tournament?.host) === idString(userId)) return true;
+  const participantIds = group?.participants || [];
+  return participantIds.some((participant) => idString(participant) === idString(userId))
+    || hasActiveMembershipInTeams(participantIds, userId);
+};
+
+const sanitizeTournamentMessages = (messages = []) => messages.map((message) => {
+  const safe = message?.toObject ? message.toObject() : { ...message };
+  if (safe.sender && typeof safe.sender === 'object') {
+    safe.sender = minimalTournamentUser(safe.sender);
+  }
+  return safe;
+});
+
 const ACTIVE_TOURNAMENT_STATUSES = ['Upcoming', 'Registration Open', 'Ongoing'];
+const PUBLIC_TOURNAMENT_SELECT = '-groupMessages -tournamentMessages -broadcastChannels';
 
 const normalizePrizePoolType = (value) => (
   value === 'no_prize' ? 'without_prize' : (value || 'without_prize')
@@ -835,6 +892,7 @@ const getTournaments = async (req, res) => {
     }
 
     let tournaments = await Tournament.find(queryFilter)
+      .select(PUBLIC_TOURNAMENT_SELECT)
       .populate('host', 'username profile.displayName profile.avatar')
       .populate('participants', 'username profile.displayName profile.avatar')
       .populate('teams', 'username profile.displayName profile.avatar')
@@ -881,6 +939,7 @@ const getTournaments = async (req, res) => {
       }
       
       tournaments = await Tournament.find(refreshedFilter)
+        .select(PUBLIC_TOURNAMENT_SELECT)
         .populate('host', 'username profile.displayName profile.avatar')
         .populate('participants', 'username profile.displayName profile.avatar')
         .populate('teams', 'username profile.displayName profile.avatar')
@@ -907,7 +966,9 @@ const getTournaments = async (req, res) => {
     const total = await Tournament.countDocuments(queryFilter);
 
     // Process tournaments to convert banner filenames to URLs
-    const processedTournaments = tournamentsToReturn.map(processTournament);
+    const processedTournaments = tournamentsToReturn
+      .map(processTournament)
+      .map(sanitizePublicTournament);
 
     res.status(200).json({
       success: true,
@@ -927,8 +988,7 @@ const getTournaments = async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Failed to fetch tournaments',
-      error: error.message,
-      stack: error.stack
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 };
@@ -949,65 +1009,44 @@ const getTournament = async (req, res) => {
       // Trim and ensure uppercase for consistency
       const codeToSearch = id.trim().toUpperCase();
       tournament = await Tournament.findOne({ tournamentCode: codeToSearch })
+        .select(PUBLIC_TOURNAMENT_SELECT)
         .populate('host', 'username profile.displayName profile.avatar')
         .populate('participants', 'username profile.displayName profile.avatar')
-        .populate({
-          path: 'teams',
-          select: 'username profile.displayName profile.avatar teamInfo',
-          populate: {
-            path: 'teamInfo.members.user',
-            select: 'username profile.displayName profile.avatar'
-          }
-        })
+        .populate('teams', 'username userType profile.displayName profile.avatar')
         .populate('groups.participants', 'username profile.displayName profile.avatar')
         .populate('matches.team1', 'username profile.displayName profile.avatar')
         .populate('matches.team2', 'username profile.displayName profile.avatar')
         .populate('matches.winner', 'username profile.displayName profile.avatar')
-        .populate('winners.team', 'username profile.displayName profile.avatar')
-        .populate('groupMessages.messages.sender', 'username profile.displayName profile.avatar');
+        .populate('winners.team', 'username profile.displayName profile.avatar');
     } else {
       // Regular route - can be either code or ID
       // Check if it's a code format: TRN-XXX-XXXXXXXX (contains dashes)
       if (id && (id.includes('-') || id.length > 20)) {
         // Looks like a tournament code (format: TRN-BGM-A1B2C3D4)
         tournament = await Tournament.findOne({ tournamentCode: id.toUpperCase() })
+          .select(PUBLIC_TOURNAMENT_SELECT)
           .populate('host', 'username profile.displayName profile.avatar')
           .populate('participants', 'username profile.displayName profile.avatar')
-          .populate({
-            path: 'teams',
-            select: 'username profile.displayName profile.avatar teamInfo',
-            populate: {
-              path: 'teamInfo.members.user',
-              select: 'username profile.displayName profile.avatar'
-            }
-          })
+          .populate('teams', 'username userType profile.displayName profile.avatar')
           .populate('groups.participants', 'username profile.displayName profile.avatar')
           .populate('matches.team1', 'username profile.displayName profile.avatar')
           .populate('matches.team2', 'username profile.displayName profile.avatar')
           .populate('matches.winner', 'username profile.displayName profile.avatar')
-          .populate('winners.team', 'username profile.displayName profile.avatar')
-          .populate('groupMessages.messages.sender', 'username profile.displayName profile.avatar');
+          .populate('winners.team', 'username profile.displayName profile.avatar');
         
         // Don't try findById if it's a code format - it will fail with CastError
       } else if (id && mongoose.Types.ObjectId.isValid(id)) {
         // Try as MongoDB ObjectId (only if it's a valid ObjectId format)
         tournament = await Tournament.findById(id)
+          .select(PUBLIC_TOURNAMENT_SELECT)
           .populate('host', 'username profile.displayName profile.avatar')
           .populate('participants', 'username profile.displayName profile.avatar')
-          .populate({
-            path: 'teams',
-            select: 'username profile.displayName profile.avatar teamInfo',
-            populate: {
-              path: 'teamInfo.members.user',
-              select: 'username profile.displayName profile.avatar'
-            }
-          })
+          .populate('teams', 'username userType profile.displayName profile.avatar')
           .populate('groups.participants', 'username profile.displayName profile.avatar')
           .populate('matches.team1', 'username profile.displayName profile.avatar')
           .populate('matches.team2', 'username profile.displayName profile.avatar')
           .populate('matches.winner', 'username profile.displayName profile.avatar')
-          .populate('winners.team', 'username profile.displayName profile.avatar')
-          .populate('groupMessages.messages.sender', 'username profile.displayName profile.avatar');
+          .populate('winners.team', 'username profile.displayName profile.avatar');
       }
     }
 
@@ -1023,22 +1062,15 @@ const getTournament = async (req, res) => {
     
     // Refresh tournament from DB to get updated status
     tournament = await Tournament.findById(tournament._id)
+      .select(PUBLIC_TOURNAMENT_SELECT)
       .populate('host', 'username profile.displayName profile.avatar')
       .populate('participants', 'username profile.displayName profile.avatar')
-      .populate({
-        path: 'teams',
-        select: 'username profile.displayName profile.avatar teamInfo',
-        populate: {
-          path: 'teamInfo.members.user',
-          select: 'username profile.displayName profile.avatar'
-        }
-      })
+      .populate('teams', 'username userType profile.displayName profile.avatar')
       .populate('groups.participants', 'username profile.displayName profile.avatar')
       .populate('matches.team1', 'username profile.displayName profile.avatar')
       .populate('matches.team2', 'username profile.displayName profile.avatar')
       .populate('matches.winner', 'username profile.displayName profile.avatar')
-      .populate('winners.team', 'username profile.displayName profile.avatar')
-      .populate('groupMessages.messages.sender', 'username profile.displayName profile.avatar');
+      .populate('winners.team', 'username profile.displayName profile.avatar');
 
     // If tournament doesn't have a code yet (old posts), generate one
     if (!tournament.tournamentCode) {
@@ -1070,7 +1102,7 @@ const getTournament = async (req, res) => {
     }
 
     // Process tournament to convert banner filename to URL
-    const processedTournament = processTournament(tournament);
+    const processedTournament = sanitizePublicTournament(processTournament(tournament));
 
     res.status(200).json({
       success: true,
@@ -1099,27 +1131,29 @@ const getTournamentByName = async (req, res) => {
       hostUsername: decodeURIComponent(hostUsername) 
     });
     
-    // Find tournament by name and host username
+    const decodedHostUsername = decodeURIComponent(hostUsername);
+    const host = await User.findOne({ username: decodedHostUsername, isActive: true })
+      .select('_id')
+      .lean();
+    if (!host) {
+      return res.status(404).json({ success: false, message: 'Tournament not found' });
+    }
+
+    // Tournament.host is an ObjectId reference; querying host.username on the
+    // tournament document silently returned no records for this public route.
     const tournament = await Tournament.findOne({
       name: decodeURIComponent(tournamentName),
-      'host.username': decodeURIComponent(hostUsername)
+      host: host._id
     })
+      .select(PUBLIC_TOURNAMENT_SELECT)
       .populate('host', 'username profile.displayName profile.avatar')
       .populate('participants', 'username profile.displayName profile.avatar')
-      .populate({
-        path: 'teams',
-        select: 'username profile.displayName profile.avatar teamInfo',
-        populate: {
-          path: 'teamInfo.members.user',
-          select: 'username profile.displayName profile.avatar'
-        }
-      })
+      .populate('teams', 'username userType profile.displayName profile.avatar')
       .populate('groups.participants', 'username profile.displayName profile.avatar')
       .populate('matches.team1', 'username profile.displayName profile.avatar')
       .populate('matches.team2', 'username profile.displayName profile.avatar')
       .populate('matches.winner', 'username profile.displayName profile.avatar')
-      .populate('winners.team', 'username profile.displayName profile.avatar')
-      .populate('groupMessages.messages.sender', 'username profile.displayName profile.avatar');
+      .populate('winners.team', 'username profile.displayName profile.avatar');
 
     if (process.env.NODE_ENV === 'development') { console.log('getTournamentByName - Tournament found:', !!tournament);}
     if (tournament) {
@@ -1135,7 +1169,7 @@ const getTournamentByName = async (req, res) => {
     }
 
     // Process tournament to convert banner filename to URL
-    const processedTournament = processTournament(tournament);
+    const processedTournament = sanitizePublicTournament(processTournament(tournament));
 
     res.status(200).json({
       success: true,
@@ -1987,7 +2021,7 @@ const sendGroupMessage = async (req, res) => {
 const getTournamentMessages = async (req, res) => {
   try {
     const tournament = await Tournament.findById(req.params.id)
-      .populate('tournamentMessages.sender', 'username profile');
+      .populate('tournamentMessages.sender', 'username userType profile.displayName profile.avatar');
 
     if (!tournament) {
       return res.status(404).json({
@@ -1996,9 +2030,17 @@ const getTournamentMessages = async (req, res) => {
       });
     }
 
+    if (!await canReadTournamentMessages(tournament, req.user._id)) {
+      return res.status(403).json({
+        success: false,
+        code: 'TOURNAMENT_MESSAGE_ACCESS_DENIED',
+        message: 'Only tournament participants can view tournament messages'
+      });
+    }
+
     res.status(200).json({
       success: true,
-      data: { messages: tournament.tournamentMessages || [] }
+      data: { messages: sanitizeTournamentMessages(tournament.tournamentMessages || []) }
     });
 
   } catch (error) {
@@ -2015,7 +2057,7 @@ const getGroupMessages = async (req, res) => {
   try {
     const { groupId, round } = req.query;
     const tournament = await Tournament.findById(req.params.id)
-      .populate('groupMessages.messages.sender', 'username profile');
+      .populate('groupMessages.messages.sender', 'username userType profile.displayName profile.avatar');
 
     if (!tournament) {
       return res.status(404).json({
@@ -2024,13 +2066,28 @@ const getGroupMessages = async (req, res) => {
       });
     }
 
+    const group = (tournament.groups || []).find(
+      (candidate) => idString(candidate._id) === String(groupId)
+        || String(candidate.name) === String(groupId)
+    );
+    if (!group) {
+      return res.status(404).json({ success: false, message: 'Tournament group not found' });
+    }
+    if (!await canReadGroupMessages(tournament, group, req.user._id)) {
+      return res.status(403).json({
+        success: false,
+        code: 'GROUP_MESSAGE_ACCESS_DENIED',
+        message: 'Only members of this tournament group can view group messages'
+      });
+    }
+
     const groupMessageThread = tournament.groupMessages.find(
-      gm => gm.groupId === groupId && gm.round === parseInt(round)
+      gm => String(gm.groupId) === String(groupId) && gm.round === parseInt(round, 10)
     );
 
     res.status(200).json({
       success: true,
-      data: { messages: groupMessageThread?.messages || [] }
+      data: { messages: sanitizeTournamentMessages(groupMessageThread?.messages || []) }
     });
 
   } catch (error) {
@@ -2849,13 +2906,15 @@ const getTournamentParticipants = async (req, res) => {
       });
     }
 
+    const safeTournament = sanitizePublicTournament(tournament);
+
     res.status(200).json({
       success: true,
       data: {
-        participants: tournament.participants,
-        teams: tournament.teams,
-        groups: tournament.groups,
-        totalParticipants: tournament.participants.length + tournament.teams.length
+        participants: safeTournament.participants,
+        teams: safeTournament.teams,
+        groups: safeTournament.groups,
+        totalParticipants: safeTournament.participants.length + safeTournament.teams.length
       }
     });
 
@@ -4014,17 +4073,6 @@ const openRegistration = async (req, res) => {
     }
     await tournament.save();
     
-    // Emit real-time broadcast message
-    const io = require('../server').getIO();
-    if (io) {
-      io.emit('broadcast_message', {
-        id: Date.now().toString(),
-        message: `Registration opened for "${tournament.name}"! Join now to participate.`,
-        timestamp: new Date(),
-        type: 'registration_opened'
-      });
-    }
-    
     // Fan out through the durable, preference-aware bulk producer. A stable
     // key deduplicates both Notification rows and push attempts if a queue job
     // retries after partial processing.
@@ -4100,16 +4148,21 @@ const startTournament = async (req, res) => {
     const { getIO } = require('../server');
     const io = getIO();
     
-    // Emit real-time broadcast message
-    io.emit('broadcast_message', {
-      id: Date.now().toString(),
-      message: `Tournament "${tournament.name}" has started! Good luck to all participants.`,
-      timestamp: new Date(),
-      type: 'tournament_started'
-    });
-    
     // Send notification to all participants
     const participants = uniqueNotificationRecipients([...tournament.participants, ...tournament.teams]);
+    if (io) {
+      const socketRecipients = uniqueNotificationRecipients([tournament.host, ...participants]);
+      const payload = {
+        id: Date.now().toString(),
+        tournamentId: tournament._id,
+        message: `Tournament "${tournament.name}" has started! Good luck to all participants.`,
+        timestamp: new Date(),
+        type: 'tournament_started'
+      };
+      socketRecipients.forEach((recipientId) => {
+        io.to(`user-${recipientId}`).emit('broadcast_message', payload);
+      });
+    }
     await Promise.all(participants.map(async (participantId) => {
       await createAndEmitNotification({
         recipient: participantId,
@@ -4429,5 +4482,11 @@ module.exports = {
   updatePrizeDistribution,
   generateFinalResult,
   assignSpecialPrize,
-  getHostingLimits
+  getHostingLimits,
+  _private: {
+    isDirectTournamentParticipant,
+    canReadTournamentMessages,
+    canReadGroupMessages,
+    sanitizeTournamentMessages
+  }
 };

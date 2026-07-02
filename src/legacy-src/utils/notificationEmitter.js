@@ -276,6 +276,8 @@ const createAndEmitNotification = async (notificationData) => {
             intent: emailPolicy.intent,
             eventType: normalizedNotificationData.email?.eventType || normalizedNotificationData.emailEventType,
             notificationType: normalizedNotificationData.type,
+            templateKey: normalizedNotificationData.email?.templateKey || 'transactional_notification',
+            triggerSource: normalizedNotificationData.email?.triggerSource || 'notification.emitter',
             broadcastId: normalizedNotificationData.data?.broadcastId || normalizedNotificationData.data?.customData?.broadcastId,
             broadcastRecipientId: normalizedNotificationData.data?.deliveryLogId || normalizedNotificationData.data?.customData?.broadcastRecipientId
           }

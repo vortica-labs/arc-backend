@@ -40,6 +40,9 @@ const {
   rejectLeaveRequest,
   getPrivacySettings,
   updatePrivacySettings,
+  getFollowRequests,
+  acceptFollowRequest,
+  rejectFollowRequest,
   getDmPrivacy
 } = require('../controllers/userController');
 
@@ -66,6 +69,9 @@ router.get('/:username/tournament-history', optionalAuth, getUserTournamentHisto
 router.get('/privacy-settings', protect, getPrivacySettings);
 router.put('/privacy-settings', protect, updatePrivacySettings);
 router.get('/:userId/dm-privacy', protect, getDmPrivacy);
+router.get('/follow-requests/incoming', protect, getFollowRequests);
+router.post('/follow-requests/:requestId/accept', protect, acceptFollowRequest);
+router.post('/follow-requests/:requestId/reject', protect, rejectFollowRequest);
 
 router.get('/:identifier', optionalAuth, getUser);
 router.post('/:id/follow', protect, toggleFollow);

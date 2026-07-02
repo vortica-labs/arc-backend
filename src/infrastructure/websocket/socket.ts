@@ -9,6 +9,11 @@ import { registerChatSocketHandlers } from "../../modules/chat/chat.socket";
 import { registerLegacySocketHandlers } from "../../modules/legacy/legacy.socket";
 import { backendMiddlewarePath } from "../../modules/legacy/legacy.paths";
 import { socketRedisPubClient, socketRedisSubClient } from "../cache/redis";
+import {
+  announcePresenceConnected,
+  announcePresenceDisconnected,
+  registerPresenceSocketHandlers
+} from "../../modules/presence/presence.socket";
 
 type SocketAuthUser = {
   isActive?: boolean;
@@ -70,6 +75,10 @@ export const createSocketServer = (httpServer: HttpServer): Server => {
       }
 
       socket.authUser = { userId: String(userId) };
+      // socket.data is serialized by Socket.IO adapters/fetchSockets. Keep the
+      // authenticated identity there as well so cross-node room revocation can
+      // never depend on a client-supplied identifier.
+      socket.data.userId = String(userId);
       return next();
     } catch (error) {
       return next(new Error(`Authentication failed: ${String(error)}`));
@@ -98,10 +107,20 @@ export const createSocketServer = (httpServer: HttpServer): Server => {
 
     socket.on("ping", () => socket.emit("pong"));
     registerChatSocketHandlers(io, socket);
+    registerPresenceSocketHandlers(io, socket);
     // Calls are registered only by the durable legacy bridge below. The old
     // colon-event relay accepted client-supplied target IDs without proving
     // CallSession participation and must never be mounted in parallel.
     registerLegacySocketHandlers(io, socket);
+
+    void announcePresenceConnected(io, userId).catch((error) => {
+      logger.error("Failed to publish online presence", { userId, socketId: socket.id, error: String(error) });
+    });
+    socket.on("disconnect", () => {
+      void announcePresenceDisconnected(io, userId).catch((error) => {
+        logger.error("Failed to publish offline presence", { userId, socketId: socket.id, error: String(error) });
+      });
+    });
 
     logger.info("Socket connected", { socketId: socket.id, userId });
   });

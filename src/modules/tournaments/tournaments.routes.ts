@@ -1,19 +1,19 @@
 import { Router } from "express";
-import { optionalAuth, protect, tournamentController } from "./tournaments.legacy-adapters";
+import { protect, publicOptionalAuth, tournamentController } from "./tournaments.legacy-adapters";
 
 const router = Router();
 
 router.get("/hosting-limits", protect, tournamentController.getHostingLimits);
 
 router.route("/")
-  .get(optionalAuth, tournamentController.getTournaments)
+  .get(publicOptionalAuth, tournamentController.getTournaments)
   .post(protect, tournamentController.createTournament);
 
-router.get("/code/:code", tournamentController.getTournament);
-router.get("/by-name/:tournamentName/:hostUsername", tournamentController.getTournamentByName);
+router.get("/code/:code", publicOptionalAuth, tournamentController.getTournament);
+router.get("/by-name/:tournamentName/:hostUsername", publicOptionalAuth, tournamentController.getTournamentByName);
 
 router.route("/:id")
-  .get(tournamentController.getTournament)
+  .get(publicOptionalAuth, tournamentController.getTournament)
   .put(protect, tournamentController.updateTournament)
   .delete(protect, tournamentController.deleteTournament);
 

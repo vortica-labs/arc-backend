@@ -16,6 +16,7 @@ const {
   isTeamRecruitmentStructurallyValid,
   isPlayerProfileStructurallyValid,
   listCanonicalRecruitmentRecords,
+  buildRecruitmentOwnerPrivacyStages,
   listCanonicalRecruitmentApplications,
   sameId,
   parsePagination,
@@ -87,6 +88,16 @@ assert.strictEqual(isValidRecruitmentOwner({
 assert.strictEqual(isValidRecruitmentOwner({
   _id: 'player-1', username: 'inactive_player', userType: 'player', isActive: false
 }, 'player'), false);
+
+const guestPrivacyStages = buildRecruitmentOwnerPrivacyStages();
+assert.strictEqual(guestPrivacyStages.length, 1);
+assert.strictEqual(guestPrivacyStages[0].$match.$expr.$eq[1], 'public');
+const authenticatedPrivacyStages = buildRecruitmentOwnerPrivacyStages({
+  viewerId: '507f1f77bcf86cd799439011',
+  viewerBlockedIds: ['507f1f77bcf86cd799439012']
+});
+assert(authenticatedPrivacyStages.some((stage) => stage.$lookup?.from === 'follows'));
+assert(authenticatedPrivacyStages.some((stage) => stage.$match?.$expr));
 assert.strictEqual(isValidRecruitmentOwner({
   _id: 'player-1', username: 'wrong_role', userType: 'team', isActive: true
 }, 'player'), false);

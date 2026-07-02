@@ -78,40 +78,68 @@ function stableNoise(seed, id) {
 
 async function getRelationshipContext(user) {
   if (!user || user.userType === 'guest') {
+    const restrictedAuthors = await User.find({
+      $or: [
+        { isActive: { $ne: true } },
+        {
+          'privacySettings.showPostsToFollowers': { $exists: true, $ne: true }
+        },
+        {
+          'privacySettings.profileVisibility': { $exists: true, $ne: 'public' }
+        },
+        {
+          'privacySettings.profileVisibility': { $exists: false },
+          'privacySettings.accountType': { $exists: true, $ne: 'public' }
+        }
+      ]
+    }).select('_id').lean();
     return {
       currentUserId: null,
       followingIds: new Set(),
       blockedIds: new Set(),
-      invisiblePrivateAuthorIds: new Set(),
+      invisiblePrivateAuthorIds: new Set(restrictedAuthors.map((doc) => normalizeId(doc._id))),
       blockedEitherWayIds: new Set(),
       gamingPreferences: []
     };
   }
 
   const currentUserId = normalizeId(user._id);
-  const followingFromUser = Array.isArray(user.following) ? user.following.map(normalizeId) : [];
   const blockedFromUser = Array.isArray(user.blockedUsers) ? user.blockedUsers.map(normalizeId) : [];
 
   const [followDocs, blockedByUsers] = await Promise.all([
-    Follow.find({ follower: currentUserId }).select('following').lean().catch(() => []),
-    User.find({ blockedUsers: currentUserId }).select('_id').lean().catch(() => [])
+    Follow.find({ follower: currentUserId }).select('following').lean(),
+    User.find({ blockedUsers: currentUserId }).select('_id').lean()
   ]);
 
-  const followingIds = new Set([
-    ...followingFromUser,
-    ...followDocs.map((doc) => normalizeId(doc.following))
-  ].filter(Boolean));
+  // Follow is the canonical accepted-relationship store. The legacy arrays
+  // are denormalized compatibility data and can be one-sided or stale after a
+  // partial historical write, so they must never authorize private content.
+  const followingIds = new Set(followDocs.map((doc) => normalizeId(doc.following)).filter(Boolean));
   const blockedIds = new Set(blockedFromUser.filter(Boolean));
   const blockedEitherWayIds = new Set([
     ...blockedIds,
     ...blockedByUsers.map((doc) => normalizeId(doc._id))
   ].filter(Boolean));
 
-  const allowedPrivateIds = [currentUserId, ...followingIds];
+  const allowedFollowerIds = [currentUserId, ...followingIds];
   const privateUsers = await User.find({
-    'privacySettings.accountType': 'private',
-    _id: { $nin: allowedPrivateIds }
-  }).select('_id').lean().catch(() => []);
+    _id: { $ne: currentUserId },
+    $or: [
+      { isActive: { $ne: true } },
+      {
+        'privacySettings.showPostsToFollowers': { $exists: true, $ne: true }
+      },
+      {
+        _id: { $nin: allowedFollowerIds },
+        'privacySettings.profileVisibility': { $exists: true, $ne: 'public' }
+      },
+      {
+        _id: { $nin: allowedFollowerIds },
+        'privacySettings.profileVisibility': { $exists: false },
+        'privacySettings.accountType': { $exists: true, $ne: 'public' }
+      }
+    ]
+  }).select('_id').lean();
 
   return {
     currentUserId,
@@ -142,10 +170,23 @@ function buildAudienceFilter({ user, mode, relationship, query }) {
   }
 
   const isGuest = !user || user.userType === 'guest';
-  if (query.visibility === 'public' || isGuest) {
+  const requestedVisibility = ['public', 'followers', 'private'].includes(query.visibility)
+    ? query.visibility
+    : null;
+  if (requestedVisibility === 'public' || isGuest) {
     filter.visibility = 'public';
-  } else if (query.visibility) {
-    filter.visibility = query.visibility;
+  } else if (requestedVisibility === 'followers') {
+    filter.visibility = 'followers';
+    filter.$and = [{
+      $or: [
+        { author: relationship.currentUserId },
+        { author: { $in: Array.from(relationship.followingIds) } }
+      ]
+    }];
+  } else if (requestedVisibility === 'private') {
+    // A client filter must never replace the server-derived audience scope.
+    filter.visibility = 'private';
+    filter.$and = [{ author: relationship.currentUserId }];
   } else {
     filter.$or = [
       { visibility: 'public' },
@@ -163,9 +204,10 @@ function buildAudienceFilter({ user, mode, relationship, query }) {
   ]);
   excludedAuthors.delete(relationship.currentUserId);
   if (excludedAuthors.size > 0) {
-    filter.author = filter.author
-      ? { $eq: filter.author, $nin: Array.from(excludedAuthors) }
-      : { $nin: Array.from(excludedAuthors) };
+    filter.$and = [
+      ...(Array.isArray(filter.$and) ? filter.$and : []),
+      { author: { $nin: Array.from(excludedAuthors) } }
+    ];
   }
 
   return filter;
@@ -369,7 +411,7 @@ async function findWatchedClipIds(userId) {
 
 async function fetchCandidates(filter, { limit, page, cursor }) {
   const query = Post.find(filter)
-    .populate('author', 'username profile.displayName profile.avatar profilePicture avatar userType privacySettings.accountType')
+    .populate('author', 'username profile.displayName profile.avatar profilePicture avatar userType privacySettings isActive')
     .populate('likes.user', 'username profile.displayName profile.avatar profilePicture avatar')
     .populate('comments.user', 'username profile.displayName profile.avatar profilePicture avatar')
     .sort({ createdAt: -1, _id: -1 })

@@ -1,13 +1,67 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const mongoose = require('mongoose');
 const TeamRecruitment = require('../models/TeamRecruitment');
 const PlayerProfile = require('../models/PlayerProfile');
 const RecruitmentApplication = require('../models/RecruitmentApplication');
 const User = require('../models/User');
 const safeAsyncHandler = require('../utils/safeAsyncHandler');
 const log = require('../utils/logger');
+const {
+  addPlayerProfileIntegrityFilters,
+  listCanonicalRecruitmentRecords
+} = require('../services/recruitmentPolicy');
 
 // Initialize Gemini AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// Candidate discovery is a profile read. Run owner validity, follow-based
+// visibility and both-way block checks before pagination and before any data is
+// prepared for the external AI provider.
+const AI_CANDIDATE_OWNER_PROJECTION = Object.freeze({
+  _id: 1,
+  username: 1,
+  userType: 1,
+  'profile.displayName': 1,
+  'profile.avatar': 1,
+  'profile.location': 1,
+  'playerInfo.gamingStats': 1
+});
+
+const findPrivacySafeCandidateProfiles = async ({ query = {}, viewer, limit = 100 }) => {
+  const liveQuery = addPlayerProfileIntegrityFilters({
+    ...query,
+    status: 'active',
+    isActive: true,
+    $and: [
+      ...(Array.isArray(query.$and) ? query.$and : []),
+      {
+        $or: [
+          { expiresAt: { $gt: new Date() } },
+          { expiresAt: null },
+          { expiresAt: { $exists: false } }
+        ]
+      }
+    ]
+  });
+
+  const { records } = await listCanonicalRecruitmentRecords({
+    model: PlayerProfile,
+    userModel: User,
+    query: liveQuery,
+    ownerField: 'player',
+    expectedUserType: 'player',
+    countField: 'interestedTeamsCount',
+    sortBy: 'createdAt',
+    sortDirection: -1,
+    page: 1,
+    limit,
+    viewerId: viewer?._id,
+    viewerBlockedIds: viewer?.blockedUsers || [],
+    ownerProjection: AI_CANDIDATE_OWNER_PROJECTION
+  });
+
+  return records;
+};
 
 /**
  * Calculate compatibility score based on data (without AI for fallback)
@@ -109,15 +163,17 @@ const matchPlayersToTeam = safeAsyncHandler(async (req, res) => {
       });
     }
 
-    // Find matching player profiles - More flexible search
-    const playerProfiles = await PlayerProfile.find({
-      profileType: 'looking-for-team',
-      game: actualGame,
-      status: 'active',
-      isActive: true
-    })
-      .populate('player', 'username profile.displayName profile.avatar profile.location playerInfo.gamingStats')
-      .limit(100); // Get more candidates
+    // Privacy and owner integrity are applied inside the canonical aggregation
+    // before the 100-candidate cap. Hidden owners therefore cannot displace
+    // visible candidates or reach the AI prompt/response.
+    const playerProfiles = await findPrivacySafeCandidateProfiles({
+      viewer: req.user,
+      limit: 100,
+      query: {
+        profileType: 'looking-for-team',
+        game: actualGame
+      }
+    });
 
     // Filter by role if specified
     const filteredProfiles = actualRole 
@@ -880,7 +936,6 @@ Interested players can apply through this platform.`,
 const generateInterviewQuestions = safeAsyncHandler(async (req, res) => {
   try {
     const { game, role, playerProfileId } = req.body;
-    const userId = req.user._id;
 
     if (!game || !role) {
       return res.status(400).json({
@@ -891,9 +946,15 @@ const generateInterviewQuestions = safeAsyncHandler(async (req, res) => {
 
     let playerContext = '';
     if (playerProfileId) {
-      const playerProfile = await PlayerProfile.findById(playerProfileId)
-        .populate('player', 'username profile.displayName playerInfo.gamingStats');
-      
+      const validProfileId = mongoose.Types.ObjectId.isValid(String(playerProfileId));
+      const [playerProfile] = validProfileId
+        ? await findPrivacySafeCandidateProfiles({
+            viewer: req.user,
+            limit: 1,
+            query: { _id: new mongoose.Types.ObjectId(String(playerProfileId)) }
+          })
+        : [];
+
       if (playerProfile) {
         const stats = playerProfile.player.playerInfo?.gamingStats?.find(s => s.game === game) || {};
         playerContext = `
@@ -1243,14 +1304,7 @@ const smartSearch = safeAsyncHandler(async (req, res) => {
     // Find matching profiles
     const profileType = searchType === 'players' ? 'looking-for-team' : 'staff-position';
     const query = {
-      profileType,
-      status: 'active',
-      isActive: true,
-      $or: [
-        { expiresAt: { $gt: new Date() } },
-        { expiresAt: null },
-        { expiresAt: { $exists: false } }
-      ]
+      profileType
     };
 
     if (searchType === 'players' && role) {
@@ -1262,9 +1316,11 @@ const smartSearch = safeAsyncHandler(async (req, res) => {
       query.game = game;
     }
 
-    const profiles = await PlayerProfile.find(query)
-      .populate('player', 'username profile.displayName profile.avatar profile.location playerInfo.gamingStats')
-      .limit(50);
+    const profiles = await findPrivacySafeCandidateProfiles({
+      query,
+      viewer: req.user,
+      limit: 50
+    });
 
     if (profiles.length === 0) {
       return res.status(200).json({

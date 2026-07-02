@@ -10,8 +10,10 @@ const {
     buildCompatiblePreferenceQuery,
     isPremiumUser,
     buildSessionPolicy,
+    buildConnectionPayload,
     scoreCandidate,
-    buildGenderFilterUserIds
+    buildGenderFilterUserIds,
+    canPrivacyMatchUsers
   }
 } = require('./randomConnectController');
 const RandomConnection = require('../models/RandomConnection');
@@ -79,6 +81,41 @@ assert.deepStrictEqual(buildSessionPolicy(premiumUser, freeUser), {
   durationLimitSeconds: null,
   limitReason: 'premium_unlimited'
 });
+
+const privacyUserA = { _id: id('privacy-a'), isActive: true, blockedUsers: [] };
+const privacyUserB = { _id: id('privacy-b'), isActive: true, blockedUsers: [] };
+assert.strictEqual(canPrivacyMatchUsers(privacyUserA, privacyUserB), true);
+assert.strictEqual(
+  canPrivacyMatchUsers({ ...privacyUserA, blockedUsers: [privacyUserB._id] }, privacyUserB),
+  false,
+  'Random Connect must exclude users blocked by the seeker'
+);
+assert.strictEqual(
+  canPrivacyMatchUsers(privacyUserA, { ...privacyUserB, blockedUsers: [privacyUserA._id] }),
+  false,
+  'Random Connect must exclude users who blocked the seeker'
+);
+assert.strictEqual(
+  canPrivacyMatchUsers(privacyUserA, { ...privacyUserB, isActive: false }),
+  false,
+  'Random Connect must exclude inactive queue users'
+);
+
+const publicConnectionPayload = buildConnectionPayload({
+  roomId: 'privacy-room',
+  status: 'active',
+  participants: [{
+    userId: id('privacy-a'),
+    username: 'privacy-a',
+    displayName: 'Privacy A',
+    avatar: 'avatar.png',
+    videoEnabled: true,
+    isPremium: true,
+    membershipTier: 'player_pro'
+  }]
+});
+assert.strictEqual(publicConnectionPayload.participants[0].isPremium, undefined);
+assert.strictEqual(publicConnectionPayload.participants[0].membershipTier, undefined);
 
 const filteredUser = id('filter-user');
 const unfilteredUser = id('no-filter-user');

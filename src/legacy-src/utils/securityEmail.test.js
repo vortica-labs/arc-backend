@@ -13,7 +13,7 @@ require.cache[jobQueuePath] = {
   paths: []
 };
 
-const { EMAIL_INTENTS } = require('./notificationChannelPolicy');
+const { EMAIL_INTENTS, evaluateEmailPolicy } = require('./notificationChannelPolicy');
 const {
   PASSWORD_SECURITY_EVENTS,
   buildPasswordSecurityEmail,
@@ -31,6 +31,11 @@ const previousSmtpPass = process.env.SMTP_PASS;
     assert.ok(email.subject.includes('password'));
     assert.ok(email.text.includes('contact ARC support immediately'));
     assert.equal(/otp|one[- ]time|new password|temporary password/i.test(`${email.subject} ${email.text}`), false);
+    assert.equal(
+      evaluateEmailPolicy({ intent: EMAIL_INTENTS.SECURITY, eventType }).allowed,
+      true,
+      `${eventType} must be registered as a security transaction`
+    );
   }
 
   assert.throws(
@@ -61,7 +66,12 @@ const previousSmtpPass = process.env.SMTP_PASS;
     PASSWORD_SECURITY_EVENTS.password_changed.subject,
     PASSWORD_SECURITY_EVENTS.password_changed.text,
     '',
-    { intent: EMAIL_INTENTS.SECURITY, eventType: 'password_changed' }
+    {
+      intent: EMAIL_INTENTS.SECURITY,
+      eventType: 'password_changed',
+      templateKey: 'security_password_changed',
+      triggerSource: 'security.password'
+    }
   ]);
 
   const missing = await enqueuePasswordSecurityEmail({ to: '', eventType: 'password_reset' });

@@ -1,6 +1,7 @@
 const express = require('express');
 const { protect } = require('../middleware/auth');
 const Notification = require('../models/Notification');
+const { sanitizeNotificationsForViewer } = require('../utils/notificationPrivacy');
 
 const router = express.Router();
 
@@ -18,13 +19,13 @@ const getNotifications = async (req, res) => {
       filter.isRead = isRead === 'true';
     }
 
-    const notifications = await Notification.find(filter)
+    const notificationDocuments = await Notification.find(filter)
       .populate('sender', 'username profile.displayName profile.avatar')
-      .populate('data.postId', 'content.text')
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)
       .exec();
+    const notifications = await sanitizeNotificationsForViewer(notificationDocuments, req.user);
 
     const total = await Notification.countDocuments(filter);
     const unreadCount = await Notification.countDocuments({ recipient: userId, isRead: false });

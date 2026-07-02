@@ -5,6 +5,8 @@ import { backendControllerPath, backendModelPath, backendRootPath } from "./lega
 
 const CALL_RING_TTL_SECONDS = 30;
 const OBJECT_ID_PATTERN = /^[a-f\d]{24}$/i;
+const CALL_ID_PATTERN = /^[A-Za-z0-9:_-]{8,160}$/;
+const MAX_ACTIVE_GROUP_CALLS = 10_000;
 
 type ActiveCallSession = {
   callId: string;
@@ -36,6 +38,13 @@ type RandomConnectController = {
   getSessionTimerState?: (roomId: string, userId: string) => Promise<unknown>;
 };
 
+type PrivacyPolicy = {
+  resolvePrivacyAccess: (input: Record<string, unknown>) => Promise<{
+    settings: { allowMessageFrom: string };
+    access: { canMessage: boolean };
+  }>;
+};
+
 type DurableCallSession = {
   _id?: unknown;
   callId: string;
@@ -45,6 +54,7 @@ type DurableCallSession = {
   callType: "voice" | "video";
   expiresAt: Date | string;
   status: string;
+  source?: "socket" | "rest" | "random_connect";
   randomRoomId?: string;
   callerSnapshot?: Record<string, unknown>;
 };
@@ -65,6 +75,10 @@ type ApnsVoipPushService = {
     notification: Record<string, unknown>,
     outcome: Record<string, unknown> | null
   ) => Promise<Record<string, unknown>>;
+};
+
+type CallPrivacy = {
+  assertCallSessionPrivacy: (session: DurableCallSession) => Promise<unknown>;
 };
 
 const activeCalls = new Map<string, ActiveCallSession>();
@@ -129,6 +143,9 @@ const getCallSessionService = (): CallSessionService | null =>
 
 const getApnsVoipPushService = (): ApnsVoipPushService | null =>
   safeRequire<ApnsVoipPushService>(path.join(backendRootPath, "services", "apnsVoipPushService.js"));
+
+const getCallPrivacy = (): CallPrivacy | null =>
+  safeRequire<CallPrivacy>(path.join(backendRootPath, "utils", "callPrivacy.js"));
 
 const sendFailedVoipFallback = async (
   targetUserId: string,
@@ -230,6 +247,22 @@ const getRandomConnectionModel = (): RandomConnectionModel | null =>
 const getRandomConnectController = (): RandomConnectController | null =>
   safeRequire<RandomConnectController>(path.join(backendControllerPath, "randomConnectController.js"));
 
+const getPrivacyPolicy = (): PrivacyPolicy | null =>
+  safeRequire<PrivacyPolicy>(path.join(backendRootPath, "utils", "privacyPolicy.js"));
+
+const isAuthorizedLegacyChatMember = async (chatRoomId: string, userId: string): Promise<boolean> => {
+  const messageModels = safeRequire<any>(path.join(backendModelPath, "Message.js"));
+  if (!messageModels?.ChatRoom || !chatRoomId || !userId) return false;
+  return Boolean(await messageModels.ChatRoom.exists({
+    _id: chatRoomId,
+    isActive: true,
+    $or: [
+      { creator: userId },
+      { "members.user": userId }
+    ]
+  }));
+};
+
 const findAuthorizedRandomSession = async (
   roomId: string,
   userId: string,
@@ -261,6 +294,9 @@ const handleGroupCallLeave = (io: Server, callId: string, userId: string, socket
   if (socket) {
     socket.to(`call-${callId}`).emit("group-call-participant-left", { callId, userId });
     socket.leave(`call-${callId}`);
+    if (socket.data?.groupCallChats && typeof socket.data.groupCallChats === "object") {
+      delete socket.data.groupCallChats[callId];
+    }
   } else {
     io.to(`call-${callId}`).emit("group-call-participant-left", { callId, userId });
   }
@@ -278,14 +314,18 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
   }
 
   socket.on("join-random-queue", (data: { selectedGame?: string }) => {
-    if (data?.selectedGame) {
-      socket.join(`random-queue-${data.selectedGame}`);
+    const selectedGame = boundedString(data?.selectedGame, 64);
+    if (!selectedGame || !/^[A-Za-z0-9 _.-]{1,64}$/.test(selectedGame)) return;
+    for (const room of socket.rooms) {
+      if (room.startsWith("random-queue-")) socket.leave(room);
     }
+    socket.join(`random-queue-${selectedGame}`);
   });
 
   socket.on("leave-random-queue", (data: { selectedGame?: string }) => {
-    if (data?.selectedGame) {
-      socket.leave(`random-queue-${data.selectedGame}`);
+    const selectedGame = boundedString(data?.selectedGame, 64);
+    if (selectedGame && /^[A-Za-z0-9 _.-]{1,64}$/.test(selectedGame)) {
+      socket.leave(`random-queue-${selectedGame}`);
     }
   });
 
@@ -328,7 +368,8 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
   });
 
   socket.on("random-connection-message", async (data: { roomId?: string; message?: string }) => {
-    if (!data?.roomId || !data?.message) {
+    const message = boundedString(data?.message, 2000);
+    if (!data?.roomId || !message) {
       return;
     }
     const session = await findAuthorizedRandomSession(String(data.roomId), userIdStr);
@@ -339,15 +380,18 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
     socket.to(`random-room-${data.roomId}`).emit("random-connection-message", {
       roomId: data.roomId,
       sender: userIdStr,
-      message: data.message,
+      message,
       timestamp: new Date()
     });
   });
 
   socket.on("webrtc-signal", async (data: { roomId?: string; signal?: unknown; targetUserId?: string }) => {
-    if (!data?.roomId || !data?.signal || !data?.targetUserId) {
+    if (!data?.roomId || !data?.signal || typeof data.signal !== "object" || !data?.targetUserId) {
       return;
     }
+    let serializedSignal = "";
+    try { serializedSignal = JSON.stringify(data.signal); } catch { return; }
+    if (Buffer.byteLength(serializedSignal, "utf8") > 64 * 1024) return;
     const targetUserId = String(data.targetUserId);
     const session = await findAuthorizedRandomSession(String(data.roomId), userIdStr, targetUserId);
     if (!session) {
@@ -429,13 +473,49 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
     const User = safeRequire<any>(path.join(backendModelPath, "User.js"));
     if (!User) return;
     const [caller, target] = await Promise.all([
-      User.findById(userIdStr).select("username profile.displayName profile.avatar blockedUsers isActive").lean(),
-      User.findById(targetUserId).select("username blockedUsers isActive").lean()
+      User.findById(userIdStr).select("username userType profile privacySettings blockedUsers isActive").lean(),
+      User.findById(targetUserId).select("username userType profile privacySettings blockedUsers isActive").lean()
     ]);
-    if (!caller?.isActive || !target?.isActive) return;
+    if (!caller?.isActive || !target?.isActive) {
+      socket.emit("call-error", { callId, code: "CALL_UNAVAILABLE" });
+      return;
+    }
     const callerBlockedTarget = (caller.blockedUsers || []).some((id: unknown) => getObjectIdString(id) === targetUserId);
     const targetBlockedCaller = (target.blockedUsers || []).some((id: unknown) => getObjectIdString(id) === userIdStr);
-    if (callerBlockedTarget || targetBlockedCaller) return;
+    if (callerBlockedTarget || targetBlockedCaller) {
+      socket.emit("call-error", { callId, code: "CALL_PRIVACY_RESTRICTED", reason: "blocked" });
+      return;
+    }
+
+    if (!data.randomRoomId) {
+      const Message = safeRequire<any>(path.join(backendModelPath, "Message.js"));
+      const privacyPolicy = getPrivacyPolicy();
+      if (!Message?.Message || !privacyPolicy) {
+        socket.emit("call-error", { callId, code: "CALL_PRIVACY_UNAVAILABLE" });
+        return;
+      }
+      const existingConversation = Boolean(await Message.Message.exists({
+        messageType: "direct",
+        isDeleted: false,
+        $or: [
+          { sender: targetUserId, recipient: userIdStr },
+          { sender: userIdStr, recipient: targetUserId }
+        ]
+      }));
+      const targetAccess = await privacyPolicy.resolvePrivacyAccess({
+        viewer: caller,
+        targetUser: target,
+        existingConversation
+      });
+      if (!targetAccess.access.canMessage) {
+        socket.emit("call-error", {
+          callId,
+          code: "CALL_PRIVACY_RESTRICTED",
+          reason: targetAccess.settings.allowMessageFrom === "followers" ? "not_follower" : "messages_disabled"
+        });
+        return;
+      }
+    }
 
     const callerName = boundedString(caller.profile?.displayName || caller.username, 100) || "Someone";
     const callSessionService = getCallSessionService();
@@ -463,6 +543,23 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
     } catch (error) {
       logger.warn("Call session creation rejected", { callId, callerId: userIdStr, targetUserId, error: String(error) });
       socket.emit("call-error", { callId, code: "CALL_SESSION_REJECTED" });
+      return;
+    }
+    try {
+      const callPrivacy = getCallPrivacy();
+      if (!callPrivacy) throw new Error("CALL_PRIVACY_UNAVAILABLE");
+      await callPrivacy.assertCallSessionPrivacy(durableSession);
+    } catch (error) {
+      await callSessionService.transitionCallSession({
+        callId,
+        actorId: userIdStr,
+        action: "end",
+        reason: "privacy_changed"
+      }).catch(() => undefined);
+      socket.emit("call-error", {
+        callId,
+        code: boundedString((error as { code?: unknown })?.code, 80) || "CALL_PRIVACY_RESTRICTED"
+      });
       return;
     }
     const deadlineAt = new Date(durableSession.expiresAt).toISOString();
@@ -536,6 +633,15 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
       if (!callSessionService) return;
       try {
         const action = eventName === "call-accept" ? "accept" : eventName === "call-reject" ? "decline" : "end";
+        if (eventName === "call-accept") {
+          const pendingSession = await callSessionService.getCallSessionForParticipant(
+            boundedString(data.callId, 160),
+            userIdStr
+          );
+          const callPrivacy = getCallPrivacy();
+          if (!callPrivacy) throw new Error("CALL_PRIVACY_UNAVAILABLE");
+          await callPrivacy.assertCallSessionPrivacy(pendingSession);
+        }
         const session = await callSessionService.transitionCallSession({
           callId: boundedString(data.callId, 160),
           actorId: userIdStr,
@@ -569,7 +675,10 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
           actorId: userIdStr,
           error: String(error)
         });
-        socket.emit("call-error", { callId: data.callId, code: "CALL_STATE_CONFLICT" });
+        socket.emit("call-error", {
+          callId: data.callId,
+          code: boundedString((error as { code?: unknown })?.code, 80) || "CALL_STATE_CONFLICT"
+        });
       }
     });
   }
@@ -587,6 +696,9 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
     if (!service) return;
     try {
       const session = await service.getCallSessionForParticipant(callId, userIdStr);
+      const callPrivacy = getCallPrivacy();
+      if (!callPrivacy) return;
+      await callPrivacy.assertCallSessionPrivacy(session);
       const signalType = getSignalType(data.signal);
       if (session.status !== "accepted") {
         traceCallSignal("signal_rejected_session_not_accepted", {
@@ -628,33 +740,63 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
       });
     } catch (error) {
       logger.warn("Unauthorized call signal rejected", { callId, actorId: userIdStr, error: String(error) });
+      socket.emit("call-error", {
+        callId,
+        code: boundedString((error as { code?: unknown })?.code, 80) || "CALL_SIGNAL_REJECTED"
+      });
     }
   });
 
-  socket.on("group-call-request", (data: { callId?: string; chatRoomId?: string; callType?: "voice" | "video" }) => {
-    if (!data?.callId || !data?.chatRoomId || !data?.callType) {
+  socket.on("group-call-request", async (data: { callId?: string; chatRoomId?: string; callType?: "voice" | "video" }) => {
+    const callId = boundedString(data?.callId, 160);
+    const chatRoomId = boundedString(data?.chatRoomId, 64);
+    if (!CALL_ID_PATTERN.test(callId)
+      || !OBJECT_ID_PATTERN.test(chatRoomId)
+      || !data?.callType
+      || !["voice", "video"].includes(data.callType)) {
+      socket.emit("call-error", { callId, code: "INVALID_GROUP_CALL" });
       return;
     }
-    activeCalls.set(data.callId, {
-      callId: data.callId,
+    if (!consumeCallRequestQuota(userIdStr)) {
+      socket.emit("call-error", { callId, code: "CALL_RATE_LIMITED" });
+      return;
+    }
+    if (!await isAuthorizedLegacyChatMember(chatRoomId, userIdStr)) {
+      socket.emit("call-error", { callId, code: "GROUP_CALL_ACCESS_DENIED" });
+      return;
+    }
+    const existingCall = activeCalls.get(callId);
+    if (existingCall || activeCalls.size >= MAX_ACTIVE_GROUP_CALLS) {
+      socket.emit("call-error", {
+        callId,
+        code: existingCall ? "CALL_ID_CONFLICT" : "GROUP_CALL_CAPACITY_REACHED"
+      });
+      return;
+    }
+    activeCalls.set(callId, {
+      callId,
       callType: data.callType,
       isGroup: true,
-      chatRoomId: data.chatRoomId,
+      chatRoomId,
       initiatorId: userIdStr,
       participants: new Set([userIdStr]),
       startTime: new Date(),
-      roomName: `call-${data.callId}`
+      roomName: `call-${callId}`
     });
-    socket.join(`call-${data.callId}`);
-    io.to(`chat-${data.chatRoomId}`).emit("group-call-incoming", {
-      callId: data.callId,
+    socket.data.groupCallChats = {
+      ...(socket.data.groupCallChats || {}),
+      [callId]: chatRoomId
+    };
+    await socket.join(`call-${callId}`);
+    io.to(`chat-${chatRoomId}`).emit("group-call-incoming", {
+      callId,
       callType: data.callType,
       initiatorId: userIdStr,
-      chatRoomId: data.chatRoomId
+      chatRoomId
     });
   });
 
-  socket.on("group-call-join", (data: { callId?: string }) => {
+  socket.on("group-call-join", async (data: { callId?: string }) => {
     if (!data?.callId) {
       return;
     }
@@ -663,8 +805,25 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
       socket.emit("group-call-not-found", { callId: data.callId });
       return;
     }
+    if (!await isAuthorizedLegacyChatMember(session.chatRoomId, userIdStr)) {
+      socket.emit("call-error", { callId: data.callId, code: "GROUP_CALL_ACCESS_DENIED" });
+      return;
+    }
+    const participantAuthorization = await Promise.all(
+      [...session.participants].map(async (participantId) => ({
+        participantId,
+        allowed: await isAuthorizedLegacyChatMember(session.chatRoomId, participantId)
+      }))
+    );
+    participantAuthorization.forEach(({ participantId, allowed }) => {
+      if (!allowed) session.participants.delete(participantId);
+    });
     session.participants.add(userIdStr);
-    socket.join(`call-${data.callId}`);
+    socket.data.groupCallChats = {
+      ...(socket.data.groupCallChats || {}),
+      [data.callId]: session.chatRoomId
+    };
+    await socket.join(`call-${data.callId}`);
     const existingParticipants = Array.from(session.participants)
       .filter((id) => id !== userIdStr)
       .map((id) => ({ userId: id, username: id }));
@@ -677,11 +836,24 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
     socket.to(`call-${data.callId}`).emit("group-call-participant-joined", { callId: data.callId, userId: userIdStr });
   });
 
-  socket.on("group-call-signal", (data: { callId?: string; targetUserId?: string; signal?: unknown }) => {
-    if (!data?.callId || !data?.targetUserId || !data?.signal) {
+  socket.on("group-call-signal", async (data: { callId?: string; targetUserId?: string; signal?: unknown }) => {
+    if (!data?.callId || !data?.targetUserId || !data?.signal || typeof data.signal !== "object") {
       return;
     }
-    io.to(`user-${String(data.targetUserId)}`).emit("group-call-signal", {
+    let serializedSignal = "";
+    try { serializedSignal = JSON.stringify(data.signal); } catch { return; }
+    if (Buffer.byteLength(serializedSignal, "utf8") > 64 * 1024) return;
+    const session = activeCalls.get(data.callId);
+    const targetUserId = String(data.targetUserId);
+    if (!session
+      || !session.participants.has(userIdStr)
+      || !session.participants.has(targetUserId)
+      || !await isAuthorizedLegacyChatMember(session.chatRoomId, userIdStr)
+      || !await isAuthorizedLegacyChatMember(session.chatRoomId, targetUserId)) {
+      socket.emit("call-error", { callId: data.callId, code: "GROUP_CALL_ACCESS_DENIED" });
+      return;
+    }
+    io.to(`user-${targetUserId}`).emit("group-call-signal", {
       callId: data.callId,
       fromUserId: userIdStr,
       signal: data.signal
