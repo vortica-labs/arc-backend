@@ -14,6 +14,7 @@ const {
 
 const ConnectionQueue = require('../models/ConnectionQueue');
 const RandomConnection = require('../models/RandomConnection');
+const { normalizePreferredGender } = require('../utils/randomConnectGender');
 
 const router = express.Router();
 
@@ -67,7 +68,8 @@ const joinQueueValidation = [
     .withMessage('Video enabled must be a boolean'),
   body('preferredGender')
     .optional()
-    .isIn(['male', 'female'])
+    .customSanitizer(normalizePreferredGender)
+    .isIn(['', 'male', 'female'])
     .withMessage('Preferred gender must be male or female (use Any for no filter)')
 ];
 

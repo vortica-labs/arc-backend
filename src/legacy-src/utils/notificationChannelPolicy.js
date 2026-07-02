@@ -3,16 +3,23 @@ const EMAIL_INTENTS = Object.freeze({
   SECURITY: 'security',
   PREMIUM_LIFECYCLE: 'premium_lifecycle',
   PAYMENT_TRANSACTIONAL: 'payment_transactional',
-  CREATOR_STATUS: 'creator_status',
-  HOST_STATUS: 'host_status',
-  TOURNAMENT_REGISTRATION_PRIZE: 'tournament_registration_prize',
-  RECRUITMENT_STATUS: 'recruitment_status',
-  BROADCAST_EXPLICIT: 'broadcast_explicit',
   PLATFORM_CRITICAL: 'platform_critical',
   LEGAL_POLICY: 'legal_policy'
 });
 
 const ALLOWED_EMAIL_INTENTS = new Set(Object.values(EMAIL_INTENTS));
+
+// These intents existed before email was restricted to account, security,
+// billing, legal and critical platform events. Keep their serialized values
+// blocked explicitly so jobs already waiting in Redis are acknowledged without
+// being delivered or retried after a deployment.
+const DISABLED_EMAIL_INTENTS = new Set([
+  'creator_status',
+  'host_status',
+  'tournament_registration_prize',
+  'recruitment_status',
+  'broadcast_explicit'
+]);
 
 // These are product engagement signals. They may produce inbox rows, realtime
 // events, and push alerts, but they never implicitly authorize email.
@@ -32,7 +39,12 @@ const ROUTINE_ENGAGEMENT_EVENTS = new Set([
   'message',
   'story',
   'clip',
-  'call'
+  'call',
+  'random_connect',
+  'presence',
+  'recommendation',
+  'feed_activity',
+  'friend_suggestion'
 ]);
 
 const normalizeValue = (value) => typeof value === 'string'
@@ -95,10 +107,98 @@ const normalizeRoutineEvent = (value) => {
     tournaments: 'tournament',
     tournament_registration: 'tournament',
     tournament_prize: 'tournament',
+    tournament_update: 'tournament',
+    tournament_match_update: 'tournament',
+    tournament_activity: 'tournament',
+    match_update: 'tournament',
+    match_result: 'tournament',
     recruitment_application: 'recruitment',
-    recruitment_update: 'recruitment'
+    recruitment_invitation: 'recruitment',
+    recruitment_application_status: 'recruitment',
+    recruitment_application_accepted: 'recruitment',
+    recruitment_application_rejected: 'recruitment',
+    recruitment_accepted: 'recruitment',
+    recruitment_rejected: 'recruitment',
+    recruitment_update: 'recruitment',
+    messages: 'message',
+    new_message: 'message',
+    direct_message: 'message',
+    voice_message: 'message',
+    audio_message: 'message',
+    media_message: 'message',
+    image_message: 'message',
+    video_message: 'message',
+    group_message: 'message',
+    shared_post_message: 'message',
+    shared_clip_message: 'message',
+    story_view: 'story',
+    story_views: 'story',
+    story_reaction: 'story',
+    story_reply: 'story',
+    clip_comment: 'clip',
+    clip_view: 'clip',
+    clip_views: 'clip',
+    random_connect_match: 'random_connect',
+    random_connect_match_found: 'random_connect',
+    random_connect_session_update: 'random_connect',
+    random_connect_session_started: 'random_connect',
+    random_connect_session_ended: 'random_connect',
+    presence_update: 'presence',
+    presence_updates: 'presence',
+    recommendations: 'recommendation',
+    user_recommendation: 'recommendation',
+    friend_suggestions: 'friend_suggestion',
+    engagement: 'feed_activity',
+    general_engagement: 'feed_activity'
   };
-  return aliases[normalized] || normalized;
+  if (aliases[normalized]) return aliases[normalized];
+
+  // Event names evolve (for example `post_comment_created` or
+  // `recruitment_application_withdrawn`). Recognize engagement families by
+  // complete underscore-delimited tokens so new variants fail closed without
+  // substring-matching unrelated transactional names.
+  const familyByToken = {
+    like: 'like',
+    likes: 'like',
+    liked: 'like',
+    comment: 'comment',
+    comments: 'comment',
+    reply: 'comment',
+    replies: 'comment',
+    follow: 'follow',
+    follows: 'follow',
+    follower: 'follow',
+    followers: 'follow',
+    share: 'share',
+    shares: 'share',
+    shared: 'share',
+    mention: 'mention',
+    mentions: 'mention',
+    tag: 'tag',
+    tags: 'tag',
+    tagged: 'tag',
+    reaction: 'reaction',
+    reactions: 'reaction',
+    save: 'save',
+    saves: 'save',
+    saved: 'save',
+    message: 'message',
+    messages: 'message',
+    story: 'story',
+    stories: 'story',
+    clip: 'clip',
+    clips: 'clip',
+    tournament: 'tournament',
+    tournaments: 'tournament',
+    recruitment: 'recruitment',
+    call: 'call',
+    calls: 'call'
+  };
+  for (const token of normalized.split('_')) {
+    if (familyByToken[token]) return familyByToken[token];
+  }
+  if (normalized.startsWith('random_connect_') || normalized === 'random_connect') return 'random_connect';
+  return normalized;
 };
 
 const getRoutineEngagementEvent = (input = {}) => {
@@ -142,25 +242,12 @@ const evaluateEmailPolicy = (input = {}) => {
   const intent = getEmailIntent(input);
   const routineEventType = getRoutineEngagementEvent(input);
 
-  // Broadcast Center does not yet own a durable email outbox/terminal
-  // reconciliation path. Keep the intent reserved but fail closed until the
-  // worker can revalidate recipient identity and cancellation from MongoDB.
-  if (intent === EMAIL_INTENTS.BROADCAST_EXPLICIT) {
-    return { allowed: false, intent, routineEventType, reason: 'broadcast_email_transport_not_configured' };
+  if (routineEventType) {
+    return { allowed: false, intent, routineEventType, reason: 'routine_engagement_email_blocked' };
   }
 
-  if (routineEventType) {
-    // Recruitment application decisions are explicitly transactional; general
-    // recruitment discovery/activity remains routine engagement.
-    if (routineEventType === 'recruitment' && intent === EMAIL_INTENTS.RECRUITMENT_STATUS) {
-      return { allowed: true, intent, routineEventType, reason: 'explicit_recruitment_status' };
-    }
-    // Tournament registration and prize outcomes are transactional, while
-    // tournament activity/updates remain push + in-app only.
-    if (routineEventType === 'tournament' && intent === EMAIL_INTENTS.TOURNAMENT_REGISTRATION_PRIZE) {
-      return { allowed: true, intent, routineEventType, reason: 'explicit_tournament_transaction' };
-    }
-    return { allowed: false, intent, routineEventType, reason: 'routine_engagement_email_blocked' };
+  if (DISABLED_EMAIL_INTENTS.has(intent)) {
+    return { allowed: false, intent, routineEventType: null, reason: 'email_intent_disabled_by_policy' };
   }
 
   if (!ALLOWED_EMAIL_INTENTS.has(intent)) {
@@ -178,6 +265,7 @@ const evaluateNotificationEmailPolicy = (notification, context = {}) => evaluate
 
 module.exports = {
   EMAIL_INTENTS,
+  DISABLED_EMAIL_INTENTS,
   ROUTINE_ENGAGEMENT_EVENTS,
   normalizeRoutineEvent,
   getRoutineEngagementEvent,

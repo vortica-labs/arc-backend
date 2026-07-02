@@ -19,23 +19,29 @@ assert(securityEmail.includes('intent: EMAIL_INTENTS.SECURITY'));
 assert(!securityEmail.toLowerCase().includes('temporary password'));
 assert(!securityEmail.toLowerCase().includes('one-time'));
 
-assert(recruitment.includes('intent: EMAIL_INTENTS.RECRUITMENT_STATUS'));
-assert(recruitment.includes("notificationType: 'recruitment'"));
-assert(!recruitment.includes('sendMail({'), 'recruitment decisions must use the typed queue rather than raw HTML transport');
+assert(!recruitment.includes('enqueueEmail('), 'recruitment activity must not enqueue email');
+assert(!recruitment.includes('EMAIL_INTENTS.'), 'recruitment activity must remain push + in-app only');
 
 assert(premium.includes('intent: EMAIL_INTENTS.PREMIUM_LIFECYCLE'));
 assert(premium.includes('eventType: action'));
 
 const requiredAdminIntents = [
   'EMAIL_INTENTS.ACCOUNT_LIFECYCLE',
-  'EMAIL_INTENTS.PLATFORM_CRITICAL',
-  'EMAIL_INTENTS.CREATOR_STATUS',
-  'EMAIL_INTENTS.HOST_STATUS',
   'EMAIL_INTENTS.PAYMENT_TRANSACTIONAL'
 ];
 for (const intent of requiredAdminIntents) {
   assert(admin.includes(intent), `admin critical outcomes must opt into ${intent}`);
 }
+
+for (const disabledIntent of [
+  'EMAIL_INTENTS.CREATOR_STATUS',
+  'EMAIL_INTENTS.HOST_STATUS',
+  'EMAIL_INTENTS.RECRUITMENT_STATUS',
+  'EMAIL_INTENTS.TOURNAMENT_REGISTRATION_PRIZE'
+]) {
+  assert(!admin.includes(disabledIntent), `${disabledIntent} must not be used by admin activity notifications`);
+}
+assert(!admin.includes("notificationEmail(EMAIL_INTENTS.PLATFORM_CRITICAL, 'content_report_warning')"));
 
 for (const eventType of [
   'account_restored',

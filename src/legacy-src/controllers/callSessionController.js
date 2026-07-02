@@ -6,6 +6,15 @@ const {
 } = require('../services/callSessionService');
 const log = require('../utils/logger');
 const INSTALLATION_ID_PATTERN = /^[A-Za-z0-9:._-]{8,200}$/;
+const callSignalDebugEnabled = process.env.CALL_SIGNAL_DEBUG === 'true';
+const traceCallSignal = (stage, meta = {}) => {
+  if (!callSignalDebugEnabled) return;
+  log.info('Call signaling trace', {
+    timestamp: new Date().toISOString(),
+    stage,
+    ...meta
+  });
+};
 
 const userId = (req) => String(req.user?._id || '');
 const sendError = (res, error, operation) => {
@@ -56,12 +65,26 @@ const performAction = (action) => async (req, res) => {
     const callerId = String(session.caller);
     const calleeId = String(session.callee);
     const otherUserId = actorId === callerId ? calleeId : callerId;
+    traceCallSignal('durable_call_action_committed', {
+      callId: session.callId,
+      action,
+      actorId,
+      callerId,
+      calleeId,
+      installationId: installationId || 'unspecified',
+      status: session.status
+    });
     if (action === 'accept') {
       io?.to?.(`user-${callerId}`).emit('call-accept', {
         callId: session.callId,
         nativeCallId: session.nativeCallId,
         fromUserId: calleeId,
         acceptedAt: session.acceptedAt
+      });
+      traceCallSignal('call_accept_forwarded', {
+        callId: session.callId,
+        fromUserId: calleeId,
+        targetUserId: callerId
       });
     } else if (action === 'decline') {
       io?.to?.(`user-${callerId}`).emit('call-reject', {

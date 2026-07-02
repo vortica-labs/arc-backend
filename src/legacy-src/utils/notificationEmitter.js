@@ -9,9 +9,21 @@ const setIoInstance = (ioInstance) => {
 };
 
 const emitNotification = (userId, notification) => {
-  if (io) {
-    io.to(`user-${userId}`).emit('new-notification', notification);
+  if (!io) {
+    log.debug('Notification socket emit skipped: Socket.IO unavailable', {
+      userId: String(userId),
+      notificationId: String(notification?._id || ''),
+      type: notification?.type || 'system'
+    });
+    return false;
   }
+  io.to(`user-${userId}`).emit('new-notification', notification);
+  log.debug('Notification socket event emitted', {
+    userId: String(userId),
+    notificationId: String(notification?._id || ''),
+    type: notification?.type || 'system'
+  });
+  return true;
 };
 
 const emitBroadcastNotification = (userId, notification) => {
@@ -150,6 +162,12 @@ const getRecipientDeliveryContext = async (notificationData) => {
 const createAndEmitNotification = async (notificationData) => {
   try {
     const normalizedNotificationData = normalizeNotificationPayload(notificationData);
+    log.debug('Notification dispatch started', {
+      userId: String(normalizedNotificationData.recipient || ''),
+      type: normalizedNotificationData.type || 'system',
+      requestedInApp: normalizedNotificationData.sendInApp !== false,
+      requestedPush: normalizedNotificationData.sendPush !== false
+    });
     // Preference lookup is a delivery precondition. Failing open here would
     // bypass an explicit opt-out whenever the user lookup has a transient
     // failure, so surface the error to the producer instead.
@@ -194,6 +212,14 @@ const createAndEmitNotification = async (notificationData) => {
         }
       }
       if (created && notification && channels.inApp) emitNotification(notification.recipient, notification);
+      log.debug('Notification durable row prepared', {
+        userId: String(normalizedNotificationData.recipient || ''),
+        notificationId: String(notification?._id || ''),
+        type: normalizedNotificationData.type || 'system',
+        created,
+        inApp: channels.inApp,
+        push: channels.push
+      });
     }
 
     if (channels.push) {
@@ -206,10 +232,21 @@ const createAndEmitNotification = async (notificationData) => {
           deliveryNotification = await Notification.claimPushDelivery(notification._id, leaseKey);
         }
         if (deliveryNotification) {
-          await sendPushNotification(
+          const pushResult = await sendPushNotification(
             normalizedNotificationData.recipient,
             deliveryNotification
           );
+          log.debug('Notification push dispatch completed', {
+            userId: String(normalizedNotificationData.recipient || ''),
+            notificationId: String(notification?._id || ''),
+            type: normalizedNotificationData.type || 'system',
+            requestKey: String(pushResult?.requestKey || '').slice(0, 16),
+            reasonCode: pushResult?.reasonCode || '',
+            submitted: Number(pushResult?.submitted || 0),
+            accepted: Number(pushResult?.accepted || 0),
+            failed: Number(pushResult?.failed || 0),
+            skipped: Number(pushResult?.skipped || 0)
+          });
           if (notification) {
             const Notification = require('../models/Notification');
             await Notification.completePushDelivery(notification._id, leaseKey);

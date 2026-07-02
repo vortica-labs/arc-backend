@@ -72,6 +72,21 @@ const callRequestWindows = new Map<string, number[]>();
 const CALL_REQUEST_WINDOW_MS = 60_000;
 const CALL_REQUEST_MAX_PER_WINDOW = 8;
 let randomMatchLoopStarted = false;
+const callSignalDebugEnabled = process.env.CALL_SIGNAL_DEBUG === "true";
+const traceCallSignal = (stage: string, meta: Record<string, unknown>) => {
+  if (!callSignalDebugEnabled) return;
+  logger.info("Call signaling trace", {
+    timestamp: new Date().toISOString(),
+    stage,
+    ...meta
+  });
+};
+
+const getSignalType = (signal: unknown): string => (
+  signal && typeof signal === "object" && "type" in signal
+    ? boundedString((signal as { type?: unknown }).type, 40) || "unknown"
+    : "unknown"
+);
 
 const consumeCallRequestQuota = (userId: string, now = Date.now()) => {
   const recent = (callRequestWindows.get(userId) || []).filter((timestamp) => now - timestamp < CALL_REQUEST_WINDOW_MS);
@@ -395,6 +410,13 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
     if (!callId || !OBJECT_ID_PATTERN.test(targetUserId) || !data?.callType || !["voice", "video"].includes(data.callType) || targetUserId === userIdStr) {
       return;
     }
+    traceCallSignal("call_request_received", {
+      callId,
+      callType: data.callType,
+      callerId: userIdStr,
+      calleeId: targetUserId,
+      socketId: socket.id
+    });
     if (!consumeCallRequestQuota(userIdStr)) {
       socket.emit("call-error", { callId, code: "CALL_RATE_LIMITED" });
       return;
@@ -523,6 +545,14 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
         const callerId = getObjectIdString(session.caller);
         const calleeId = getObjectIdString(session.callee);
         const otherUserId = userIdStr === callerId ? calleeId : callerId;
+        traceCallSignal("call_state_forwarded", {
+          callId: session.callId,
+          eventName,
+          actorId: userIdStr,
+          targetUserId: otherUserId,
+          socketId: socket.id,
+          status: session.status
+        });
         io.to(`user-${otherUserId}`).emit(eventName, {
           callId: session.callId,
           nativeCallId: session.nativeCallId,
@@ -557,16 +587,44 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
     if (!service) return;
     try {
       const session = await service.getCallSessionForParticipant(callId, userIdStr);
-      if (session.status !== "accepted") return;
+      const signalType = getSignalType(data.signal);
+      if (session.status !== "accepted") {
+        traceCallSignal("signal_rejected_session_not_accepted", {
+          callId,
+          actorId: userIdStr,
+          requestedTarget,
+          signalType,
+          status: session.status,
+          socketId: socket.id
+        });
+        return;
+      }
       const callerId = getObjectIdString(session.caller);
       const calleeId = getObjectIdString(session.callee);
       const authorizedTarget = userIdStr === callerId ? calleeId : callerId;
-      if (requestedTarget !== authorizedTarget) return;
+      if (requestedTarget !== authorizedTarget) {
+        traceCallSignal("signal_rejected_wrong_target", {
+          callId,
+          actorId: userIdStr,
+          requestedTarget,
+          authorizedTarget,
+          signalType,
+          socketId: socket.id
+        });
+        return;
+      }
       io.to(`user-${authorizedTarget}`).emit("call-signal", {
         callId: session.callId,
         nativeCallId: session.nativeCallId,
         fromUserId: userIdStr,
         signal: data.signal
+      });
+      traceCallSignal("signal_forwarded", {
+        callId,
+        fromUserId: userIdStr,
+        targetUserId: authorizedTarget,
+        signalType,
+        socketId: socket.id
       });
     } catch (error) {
       logger.warn("Unauthorized call signal rejected", { callId, actorId: userIdStr, error: String(error) });
