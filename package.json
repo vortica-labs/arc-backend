@@ -18,6 +18,7 @@
     "test:broadcast": "node src/legacy-src/services/broadcastService.test.js",
     "test:recommendations": "node src/legacy-src/services/recommendationService.test.js",
     "test:random-connect": "node src/legacy-src/controllers/randomConnectController.test.js && node src/legacy-src/services/entitlementService.test.js && node src/legacy-src/services/randomConnectAdmissionService.test.js && node --check scripts/migrate-random-connect-indexes.js",
+    "test:recruitment": "node src/legacy-src/services/recruitmentPolicy.test.js && node --check src/legacy-src/controllers/recruitmentController.js && node --check src/legacy-src/controllers/aiRecruitmentController.js",
     "migrate:random-connect-indexes": "node scripts/migrate-random-connect-indexes.js",
     "verify:random-connect-indexes": "node scripts/migrate-random-connect-indexes.js --verify",
     "migrate:broadcast-indexes": "node scripts/migrate-broadcast-indexes.js",

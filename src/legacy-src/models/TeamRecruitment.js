@@ -42,7 +42,9 @@ const teamRecruitmentSchema = new mongoose.Schema({
   // Game and Role Information
   game: {
     type: String,
-    required: [true, 'Game is required'],
+    required: function() {
+      return this.recruitmentType === 'roster';
+    },
     enum: ['BGMI', 'Valorant', 'Free Fire', 'Call of Duty Mobile', 'CS:GO', 'Fortnite', 'Apex Legends', 'League of Legends', 'Dota 2']
   },
   role: {

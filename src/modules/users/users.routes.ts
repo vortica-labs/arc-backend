@@ -42,7 +42,6 @@ router.delete("/:teamId/roster/:game/:playerId", protect, userController.removeP
 router.post("/:teamId/staff/add", protect, userController.addStaffMember);
 router.post("/:teamId/staff/add-by-username", protect, userController.addStaffMemberByUsername);
 router.delete("/:teamId/staff/:playerId", protect, userController.removeStaffMember);
-router.post("/:playerId/add-team/:teamId", protect, userController.addTeamToPlayer);
 router.get("/:teamId/pending-invites", protect, userController.getTeamPendingInvites);
 router.delete("/:teamId/staff/cancel-by-username", protect, userController.cancelStaffInviteByUsername);
 router.post("/:teamId/leave-request", protect, userController.sendLeaveRequest);

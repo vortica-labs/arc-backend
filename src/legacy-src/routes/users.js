@@ -19,7 +19,6 @@ const {
   addStaffMemberByUsername,
   removePlayerFromRoster,
   removeStaffMember,
-  addTeamToPlayer,
   getTeamPendingInvites,
   cancelRosterInvite,
   getRosterInvites,
@@ -83,7 +82,6 @@ router.delete('/:teamId/roster/:game/:playerId', protect, removePlayerFromRoster
 router.post('/:teamId/staff/add', protect, addStaffMember);
 router.post('/:teamId/staff/add-by-username', protect, addStaffMemberByUsername);
 router.delete('/:teamId/staff/:playerId', protect, removeStaffMember);
-router.post('/:playerId/add-team/:teamId', protect, addTeamToPlayer);
 router.get('/:teamId/pending-invites', protect, getTeamPendingInvites);
 router.delete('/roster-invite/:inviteId', protect, cancelRosterInvite);
 // Player-facing roster invite endpoints

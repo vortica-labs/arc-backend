@@ -190,6 +190,16 @@ const optionalAuth = async (req, res, next) => {
   }
 };
 
+// Public-read authentication: anonymous requests continue, while a supplied
+// token is still validated and attached so controllers can recognize owners.
+// Keep this separate from optionalAuth because existing routes intentionally
+// require either a User or Guest token through that legacy middleware.
+const publicOptionalAuth = async (req, res, next) => {
+  const token = extractToken(req);
+  if (!token) return next();
+  return optionalAuth(req, res, next);
+};
+
 // Check if user owns the resource
 const checkOwnership = (resourceModel, resourceIdParam = 'id') => {
   return async (req, res, next) => {
@@ -247,6 +257,7 @@ module.exports = {
   protectAllowIncomplete,
   authorize,
   optionalAuth,
+  publicOptionalAuth,
   checkOwnership,
   invalidateUserCache,
   getCachedUser

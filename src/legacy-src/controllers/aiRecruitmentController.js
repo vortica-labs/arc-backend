@@ -57,15 +57,15 @@ const matchPlayersToTeam = safeAsyncHandler(async (req, res) => {
     const { teamId, game, role, requirements, limit = 10, recruitmentId } = req.body;
     const userId = req.user._id;
 
-    // Validate team ownership
+    if (req.user.userType !== 'team') {
+      return res.status(403).json({ success: false, message: 'Only teams can match recruitment candidates' });
+    }
+
     if (teamId && teamId.toString() !== userId.toString()) {
-      const team = await User.findById(teamId);
-      if (!team || team.userType !== 'team') {
-        return res.status(404).json({
-          success: false,
-          message: 'Team not found'
-        });
-      }
+      return res.status(403).json({
+        success: false,
+        message: 'You can only match candidates for your own team'
+      });
     }
 
     const actualTeamId = teamId || userId;
@@ -1222,26 +1222,44 @@ const smartSearch = safeAsyncHandler(async (req, res) => {
     const { searchType, game, role, description, teamId } = req.body;
     const userId = req.user._id;
 
-    if (!game || !description) {
+    if (req.user.userType !== 'team' || (teamId && teamId.toString() !== userId.toString())) {
+      return res.status(403).json({ success: false, message: 'Only the owning team can search recruitment candidates' });
+    }
+    if (!['players', 'staff'].includes(searchType)) {
+      return res.status(400).json({ success: false, message: 'Search type must be players or staff' });
+    }
+
+    if (!description) {
       return res.status(400).json({
         success: false,
-        message: 'Game and description are required'
+        message: 'Description is required'
       });
+    }
+
+    if (searchType === 'players' && !game) {
+      return res.status(400).json({ success: false, message: 'Game is required when searching for players' });
     }
 
     // Find matching profiles
     const profileType = searchType === 'players' ? 'looking-for-team' : 'staff-position';
     const query = {
       profileType,
-      game,
       status: 'active',
-      isActive: true
+      isActive: true,
+      $or: [
+        { expiresAt: { $gt: new Date() } },
+        { expiresAt: null },
+        { expiresAt: { $exists: false } }
+      ]
     };
 
     if (searchType === 'players' && role) {
+      query.game = game;
       query.role = { $regex: role, $options: 'i' };
     } else if (searchType === 'staff' && role) {
       query.staffRole = role;
+    } else if (searchType === 'players') {
+      query.game = game;
     }
 
     const profiles = await PlayerProfile.find(query)
