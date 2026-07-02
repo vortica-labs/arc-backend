@@ -1,28 +1,36 @@
 const User = require('../models/User');
 const RandomConnection = require('../models/RandomConnection');
 const ConnectionQueue = require('../models/ConnectionQueue');
+const { createAndEmitNotification } = require('../utils/notificationEmitter');
+const {
+  FREE_DAILY_GENDER_MATCH_LIMIT,
+  isLegacyUserPremium,
+  resolveRandomConnectEntitlement,
+  randomConnectEntitlementEnvelope
+} = require('../services/entitlementService');
+const {
+  withRandomConnectAdmissions,
+  withRandomConnectAdmission,
+  commitRandomConnectMatch,
+  ensureGenderFilterQuota,
+  reserveGenderFilterSlot,
+  syncAttributedUsage,
+  getGenderFilterUsage
+} = require('../services/randomConnectAdmissionService');
 const { v4: uuidv4 } = require('uuid');
 const log = require('../utils/logger');
 
 // Free users: daily match limit. Premium: unlimited matches.
-const FREE_DAILY_MATCH_LIMIT = 5;
+const FREE_DAILY_MATCH_LIMIT = FREE_DAILY_GENDER_MATCH_LIMIT;
 const FREE_TO_FREE_SESSION_SECONDS = Number(process.env.RANDOM_CONNECT_FREE_SESSION_SECONDS || 180);
 const SESSION_WARNING_SECONDS = 30;
 const TAG_FALLBACK_MS = Number(process.env.RANDOM_CONNECT_TAG_FALLBACK_MS || 20000);
 const RECENT_PARTNER_AVOID_MS = Number(process.env.RANDOM_CONNECT_RECENT_PARTNER_AVOID_MS || 10 * 60 * 1000);
 const MATCH_BATCH_LIMIT = Number(process.env.RANDOM_CONNECT_MATCH_BATCH_LIMIT || 100);
 const ACTIVE_SESSION_STATUSES = ['waiting', 'active'];
-const PREMIUM_TIERS = ['player_pro', 'player_pro_plus', 'team_pro', 'team_org'];
 const sessionTimerHandles = new Map();
 
-const isPremiumUser = (user) => {
-  if (!user) return false;
-  const tier = user.membership?.tier || 'free';
-  const isPremiumTier = PREMIUM_TIERS.includes(tier);
-  const validUntil = user.membership?.validUntil;
-  const isExpired = validUntil ? new Date(validUntil).getTime() < Date.now() : false;
-  return (user.isPremium === true || isPremiumTier) && !isExpired;
-};
+const isPremiumUser = isLegacyUserPremium;
 
 const getIo = (req) => req?.app?.get?.('io') || global._arcSocketIO || null;
 
@@ -36,6 +44,20 @@ const normalizeTags = (tags = []) => {
 
 const sanitizePreferredGender = (preferredGender) =>
   (preferredGender === 'male' || preferredGender === 'female') ? preferredGender : '';
+
+const requestSource = (req) => String(
+  req?.get?.('x-client-platform') || req?.get?.('x-app-platform') || 'unspecified'
+).trim().slice(0, 40) || 'unspecified';
+
+const setEntitlementNoStore = (res) => {
+  res.set('Cache-Control', 'private, no-store');
+};
+
+const buildGenderFilterUserIds = (...participants) => Array.from(new Map(
+  participants
+    .filter((participant) => participant?.userId && sanitizePreferredGender(participant.preferredGender))
+    .map((participant) => [getUserIdString(participant.userId), participant.userId])
+).values());
 
 const getUserIdString = (value) => {
   if (!value) return '';
@@ -302,10 +324,63 @@ const createHttpError = (status, payload) => {
   return error;
 };
 
-const queueAndTryMatch = async ({ user, body = {}, io }) => {
+const buildRequestErrorPayload = async (req, error, fallbackMessage) => {
+  if (error?.payload) return error.payload;
+  let entitlementResponse = {};
+  if (req.user?._id) {
+    try {
+      const entitlement = await resolveRandomConnectEntitlement({
+        userId: req.user._id,
+        requestSource: requestSource(req)
+      });
+      entitlementResponse = randomConnectEntitlementEnvelope(entitlement);
+    } catch {
+      // If entitlement storage itself is unavailable, preserve the original
+      // failure instead of substituting or granting a client-side decision.
+    }
+  }
+  return {
+    success: false,
+    code: error?.code || 'RANDOM_CONNECT_REQUEST_FAILED',
+    message: error?.message || fallbackMessage,
+    retryable: error?.retryable === true || error?.status === 409,
+    retryAfterMs: error?.retryAfterMs,
+    ...entitlementResponse
+  };
+};
+
+const runAdmissionProtectedController = async ({ req, res, operation, work, fallbackMessage }) => {
+  setEntitlementNoStore(res);
+  try {
+    return await withRandomConnectAdmission({
+      userId: req.user._id,
+      operation,
+      work
+    });
+  } catch (error) {
+    if (error?.status) {
+      if (error.retryAfterMs) res.set('Retry-After', String(Math.max(1, Math.ceil(error.retryAfterMs / 1000))));
+      return res.status(error.status).json(await buildRequestErrorPayload(req, error, fallbackMessage));
+    }
+    log.error(`${operation} Random Connect admission error`, { error: String(error) });
+    return res.status(500).json({
+      success: false,
+      message: fallbackMessage,
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+const queueAndTryMatch = async ({
+  user,
+  body = {},
+  io,
+  source = 'unspecified',
+  admissionLease,
+  assertLease = () => {}
+}) => {
   const { selectedGame, tags = [], videoEnabled = true, preferredGender } = body;
   const userId = user?._id;
-  const isPremium = isPremiumUser(user);
   const userGender = user?.profile?.gender || '';
 
   if (!userId) {
@@ -315,31 +390,74 @@ const queueAndTryMatch = async ({ user, body = {}, io }) => {
     });
   }
 
-  if (user.userType !== 'player') {
+  // Never authorize Premium behavior from req.user/JWT/client state. The
+  // resolver reads the current canonical membership and a fresh User fallback.
+  const entitlement = await resolveRandomConnectEntitlement({
+    userId,
+    requestSource: source
+  });
+  const entitlementResponse = randomConnectEntitlementEnvelope(entitlement);
+  const refreshedEntitlementResponse = async () => {
+    try {
+      return randomConnectEntitlementEnvelope(await resolveRandomConnectEntitlement({
+        userId,
+        requestSource: source
+      }));
+    } catch (error) {
+      // A connection/queue mutation that already committed remains successful;
+      // clients can refetch the no-store entitlement endpoint if this refresh
+      // encounters a transient read failure.
+      log.warn('Random Connect response entitlement refresh failed', {
+        userId: String(userId),
+        error: String(error)
+      });
+      return entitlementResponse;
+    }
+  };
+  const isPremium = entitlement.isPremium;
+  assertLease();
+
+  if (!entitlement.entitlements.randomConnect.enabled) {
     console.warn(`[RandomConnect] join-queue forbidden (not player): user=${user.username} id=${userId} type=${user.userType}`);
     throw createHttpError(403, {
       success: false,
-      message: 'Random Connect is only for users. Teams cannot use this feature.'
+      message: 'Random Connect is only for users. Teams cannot use this feature.',
+      ...entitlementResponse
     });
+  }
+
+  const existingConnection = await RandomConnection.findOne({
+    'participants.userId': userId,
+    status: { $in: ACTIVE_SESSION_STATUSES }
+  });
+  if (existingConnection) {
+    const connectionData = buildConnectionPayload(existingConnection);
+    return {
+      success: true,
+      message: 'Existing Random Connect session restored.',
+      connection: connectionData,
+      matched: true,
+      resumed: true,
+      roomId: existingConnection.roomId,
+      ...(await refreshedEntitlementResponse())
+    };
   }
 
   const queuePreferredGender = sanitizePreferredGender(preferredGender);
   if (!isPremium && queuePreferredGender) {
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
-    const todayGenderFilterMatchCount = await RandomConnection.countDocuments({
-      'participants.userId': userId,
-      status: { $in: ['active', 'disconnected', 'ended'] },
-      startTime: { $gte: startOfToday },
-      usedGenderFilter: true
-    });
+    const { used: todayGenderFilterMatchCount, legacyUsageConservativelyCharged } = await getGenderFilterUsage({ userId });
     if (todayGenderFilterMatchCount >= FREE_DAILY_MATCH_LIMIT) {
       console.warn(`[RandomConnect] join-queue daily limit (gender filter): user=${user.username} count=${todayGenderFilterMatchCount}/${FREE_DAILY_MATCH_LIMIT}`);
       throw createHttpError(403, {
         success: false,
         message: `Daily limit reached (${FREE_DAILY_MATCH_LIMIT} matches per day when using Male/Female filter). Use "Any" for unlimited or upgrade to Premium.`,
         dailyLimitReached: true,
-        limit: FREE_DAILY_MATCH_LIMIT
+        used: todayGenderFilterMatchCount,
+        limit: FREE_DAILY_MATCH_LIMIT,
+        remaining: 0,
+        unlimited: false,
+        legacyUsageConservativelyCharged,
+        ...entitlementResponse
       });
     }
   }
@@ -349,6 +467,7 @@ const queueAndTryMatch = async ({ user, body = {}, io }) => {
     console.log(`User ${userId} attempting to join queue - Game: ${selectedGame || 'none'}, Tags: ${normalizedTags.join(', ')}`);
   }
 
+  assertLease();
   await cleanupExistingConnections(userId, io);
 
   const existingInQueue = await ConnectionQueue.findOne({
@@ -414,70 +533,140 @@ const queueAndTryMatch = async ({ user, body = {}, io }) => {
     return {
       success: true,
       message: 'Added to queue. Waiting for match...',
-      matched: false
+      matched: false,
+      ...(await refreshedEntitlementResponse())
     };
   }
 
   if (process.env.NODE_ENV === 'development') { console.log(`✅ Instant match found for ${userId} with ${match.userId}`); }
-  const claimed = await claimWaitingPair(userId, match.userId);
-  if (!claimed) {
-    return {
-      success: true,
-      message: 'Added to queue. Waiting for match...',
-      matched: false
-    };
-  }
+  assertLease();
+  let pairOutcome;
+  try {
+    pairOutcome = await withRandomConnectAdmissions({
+      userIds: [userId, match.userId],
+      operation: 'join',
+      existingLeases: admissionLease ? [admissionLease] : [],
+      work: async ({ leases, assertLeases }) => {
+        assertLease();
+        assertLeases();
+        const claimed = await claimWaitingPair(userId, match.userId);
+        if (!claimed) {
+          return { response: {
+            success: true,
+            message: 'Added to queue. Waiting for match...',
+            matched: false,
+            ...(await refreshedEntitlementResponse())
+          } };
+        }
 
-  const usedGenderFilter = queuePreferredGender !== '';
-  const connection = await createConnectionForPair({
-    user1: {
-      userId,
-      username: user.username,
-      displayName: user.profile?.displayName,
-      avatar: user.profile?.avatar,
-      videoEnabled
-    },
-    user2: match,
-    selectedGame: selectedGame || match.selectedGame || null,
-    tags: normalizedTags,
-    usedGenderFilter,
-    matchedTags: match.commonTags || [],
-    matchQuality: match.matchQuality || 'unknown'
-  });
+        const genderFilterUserIds = buildGenderFilterUserIds(
+          { userId, preferredGender: queuePreferredGender },
+          { userId: match.userId, preferredGender: match.preferredGender }
+        );
+        try {
+          assertLease();
+          assertLeases();
+          const connection = await createConnectionForPair({
+            user1: {
+              userId,
+              username: user.username,
+              displayName: user.profile?.displayName,
+              avatar: user.profile?.avatar,
+              videoEnabled,
+              preferredGender: queuePreferredGender
+            },
+            user2: match,
+            selectedGame: selectedGame || match.selectedGame || null,
+            tags: normalizedTags,
+            genderFilterUserIds,
+            matchedTags: match.commonTags || [],
+            matchQuality: match.matchQuality || 'unknown',
+            admissionLeases: leases
+          });
+          return { connection };
+        } catch (error) {
+          if (!error?.commitOutcomeUnknown) {
+            await recoverClaimedPair(userId, match.userId, error?.userId);
+          }
+          if (error?.commitOutcomeUnknown) throw error;
+          if (error?.status && String(error.userId || '') === String(userId)) {
+            throw createHttpError(error.status, {
+              success: false,
+              code: error.code,
+              message: error.message,
+              dailyLimitReached: error.code === 'RANDOM_CONNECT_GENDER_FILTER_LIMIT',
+              used: error.code === 'RANDOM_CONNECT_GENDER_FILTER_LIMIT' ? FREE_DAILY_MATCH_LIMIT : undefined,
+              limit: entitlement.genderFilterLimit,
+              remaining: error.code === 'RANDOM_CONNECT_GENDER_FILTER_LIMIT' ? 0 : undefined,
+              unlimited: entitlement.entitlements.randomConnect.genderFilter.unlimited,
+              ...(await refreshedEntitlementResponse())
+            });
+          }
+          if (error?.status) {
+            return { response: {
+              success: true,
+              message: 'Added to queue. Waiting for another eligible match...',
+              matched: false,
+              ...(await refreshedEntitlementResponse())
+            } };
+          }
+          throw error;
+        }
+      }
+    });
+  } catch (error) {
+    if (error?.code === 'RANDOM_CONNECT_REQUEST_IN_PROGRESS') {
+      return {
+        success: true,
+        message: 'Added to queue. Waiting for an available match...',
+        matched: false,
+        ...(await refreshedEntitlementResponse())
+      };
+    }
+    throw error;
+  }
+  if (pairOutcome.response) return pairOutcome.response;
+  const connection = pairOutcome.connection;
 
   const userIdStr = userId.toString();
   const matchUserIdStr = match.userId.toString();
   const connectionData = buildConnectionPayload(connection);
 
-  if (io) {
-    if (process.env.NODE_ENV === 'development') { console.log('📤 Emitting connection-matched events to both users...'); }
-    await emitConnectionMatched(io, userIdStr, matchUserIdStr, connectionData, connection.roomId);
-  } else {
-    console.warn('⚠️ Socket.io not available, cannot emit events');
-  }
+  if (process.env.NODE_ENV === 'development') { console.log('📤 Delivering connection-matched events to both users...'); }
+  await emitConnectionMatched(io, userIdStr, matchUserIdStr, connectionData, connection.roomId);
 
   return {
     success: true,
     message: 'Connection established!',
     connection: { ...connectionData },
     matched: true,
-    roomId: connection.roomId
+    roomId: connection.roomId,
+    ...(await refreshedEntitlementResponse())
   };
 };
 
 // Random Connect: for users only. Matches 2 users who share tags or requested filters.
 const joinQueue = async (req, res) => {
+  setEntitlementNoStore(res);
   try {
-    const result = await queueAndTryMatch({
-      user: req.user,
-      body: req.body,
-      io: getIo(req)
+    const result = await withRandomConnectAdmission({
+      userId: req.user._id,
+      operation: 'join',
+      work: ({ lease, assertLease }) => queueAndTryMatch({
+        user: req.user,
+        body: req.body,
+        io: getIo(req),
+        source: requestSource(req),
+        admissionLease: lease,
+        assertLease
+      })
     });
 
     res.status(200).json(result);
   } catch (error) {
     if (error?.status) {
-      return res.status(error.status).json(error.payload);
+      if (error.retryAfterMs) res.set('Retry-After', String(Math.max(1, Math.ceil(error.retryAfterMs / 1000))));
+      return res.status(error.status).json(await buildRequestErrorPayload(req, error, 'Random Connect request failed'));
     }
     log.error('Join queue error:', { error: String(error) });
     res.status(500).json({
@@ -644,8 +833,20 @@ const claimWaitingPair = async (userId1, userId2) => {
   return true;
 };
 
-const buildParticipant = (queueLikeUser, dbUser, videoEnabled) => {
-  const premium = getPremiumSnapshot(dbUser);
+const recoverClaimedPair = async (userId1, userId2, blockedUserId) => {
+  const blocked = String(blockedUserId || '');
+  await Promise.all([userId1, userId2].map((userId) => (
+    blocked && String(userId) === blocked
+      ? ConnectionQueue.deleteMany({ userId, status: 'matched' })
+      : ConnectionQueue.updateOne(
+        { userId, status: 'matched' },
+        { $set: { status: 'waiting', updatedAt: new Date() } }
+      )
+  )));
+};
+
+const buildParticipant = (queueLikeUser, dbUser, videoEnabled, entitlement) => {
+  const premium = entitlement || getPremiumSnapshot(dbUser);
   return {
     userId: dbUser._id,
     username: queueLikeUser.username || dbUser.username,
@@ -653,27 +854,87 @@ const buildParticipant = (queueLikeUser, dbUser, videoEnabled) => {
     avatar: queueLikeUser.avatar || dbUser.profile?.avatar,
     videoEnabled: videoEnabled !== undefined ? videoEnabled : queueLikeUser.videoEnabled,
     isPremium: premium.isPremium,
-    membershipTier: premium.membershipTier
+    membershipTier: premium.plan || premium.membershipTier || 'free'
   };
 };
 
-const createConnectionForPair = async ({ user1, user2, selectedGame, tags, usedGenderFilter, matchedTags = [], matchQuality = 'unknown' }) => {
-  const [dbUser1, dbUser2] = await Promise.all([
-    User.findById(user1.userId || user1._id).select('username profile.displayName profile.avatar isPremium membership'),
-    User.findById(user2.userId || user2._id).select('username profile.displayName profile.avatar isPremium membership')
+const cleanupCommittedPairQueue = async (connection, userIds) => {
+  try {
+    await ConnectionQueue.deleteMany({ userId: { $in: userIds } });
+  } catch (error) {
+    // The RandomConnection is already durable. Never requeue/retry the pair
+    // after this point; stale matched rows are removed by the periodic cleanup.
+    log.error('Random Connect post-commit queue cleanup failed', {
+      roomId: String(connection?.roomId || ''),
+      userIds: userIds.map(String),
+      error: String(error)
+    });
+  }
+  return connection;
+};
+
+const createConnectionForPair = async ({
+  user1,
+  user2,
+  selectedGame,
+  tags,
+  genderFilterUserIds = [],
+  matchedTags = [],
+  matchQuality = 'unknown',
+  admissionLeases = []
+}) => {
+  const user1Id = user1.userId || user1._id;
+  const user2Id = user2.userId || user2._id;
+  const [dbUser1, dbUser2, entitlement1, entitlement2] = await Promise.all([
+    User.findById(user1Id).select('username profile.displayName profile.avatar isPremium membership'),
+    User.findById(user2Id).select('username profile.displayName profile.avatar isPremium membership'),
+    resolveRandomConnectEntitlement({ userId: user1Id, requestSource: 'matchmaking' }),
+    resolveRandomConnectEntitlement({ userId: user2Id, requestSource: 'matchmaking' })
   ]);
 
   if (!dbUser1 || !dbUser2) {
     throw new Error('Matched user profile not found');
   }
 
-  const policy = buildSessionPolicy(dbUser1, dbUser2);
+  const policy = buildSessionPolicy(entitlement1, entitlement2);
   const roomId = uuidv4();
-  const connection = await RandomConnection.create({
+  const entitlementsByUserId = new Map([
+    [String(user1Id), entitlement1],
+    [String(user2Id), entitlement2]
+  ]);
+  for (const [participantId, participantEntitlement] of entitlementsByUserId) {
+    if (!participantEntitlement?.entitlements?.randomConnect?.enabled) {
+      const error = new Error('Random Connect is no longer available for this account');
+      error.status = 403;
+      error.code = 'RANDOM_CONNECT_NOT_ALLOWED';
+      error.userId = participantId;
+      throw error;
+    }
+  }
+
+  // Reconcile historical, already-durable connections before entering the
+  // new atomic commit. Only this match's reservation belongs in the transaction.
+  for (const filteredUserId of genderFilterUserIds) {
+    const filteredEntitlement = entitlementsByUserId.get(String(filteredUserId));
+    const genderCapability = filteredEntitlement?.entitlements?.randomConnect?.genderFilter;
+    if (!genderCapability?.enabled) {
+      const error = new Error('Gender filtering is no longer available for this account');
+      error.status = 403;
+      error.code = 'RANDOM_CONNECT_GENDER_FILTER_NOT_ALLOWED';
+      error.userId = String(filteredUserId);
+      throw error;
+    }
+    if (!genderCapability.unlimited) {
+      await syncAttributedUsage({ userId: filteredUserId });
+      await ensureGenderFilterQuota({ userId: filteredUserId });
+    }
+  }
+
+  const connectionDocument = {
     roomId,
     participants: [
-      buildParticipant(user1, dbUser1, user1.videoEnabled),
-      buildParticipant(user2, dbUser2, user2.videoEnabled)
+      buildParticipant(user1, dbUser1, user1.videoEnabled, entitlement1),
+      buildParticipant(user2, dbUser2, user2.videoEnabled, entitlement2)
     ],
     selectedGame: selectedGame || null,
     tags: tags || [],
@@ -681,16 +942,44 @@ const createConnectionForPair = async ({ user1, user2, selectedGame, tags, usedG
     matchQuality,
     status: 'active',
     createdBy: dbUser1._id,
-    usedGenderFilter: Boolean(usedGenderFilter),
+    usedGenderFilter: genderFilterUserIds.length > 0,
+    genderFilterUserIds,
     durationLimitSeconds: policy.durationLimitSeconds,
     endReason: null
+  };
+
+  const connection = await commitRandomConnectMatch({
+    leases: admissionLeases,
+    userIds: [user1Id, user2Id],
+    reserveQuota: async (session) => {
+      // Each callback retry receives the same roomId. $addToSet plus the
+      // transaction rollback makes reservations both atomic and idempotent.
+      for (const filteredUserId of genderFilterUserIds) {
+        const filteredEntitlement = entitlementsByUserId.get(String(filteredUserId));
+        const genderCapability = filteredEntitlement?.entitlements?.randomConnect?.genderFilter;
+        if (!genderCapability.unlimited) {
+          await reserveGenderFilterSlot({
+            userId: filteredUserId,
+            reservationKey: roomId,
+            session
+          });
+        }
+      }
+    },
+    persistConnection: (session) => RandomConnection.findOneAndUpdate(
+      { roomId },
+      { $setOnInsert: connectionDocument },
+      {
+        upsert: true,
+        new: true,
+        setDefaultsOnInsert: true,
+        session
+      }
+    ),
+    findCommittedConnection: () => RandomConnection.findOne({ roomId })
   });
 
-  await ConnectionQueue.deleteMany({
-    userId: { $in: [dbUser1._id, dbUser2._id] }
-  });
-
-  return connection;
+  return cleanupCommittedPairQueue(connection, [dbUser1._id, dbUser2._id]);
 };
 
 // Match users from queue (used by periodic matcher)
@@ -737,36 +1026,54 @@ const matchUsersFromQueue = async (io) => {
       );
 
       if (match && !processedUserIds.has(match.userId.toString())) {
-        const claimed = await claimWaitingPair(user1.userId, match.userId);
-        if (!claimed) {
-          continue;
+        try {
+          await withRandomConnectAdmissions({
+            userIds: [user1.userId, match.userId],
+            operation: 'join',
+            work: async ({ leases, assertLeases }) => {
+              assertLeases();
+              const claimed = await claimWaitingPair(user1.userId, match.userId);
+              if (!claimed) return;
+
+              const genderFilterUserIds = buildGenderFilterUserIds(user1, match);
+              let connection;
+              try {
+                assertLeases();
+                connection = await createConnectionForPair({
+                  user1,
+                  user2: match,
+                  selectedGame: user1.selectedGame || match.selectedGame || null,
+                  tags: user1.tags || [],
+                  genderFilterUserIds,
+                  matchedTags: match.commonTags || [],
+                  matchQuality: match.matchQuality || 'unknown',
+                  admissionLeases: leases
+                });
+              } catch (error) {
+                if (!error?.commitOutcomeUnknown) {
+                  await recoverClaimedPair(user1.userId, match.userId, error?.userId);
+                }
+                if (error?.status) return;
+                throw error;
+              }
+
+              if (process.env.NODE_ENV === 'development') {
+                console.log(`✅ Periodic match: Created connection ${connection.roomId} for users ${user1.userId} <-> ${match.userId}`);
+              }
+              const userId1Str = user1.userId.toString();
+              const userId2Str = match.userId.toString();
+              const connectionData = buildConnectionPayload(connection);
+
+              await emitConnectionMatched(io, userId1Str, userId2Str, connectionData, connection.roomId);
+
+              processedUserIds.add(userId1Str);
+              processedUserIds.add(userId2Str);
+            }
+          });
+        } catch (error) {
+          if (error?.code === 'RANDOM_CONNECT_REQUEST_IN_PROGRESS') continue;
+          throw error;
         }
-
-        const usedGenderFilter = (user1.preferredGender === 'male' || user1.preferredGender === 'female' ||
-          match.preferredGender === 'male' || match.preferredGender === 'female');
-        const connection = await createConnectionForPair({
-          user1,
-          user2: match,
-          selectedGame: user1.selectedGame || match.selectedGame || null,
-          tags: user1.tags || [],
-          usedGenderFilter,
-          matchedTags: match.commonTags || [],
-          matchQuality: match.matchQuality || 'unknown'
-        });
-
-        if (process.env.NODE_ENV === 'development') {
-          console.log(`✅ Periodic match: Created connection ${connection.roomId} for users ${user1.userId} <-> ${match.userId}`);
-        }
-        const userId1Str = user1.userId.toString();
-        const userId2Str = match.userId.toString();
-        const connectionData = buildConnectionPayload(connection);
-
-        if (io) {
-          await emitConnectionMatched(io, userId1Str, userId2Str, connectionData, connection.roomId);
-        }
-
-        processedUserIds.add(userId1Str);
-        processedUserIds.add(userId2Str);
       }
     }
 
@@ -778,160 +1085,51 @@ const matchUsersFromQueue = async (io) => {
   }
 };
 
-// Improved socket event emission with retry and verification
+const notifyRandomConnectMatch = async (userIds, connectionData, roomId) => {
+  const expiresAt = new Date(Date.now() + 2 * 60 * 1000).toISOString();
+  const recipients = Array.from(new Set((userIds || []).map(String).filter(Boolean)));
+  await Promise.all(recipients.map(async (recipientId) => {
+    const partner = (connectionData?.participants || []).find((participant) => String(participant.userId) !== String(recipientId));
+    await createAndEmitNotification({
+      recipient: recipientId,
+      type: 'call',
+      title: 'Random Connect match ready',
+      message: partner?.displayName || partner?.username
+        ? `You matched with ${partner.displayName || partner.username}. Tap to join.`
+        : 'Your Random Connect match is ready. Tap to join.',
+      data: {
+        deepLink: '/random-connect',
+        customData: {
+          eventType: 'random_connect_match',
+          notificationDedupeKey: `random-connect-match:${roomId}`,
+          pushRequestId: `random-connect-match:${roomId}`,
+          deepLinkType: 'random_connect',
+          roomId,
+          randomConnectionRoomId: roomId,
+          expiresAt,
+          pushOptions: {
+            ttl: 120,
+            priority: 'high',
+            collapseKey: `random-connect-${roomId}`
+          }
+        }
+      }
+    });
+  }));
+};
+
+// One adapter-backed room emit is sufficient for connected installations.
+// Offline/background installations receive the durable notification fallback,
+// and clients can hydrate the saved session through current-connection.
 const emitConnectionMatched = async (io, userId1Str, userId2Str, connectionData, roomId) => {
   try {
-    // Find sockets for both users - improved detection
-    const allSockets = Array.from(io.sockets.sockets.values());
-    
-    // Normalize userId strings for comparison
-    const userId1Normalized = String(userId1Str).trim();
-    const userId2Normalized = String(userId2Str).trim();
-    
-    // Try multiple ways to match userId
-    const userSockets1 = allSockets.filter(s => {
-      const socketUserId = String(s.authUser?.userId ?? '').trim();
-      return socketUserId !== '' && socketUserId === userId1Normalized;
-    });
-
-    const userSockets2 = allSockets.filter(s => {
-      const socketUserId = String(s.authUser?.userId ?? '').trim();
-      return socketUserId !== '' && socketUserId === userId2Normalized;
-    });
-    
-    // Also check user rooms for sockets
-    const room1 = io.sockets.adapter.rooms.get(`user-${userId1Str}`);
-    const room2 = io.sockets.adapter.rooms.get(`user-${userId2Str}`);
-    
-    if (process.env.NODE_ENV === 'development') { console.log(`📤 Emitting connection-matched:`);}
-    if (process.env.NODE_ENV === 'development') { console.log(`   User1 (${userId1Str}): ${userSockets1.length} direct socket(s), ${room1?.size || 0} socket(s) in room`);}
-    if (process.env.NODE_ENV === 'development') { console.log(`   User2 (${userId2Str}): ${userSockets2.length} direct socket(s), ${room2?.size || 0} socket(s) in room`);
-    }
-    // Debug: Log all socket userIds for troubleshooting
-    if (userSockets1.length === 0 || userSockets2.length === 0) {
-      log.debug('🔍 Debug: All connected socket userIds:', 
-        allSockets.map(s => ({ 
-          socketId: s.id, 
-          userId: s.userId?.toString(),
-          connected: s.connected,
-          rooms: Array.from(s.rooms || [])
-        })).slice(0, 10)
-      );
-      if (process.env.NODE_ENV === 'development') { console.log(`🔍 Looking for userIds: "${userId1Normalized}" and "${userId2Normalized}"`);}
-    }
-    
-    // Join sockets to random room first
-    userSockets1.forEach(socket => {
-      socket.join(`random-room-${roomId}`);
-      if (process.env.NODE_ENV === 'development') { console.log(`✓ Socket ${socket.id} (user ${userId1Str}) joined random-room-${roomId}`);}
-    });
-    userSockets2.forEach(socket => {
-      socket.join(`random-room-${roomId}`);
-      if (process.env.NODE_ENV === 'development') { console.log(`✓ Socket ${socket.id} (user ${userId2Str}) joined random-room-${roomId}`);}
-    });
-    
-    // Small delay to ensure room joins are processed
-    await new Promise(resolve => setTimeout(resolve, 300));
-    
-    // Emit to user rooms (primary method) - multiple times to ensure delivery
-    const emitToRooms = () => {
+    if (io) {
       io.to(`user-${userId1Str}`).emit('connection-matched', connectionData);
       io.to(`user-${userId2Str}`).emit('connection-matched', connectionData);
-    };
-    
-    // Immediate emit
-    emitToRooms();
-    
-    // Emit directly to sockets as backup
-    userSockets1.forEach(socket => {
-      socket.emit('connection-matched', connectionData);
-      if (process.env.NODE_ENV === 'development') { console.log(`  ✓ Direct emit to socket ${socket.id} (user ${userId1Str})`);}
-    });
-    userSockets2.forEach(socket => {
-      socket.emit('connection-matched', connectionData);
-      if (process.env.NODE_ENV === 'development') { console.log(`  ✓ Direct emit to socket ${socket.id} (user ${userId2Str})`);}
-    });
-    
-    // CRITICAL: Multiple retry emits to ensure BOTH users receive the event
-    // This is essential because one user might receive it but the other might miss it
-    setTimeout(() => {
-      if (process.env.NODE_ENV === 'development') { console.log(`📤 Retry emit #1 (500ms delay) - ensuring both users receive`);}
-      emitToRooms();
-      userSockets1.forEach(socket => socket.emit('connection-matched', connectionData));
-      userSockets2.forEach(socket => socket.emit('connection-matched', connectionData));
-    }, 500);
-    
-    setTimeout(() => {
-      if (process.env.NODE_ENV === 'development') { console.log(`📤 Retry emit #2 (1000ms delay) - ensuring both users receive`);}
-      emitToRooms();
-      userSockets1.forEach(socket => socket.emit('connection-matched', connectionData));
-      userSockets2.forEach(socket => socket.emit('connection-matched', connectionData));
-    }, 1000);
-    
-    setTimeout(() => {
-      if (process.env.NODE_ENV === 'development') { console.log(`📤 Retry emit #3 (2000ms delay) - ensuring both users receive`);}
-      emitToRooms();
-      userSockets1.forEach(socket => socket.emit('connection-matched', connectionData));
-      userSockets2.forEach(socket => socket.emit('connection-matched', connectionData));
-    }, 2000);
-    
-    setTimeout(() => {
-      if (process.env.NODE_ENV === 'development') { console.log(`📤 Retry emit #4 (3000ms delay) - ensuring both users receive`);}
-      emitToRooms();
-      userSockets1.forEach(socket => socket.emit('connection-matched', connectionData));
-      userSockets2.forEach(socket => socket.emit('connection-matched', connectionData));
-    }, 3000);
-    
-    // Final retry after 5 seconds
-    setTimeout(() => {
-      if (process.env.NODE_ENV === 'development') { console.log(`📤 Final retry emit #5 (5000ms delay) - ensuring both users receive`);}
-      emitToRooms();
-      userSockets1.forEach(socket => socket.emit('connection-matched', connectionData));
-      userSockets2.forEach(socket => socket.emit('connection-matched', connectionData));
-    }, 5000);
-    
-    // Also emit to random room as backup (users will join this room when they get the event)
-    io.to(`random-room-${roomId}`).emit('connection-matched', connectionData);
-    if (process.env.NODE_ENV === 'development') { console.log(`📤 Also emitted to random-room-${roomId}`);
     }
-    // CRITICAL: Also join sockets from rooms to random room (in case they're in room but not found directly)
-    if (room1 && room1.size > 0) {
-      room1.forEach(socketId => {
-        const socket = io.sockets.sockets.get(socketId);
-        if (socket && socket.connected) {
-          socket.join(`random-room-${roomId}`);
-          socket.emit('connection-matched', connectionData);
-          if (process.env.NODE_ENV === 'development') { console.log(`  ✓ Emitted to socket ${socketId} from room (user ${userId1Str})`);}
-        }
-      });
-    }
-    
-    if (room2 && room2.size > 0) {
-      room2.forEach(socketId => {
-        const socket = io.sockets.sockets.get(socketId);
-        if (socket && socket.connected) {
-          socket.join(`random-room-${roomId}`);
-          socket.emit('connection-matched', connectionData);
-          if (process.env.NODE_ENV === 'development') { console.log(`  ✓ Emitted to socket ${socketId} from room (user ${userId2Str})`);}
-        }
-      });
-    }
-    
-    // Log warnings if no sockets found
-    if (userSockets1.length === 0 && (!room1 || room1.size === 0)) {
-      console.warn(`⚠️ No sockets found for user ${userId1Str} - event sent to room only`);
-      console.warn(`   User will receive event via fallback check or when socket connects`);
-    }
-    if (userSockets2.length === 0 && (!room2 || room2.size === 0)) {
-      console.warn(`⚠️ No sockets found for user ${userId2Str} - event sent to room only`);
-      console.warn(`   User will receive event via fallback check or when socket connects`);
-    }
-    
-    // Important: Even if no sockets found, the event is sent to user rooms
-    // Frontend fallback check will pick it up via current-connection API
-    if (process.env.NODE_ENV === 'development') { console.log(`✅ Connection-matched event emitted via multiple channels for BOTH users`);}
+    await notifyRandomConnectMatch([userId1Str, userId2Str], connectionData, roomId);
   } catch (error) {
-    log.error('❌ Error emitting connection-matched event:', { error: String(error) });
+    log.error('❌ Error delivering connection-matched event:', { error: String(error) });
   }
 };
 
@@ -979,11 +1177,12 @@ const cleanupExistingConnections = async (userId, io) => {
     
   } catch (error) {
     log.error('Cleanup existing connections error:', { error: String(error) });
+    throw error;
   }
 };
 
 // Leave the queue
-const leaveQueue = async (req, res) => {
+const leaveQueueUnlocked = async (req, res) => {
   try {
     const userId = req.user._id;
 
@@ -1017,6 +1216,14 @@ const leaveQueue = async (req, res) => {
     });
   }
 };
+
+const leaveQueue = async (req, res) => runAdmissionProtectedController({
+  req,
+  res,
+  operation: 'leave',
+  work: () => leaveQueueUnlocked(req, res),
+  fallbackMessage: 'Failed to leave queue'
+});
 
 // Get current connection - SIMPLE, return 200 with success:false instead of 404
 const getCurrentConnection = async (req, res) => {
@@ -1054,7 +1261,7 @@ const getCurrentConnection = async (req, res) => {
 };
 
 // Disconnect from current connection
-const disconnectConnection = async (req, res) => {
+const disconnectConnectionUnlocked = async (req, res) => {
   try {
     const userId = req.user._id;
     const { roomId } = req.body;
@@ -1123,6 +1330,14 @@ const disconnectConnection = async (req, res) => {
   }
 };
 
+const disconnectConnection = async (req, res) => runAdmissionProtectedController({
+  req,
+  res,
+  operation: 'disconnect',
+  work: () => disconnectConnectionUnlocked(req, res),
+  fallbackMessage: 'Failed to disconnect'
+});
+
 const endConnectionForNext = async ({ userId, roomId, io }) => {
   if (!roomId) return null;
 
@@ -1172,32 +1387,67 @@ const endConnectionForNext = async ({ userId, roomId, io }) => {
 };
 
 const nextConnection = async (req, res) => {
+  setEntitlementNoStore(res);
   try {
     const userId = req.user._id;
     const { roomId } = req.body;
     const io = getIo(req);
 
-    const endedConnection = await endConnectionForNext({ userId, roomId, io });
+    const response = await withRandomConnectAdmission({
+      userId,
+      operation: 'next',
+      work: async ({ lease, assertLease }) => {
+        const current = await RandomConnection.findOne({
+          'participants.userId': userId,
+          status: { $in: ACTIVE_SESSION_STATUSES }
+        });
 
-    // Remove stale queue rows before requeueing. The shared matcher also does this,
-    // but doing it here makes repeated/rapid Next taps deterministic.
-    await ConnectionQueue.deleteMany({ userId });
+        // A replay of Next for an older room must never tear down the newly
+        // matched room. queueAndTryMatch returns that current room idempotently.
+        if (current && (!roomId || String(current.roomId) !== String(roomId))) {
+          const existing = await queueAndTryMatch({
+            user: req.user,
+            body: req.body,
+            io,
+            source: requestSource(req),
+            admissionLease: lease,
+            assertLease
+          });
+          return {
+            ...existing,
+            requeued: false,
+            staleNextReplay: true,
+            previousRoomId: roomId || null,
+            previousSessionEnded: false
+          };
+        }
 
-    const result = await queueAndTryMatch({
-      user: req.user,
-      body: req.body,
-      io
+        assertLease();
+        const endedConnection = await endConnectionForNext({ userId, roomId, io });
+        await ConnectionQueue.deleteMany({ userId });
+        assertLease();
+        const result = await queueAndTryMatch({
+          user: req.user,
+          body: req.body,
+          io,
+          source: requestSource(req),
+          admissionLease: lease,
+          assertLease
+        });
+        return {
+          ...result,
+          requeued: true,
+          previousRoomId: roomId || null,
+          previousSessionEnded: Boolean(endedConnection)
+        };
+      }
     });
 
-    res.status(200).json({
-      ...result,
-      requeued: true,
-      previousRoomId: roomId || null,
-      previousSessionEnded: Boolean(endedConnection)
-    });
+    res.status(200).json(response);
   } catch (error) {
     if (error?.status) {
-      return res.status(error.status).json(error.payload);
+      if (error.retryAfterMs) res.set('Retry-After', String(Math.max(1, Math.ceil(error.retryAfterMs / 1000))));
+      return res.status(error.status).json(await buildRequestErrorPayload(req, error, 'Failed to find next match'));
     }
     log.error('Next connection error:', { error: String(error) });
     res.status(500).json({
@@ -1297,7 +1547,7 @@ const sendMessage = async (req, res) => {
 };
 
 // Cleanup current connection (used when user refreshes or navigates away)
-const cleanupCurrentConnection = async (req, res) => {
+const cleanupCurrentConnectionUnlocked = async (req, res) => {
   try {
     const userId = req.user._id;
     if (process.env.NODE_ENV === 'development') { console.log(`Cleaning up current connection for user ${userId}`);
@@ -1364,14 +1614,33 @@ const cleanupCurrentConnection = async (req, res) => {
   }
 };
 
-// List active sessions for monitoring (each session has unique sessionId = roomId)
+const cleanupCurrentConnection = async (req, res) => runAdmissionProtectedController({
+  req,
+  res,
+  operation: 'cleanup',
+  work: () => cleanupCurrentConnectionUnlocked(req, res),
+  fallbackMessage: 'Failed to cleanup connection'
+});
+
+// Return only sessions owned by the authenticated participant. This route is
+// player-authorized, so exposing the global active-session roster would leak
+// other players' display names, tags, Premium state, and activity timestamps.
 const getActiveSessions = async (req, res) => {
+  setEntitlementNoStore(res);
   try {
-    const sessions = await RandomConnection.find({ status: 'active' })
-      .select('roomId startTime connectedAt expiresAt durationLimitSeconds participants.username participants.displayName participants.isPremium tags matchQuality matchedTags')
+    const requesterId = String(req.user._id);
+    const sessions = await RandomConnection.find({
+      status: 'active',
+      'participants.userId': req.user._id
+    })
+      .select('roomId startTime connectedAt expiresAt durationLimitSeconds participants.userId participants.username participants.displayName tags matchQuality matchedTags')
       .lean();
 
-    const list = sessions.map(s => ({
+    // Defense in depth for mocks, unusual projections, and future query edits.
+    const ownedSessions = sessions.filter((session) => (
+      (session.participants || []).some((participant) => getUserIdString(participant.userId) === requesterId)
+    ));
+    const list = ownedSessions.map(s => ({
       sessionId: s.roomId,
       roomId: s.roomId,
       usernames: (s.participants || []).map(p => p.username || p.displayName || '?').filter(Boolean),
@@ -1399,55 +1668,55 @@ const getActiveSessions = async (req, res) => {
   }
 };
 
-// Get remaining daily gender-filter matches (for free users: Male/Female filter = 5/day)
-const getDailyGenderMatchesRemaining = async (req, res) => {
+const getEntitlementStatus = async (req) => {
+  const userId = req.user._id;
+  const entitlement = await resolveRandomConnectEntitlement({
+    userId,
+    requestSource: requestSource(req)
+  });
+  const genderCapability = entitlement.entitlements.randomConnect.genderFilter;
+  const usage = genderCapability.enabled && !genderCapability.unlimited
+    ? await getGenderFilterUsage({ userId })
+    : { used: 0, legacyUsageConservativelyCharged: 0 };
+  const used = usage.used;
+  const limit = entitlement.genderFilterLimit;
+
+  return {
+    success: true,
+    used,
+    limit,
+    remaining: genderCapability.unlimited ? null : Math.max(0, limit - used),
+    unlimited: genderCapability.unlimited,
+    legacyUsageConservativelyCharged: usage.legacyUsageConservativelyCharged,
+    ...randomConnectEntitlementEnvelope(entitlement)
+  };
+};
+
+// Canonical source for both initial feature gating and live daily quota state.
+const getRandomConnectEntitlements = async (req, res) => {
+  setEntitlementNoStore(res);
   try {
-    const userId = req.user._id;
-    const isPremium = isPremiumUser(req.user);
-    const limit = FREE_DAILY_MATCH_LIMIT;
-
-    if (isPremium) {
-      return res.status(200).json({
-        success: true,
-        used: 0,
-        limit,
-        remaining: limit,
-        isPremium: true
-      });
-    }
-
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
-    const used = await RandomConnection.countDocuments({
-      'participants.userId': userId,
-      status: { $in: ['active', 'disconnected', 'ended'] },
-      startTime: { $gte: startOfToday },
-      usedGenderFilter: true
-    });
-    const remaining = Math.max(0, limit - used);
-
-    res.status(200).json({
-      success: true,
-      used,
-      limit,
-      remaining,
-      isPremium: false
-    });
+    return res.status(200).json(await getEntitlementStatus(req));
   } catch (error) {
-    log.error('Get daily gender matches remaining error:', { error: String(error) });
-    res.status(500).json({
+    log.error('Get Random Connect entitlement error:', { error: String(error) });
+    return res.status(error?.status || 500).json({
       success: false,
-      message: 'Failed to get remaining matches',
+      message: 'Failed to get Random Connect entitlement',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 };
+
+// Backward-compatible endpoint name; response now includes the same versioned,
+// server-authoritative contract as /entitlements.
+const getDailyGenderMatchesRemaining = getRandomConnectEntitlements;
 
 module.exports = {
   joinQueue,
   leaveQueue,
   getCurrentConnection,
   getActiveSessions,
+  getRandomConnectEntitlements,
   getDailyGenderMatchesRemaining,
   disconnectConnection,
   nextConnection,
@@ -1463,6 +1732,9 @@ module.exports = {
     isPremiumUser,
     buildSessionPolicy,
     scoreCandidate,
-    buildSessionPolicyPayload
+    buildSessionPolicyPayload,
+    buildGenderFilterUserIds,
+    cleanupCommittedPairQueue,
+    getEntitlementStatus
   }
 };

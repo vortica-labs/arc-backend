@@ -5,12 +5,16 @@ const PremiumMembershipEvent = require('../models/PremiumMembershipEvent');
 const PremiumMutationClaim = require('../models/PremiumMutationClaim');
 const PaymentTransaction = require('../models/PaymentTransaction');
 const User = require('../models/User');
-const Notification = require('../models/Notification');
 const Report = require('../models/Report');
 const UserLoginEvent = require('../models/UserLoginEvent');
 const provider = require('./razorpayPremiumProvider');
+const log = require('../utils/logger');
+const { invalidateUserCache } = require('../middleware/auth');
+const {
+  isPremiumMembershipEntitled: isEntitled,
+  isLegacyUserPremium
+} = require('./entitlementService');
 
-const ACTIVE_MEMBERSHIP_STATUSES = new Set(['active']);
 const TERMINAL_PROVIDER_STATUSES = new Set(['cancelled', 'completed', 'expired']);
 const BILLING_PERIODS = new Set(['monthly', 'quarterly', 'yearly', 'lifetime']);
 const PLATFORMS = new Set(['web', 'android', 'ios', 'admin', 'unknown']);
@@ -307,11 +311,6 @@ const failMutation = async (claim, error) => {
   );
 };
 
-const isEntitled = (membership, now = new Date()) => Boolean(
-  membership && ACTIVE_MEMBERSHIP_STATUSES.has(membership.membershipStatus) &&
-  (!membership.expiresAt || new Date(membership.expiresAt) > now)
-);
-
 const projectEntitlement = async (membership) => {
   const entitled = isEntitled(membership);
   await User.updateOne(
@@ -329,6 +328,37 @@ const projectEntitlement = async (membership) => {
       }
     }
   );
+  // Auth middleware caches the complete user projection for five minutes.
+  // Evict it after every entitlement projection so purchase, cancellation,
+  // replay repair, lifecycle expiry and reconciliation are immediately visible
+  // to every authenticated API consumer.
+  await invalidateUserCache(String(membership.user));
+  // Entitlement synchronization is application state, not a user-configurable
+  // notification channel. Emit it even when push/in-app notifications are
+  // muted so active web/mobile sessions can immediately refetch server state.
+  try {
+    const userId = String(membership.user);
+    const version = Number(membership.version || 0);
+    const changedAt = new Date().toISOString();
+    const eventId = `premium-entitlement:${String(membership._id || userId)}:${version}:${entitled ? 'premium' : 'free'}`.slice(0, 200);
+    global._arcSocketIO?.to(`user-${userId}`).emit('premium-entitlement-changed', {
+      eventId,
+      subjectUserId: userId,
+      userId,
+      version,
+      action: 'entitlement_projected',
+      isPremium: entitled,
+      plan: entitled ? membership.planKey : 'free',
+      validUntil: entitled ? (membership.expiresAt || null) : null,
+      changedAt,
+      occurredAt: changedAt
+    });
+  } catch (error) {
+    log.warn('Premium entitlement socket synchronization failed', {
+      userId: String(membership.user),
+      error: String(error)
+    });
+  }
   return entitled;
 };
 
@@ -369,50 +399,55 @@ const notifyLifecycle = async (membership, { title, message, action, source = 's
   const settings = user.notificationSettings || {};
   const systemAllowed = settings.systemAlerts !== false;
   const outcomes = { inApp: 'skipped', push: 'skipped', email: 'skipped' };
-  let persistedNotification = null;
-
-  if (settings.inAppEnabled !== false && systemAllowed) {
-    try {
-      persistedNotification = await Notification.createNotification({
-        recipient: membership.user,
-        type: 'system',
-        title,
-        message,
-        sendPush: false,
-        data: { deepLink: '/premium', customData: { premiumMembershipId: String(membership._id), lifecycleAction: action } }
-      });
-      const { emitNotification } = require('../utils/notificationEmitter');
-      emitNotification(membership.user, persistedNotification);
-      outcomes.inApp = 'sent';
-    } catch {
-      outcomes.inApp = 'failed';
+  const deliveryKey = `premium-lifecycle:${membership._id}:${Number(membership.version || 0)}:${action}`;
+  const notificationData = {
+    deepLink: '/premium',
+    customData: {
+      premiumMembershipId: String(membership._id),
+      lifecycleAction: action,
+      notificationDedupeKey: deliveryKey,
+      pushRequestId: deliveryKey
     }
-  }
+  };
 
-  if (settings.pushEnabled !== false && systemAllowed) {
+  if (systemAllowed && (settings.inAppEnabled !== false || settings.pushEnabled !== false)) {
     try {
-      const { sendPushNotification } = require('../utils/pushNotificationService');
-      await sendPushNotification(membership.user, {
-        _id: persistedNotification?._id || new mongoose.Types.ObjectId(),
+      const { createAndEmitNotification } = require('../utils/notificationEmitter');
+      await createAndEmitNotification({
         recipient: membership.user,
         type: 'system',
         title,
         message,
-        data: { deepLink: '/premium', customData: { premiumMembershipId: String(membership._id), lifecycleAction: action } }
+        data: notificationData
       });
-      outcomes.push = 'sent';
-    } catch {
-      outcomes.push = 'failed';
+      if (settings.inAppEnabled !== false) outcomes.inApp = 'sent';
+      if (settings.pushEnabled !== false) outcomes.push = 'sent';
+    } catch (error) {
+      if (settings.inAppEnabled !== false) outcomes.inApp = 'failed';
+      if (settings.pushEnabled !== false) outcomes.push = 'failed';
+      log.error('Premium lifecycle notification failed', {
+        error: String(error), membershipId: String(membership._id), userId: String(membership.user), action
+      });
     }
   }
 
   if (user.email && process.env.SMTP_USER && process.env.SMTP_PASS) {
     try {
       const { enqueueEmail } = require('../utils/jobQueue');
-      await enqueueEmail(user.email, title, message, process.env.CLIENT_URL ? `${process.env.CLIENT_URL}/premium` : '');
+      const { EMAIL_INTENTS } = require('../utils/notificationChannelPolicy');
+      await enqueueEmail(
+        user.email,
+        title,
+        message,
+        process.env.CLIENT_URL ? `${process.env.CLIENT_URL.replace(/\/+$/, '')}/premium` : '',
+        { intent: EMAIL_INTENTS.PREMIUM_LIFECYCLE, eventType: action }
+      );
       outcomes.email = 'sent';
-    } catch {
+    } catch (error) {
       outcomes.email = 'failed';
+      log.error('Premium lifecycle email notification failed', {
+        error: String(error), membershipId: String(membership._id), userId: String(membership.user), action
+      });
     }
   }
 
@@ -422,7 +457,12 @@ const notifyLifecycle = async (membership, { title, message, action, source = 's
     source,
     actor: systemActor('system:premium-notifier'),
     metadata: { lifecycleAction: action, channels: outcomes }
-  }).catch(() => null);
+  }).catch((error) => {
+    log.warn('Premium notification outcome audit failed', {
+      error: String(error), membershipId: String(membership._id), userId: String(membership.user), action
+    });
+    return null;
+  });
   return outcomes;
 };
 
@@ -683,14 +723,19 @@ const activateOneTimeWebhookPayment = async ({ payment, eventId }) => {
   const userId = safeString(notes.userId, 24);
   if (!isObjectId(userId)) throw fail('Payment order user binding is invalid', 400, 'PAYMENT_OWNER_MISMATCH');
   if (existingTransaction && String(existingTransaction.user) !== userId) throw fail('Payment is already bound to another account', 409, 'PAYMENT_ALREADY_CONSUMED');
-  const user = await User.findById(userId).select('userType');
+  const user = await User.findById(userId).select('userType isPremium membership createdAt');
   if (!user) return { ignored: false, retryable: true, reason: 'user_not_found' };
   const accountType = user.userType === 'team' ? 'team' : (user.userType === 'creator' ? 'creator' : 'player');
   const planKey = safeString(notes.planKey || notes.planId, 80);
   const billingPeriod = normalizeBillingPeriod(notes.billingPeriod);
   const plan = findPlan(planKey, accountType);
   assertProviderAmount({ payment, order, plan, billingPeriod });
-  const current = await currentForUser(userId);
+  let current = await currentForUser(userId);
+  // Canonicalize legacy access before applying the captured one-time purchase
+  // so the new paid period extends one auditable current membership.
+  if (!current && isLegacyUserPremium(user)) {
+    current = await ensureCanonicalForUser(userId);
+  }
   if (existingTransaction && current) {
     const repaired = await repairPaymentReplay({ transaction: existingTransaction, userId, source: 'razorpay_order', action: 'purchase' });
     return { membership: repaired, transaction: existingTransaction, ignored: false, idempotentReplay: true };
@@ -804,11 +849,14 @@ const recordFailedWebhookPayment = async ({ payment, eventId }) => {
 
 const createRecurringSubscription = async ({ userId, planKey, billingPeriod, platform, correlationId }) => {
   const period = normalizeBillingPeriod(billingPeriod, { recurring: true });
-  const user = await User.findById(userId).select('userType');
+  const user = await User.findById(userId).select('userType isPremium membership createdAt');
   if (!user) throw fail('User not found', 404, 'USER_NOT_FOUND');
   const accountType = user.userType === 'team' ? 'team' : (user.userType === 'creator' ? 'creator' : 'player');
   const plan = findPlan(planKey, accountType);
-  const current = await currentForUser(userId);
+  let current = await currentForUser(userId);
+  if (!current && isLegacyUserPremium(user)) {
+    current = await ensureCanonicalForUser(userId);
+  }
   if (current?.source === 'razorpay_subscription' && current.membershipStatus === 'trial' && !TERMINAL_PROVIDER_STATUSES.has(current.subscriptionStatus)) {
     throw fail('A recurring subscription creation is already pending; reconcile it before retrying', 409, 'SUBSCRIPTION_CREATE_PENDING');
   }

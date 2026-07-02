@@ -17,10 +17,15 @@ const userCacheKey = (id) => `auth:user:${id}`;
 async function getCachedUser(userId) {
   // 1. Try Redis
   const cached = await getJson(userCacheKey(userId));
-  if (cached) return cached;
+  if (cached) {
+    delete cached.password;
+    delete cached.pushTokens;
+    delete cached.notificationClients;
+    return cached;
+  }
 
   // 2. Hit DB
-  const user = await User.findById(userId).select('-password').lean();
+  const user = await User.findById(userId).select('-password -pushTokens -notificationClients').lean();
   if (!user) return null;
 
   // 3. Store in Redis for next time

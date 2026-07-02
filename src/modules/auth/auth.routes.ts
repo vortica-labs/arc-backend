@@ -102,7 +102,7 @@ router.post("/upload-profile-picture", protect, uploadSingle("image"), legacyAut
 router.post("/upload-banner", protect, uploadSingle("image"), legacyAuthController.uploadBanner);
 router.put("/change-password", protect, changePasswordValidation, legacyAuthController.changePassword);
 router.delete("/account", protect, deleteAccountValidation, legacyAuthController.deleteAccount);
-router.post("/logout", legacyAuthController.logout);
+router.post("/logout", protectAllowIncomplete, legacyAuthController.logout);
 router.post("/complete-profile", protectAllowIncomplete, legacyAuthController.completeProfile);
 router.post("/complete-google-profile", protectAllowIncomplete, legacyAuthController.completeGoogleProfile);
 

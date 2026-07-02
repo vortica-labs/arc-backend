@@ -1,13 +1,18 @@
 import { Router } from "express";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import path from "path";
+import { randomUUID } from "crypto";
 import { Notification, User, protect } from "./notifications.legacy-adapters";
 import { backendRootPath } from "../legacy/legacy.paths";
+import { logger } from "../../config/logger";
 
 const router = Router();
 
 const EXPO_PUSH_TOKEN_PATTERN = /^ExponentPushToken\[[\w-]+\]$|^ExpoPushToken\[[\w-]+\]$/;
 const EXPO_PUSH_TOKEN_MAX_LENGTH = 512;
+const APNS_VOIP_TOKEN_PATTERN = /^[a-f\d]{64,512}$/i;
 const MAX_PUSH_TOKENS_PER_USER = 10;
+const INSTALLATION_ID_PATTERN = /^[A-Za-z0-9:._-]{8,200}$/;
 const VALID_PLATFORMS = new Set(["ios", "android", "web", "unknown"]);
 const VALID_TRACKING_PLATFORMS = new Set(["ios", "android", "web"]);
 const VALID_BROADCAST_CATEGORIES = new Set([
@@ -20,13 +25,34 @@ const getUserId = (req: { user?: { _id?: string } }) => req.user?._id;
 const safeString = (value: unknown, maxLength = 200) =>
   typeof value === "string" ? value.trim().slice(0, maxLength) : "";
 const maskToken = (token: string) =>
-  token.length <= 24 ? token : `${token.slice(0, 12)}...${token.slice(-8)}`;
+  token.length <= 24 ? "[redacted]" : `${token.slice(0, 12)}...${token.slice(-8)}`;
+const previewInstallation = (value: unknown) => {
+  const id = safeString(value, 200);
+  return id.length < 12 ? "[redacted]" : `${id.slice(0, 8)}...${id.slice(-4)}`;
+};
 const isObjectId = (value: unknown) => typeof value === "string" && OBJECT_ID_PATTERN.test(value);
 const trackingPlatform = (value: unknown) => {
   const platform = safeString(value, 40).toLowerCase();
   return VALID_TRACKING_PLATFORMS.has(platform) ? platform : "unknown";
 };
-const latestPushDiagnostics = new Map<string, Record<string, unknown>>();
+const userRateKey = (req: { user?: { _id?: unknown }; ip?: string }) =>
+  String(req.user?._id || ipKeyGenerator(req.ip || "unknown"));
+const pushMutationLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: userRateKey,
+  message: { success: false, message: "Too many push registration changes. Try again shortly." }
+});
+const pushTestLimiter = rateLimit({
+  windowMs: 15 * 60_000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: userRateKey,
+  message: { success: false, message: "Too many test push requests. Try again later." }
+});
 
 const buildClientVisibilityFilter = (platform: string, appVersion: string) => {
   const hasKnownPlatform = Boolean(platform && VALID_PLATFORMS.has(platform) && platform !== "unknown");
@@ -60,6 +86,18 @@ const withClientVisibility = (
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const BroadcastRecipient = require(path.join(backendRootPath, "models", "BroadcastRecipient.js"));
 // eslint-disable-next-line @typescript-eslint/no-var-requires
+const PushDeliveryAttempt = require(path.join(backendRootPath, "models", "PushDeliveryAttempt.js"));
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const CallVoipPushAttempt = require(path.join(backendRootPath, "models", "CallVoipPushAttempt.js"));
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const {
+  getPushDevicesForUser,
+  registerPushDevice,
+  removePushDevices,
+  registerVoipToken,
+  removeVoipToken
+} = require(path.join(backendRootPath, "services", "pushDeviceService.js"));
+// eslint-disable-next-line @typescript-eslint/no-var-requires
 const { trackDelivery, trackEvent } = require(path.join(backendRootPath, "services", "broadcastService.js"));
 
 const serializePushToken = (entry: Record<string, unknown>) => {
@@ -69,21 +107,60 @@ const serializePushToken = (entry: Record<string, unknown>) => {
     : undefined;
 
   return {
-    tokenPreview: maskToken(token),
+    tokenPreview: safeString(entry.tokenPreview, 80) || maskToken(token),
     isValidExpoToken: EXPO_PUSH_TOKEN_PATTERN.test(token),
     platform: safeString(entry.platform, 40) || "unknown",
+    installationId: safeString(entry.installationId, 200),
     deviceName: safeString(entry.deviceName, 120),
     projectId: safeString(entry.projectId, 120),
     appVersion: safeString(entry.appVersion, 40),
-    nativeTokenType: safeString(nativeToken?.type, 40),
+    buildVersion: safeString(entry.buildVersion, 40),
+    nativeTokenType: safeString(entry.nativeTokenType || nativeToken?.type, 40),
+    hasFcmToken: Boolean(entry.fcmTokenHash),
+    fcmTokenPreview: safeString(entry.fcmTokenPreview, 80),
+    fcmTokenUpdatedAt: entry.fcmTokenUpdatedAt,
+    hasApnsToken: Boolean(entry.apnsTokenHash),
+    apnsTokenPreview: safeString(entry.apnsTokenPreview, 80),
+    apnsTokenUpdatedAt: entry.apnsTokenUpdatedAt,
+    hasVoipToken: Boolean(entry.voipTokenHash),
+    voipTokenPreview: safeString(entry.voipTokenPreview, 80),
+    voipTokenUpdatedAt: entry.voipTokenUpdatedAt,
     lastUsedAt: entry.lastUsedAt,
     createdAt: entry.createdAt
   };
 };
 
+const serializePushAttempt = (entry: Record<string, unknown>) => ({
+  id: String(entry._id || ""),
+  requestKey: safeString(entry.requestKey, 64),
+  source: safeString(entry.source, 40),
+  notificationId: entry.notification ? String(entry.notification) : null,
+  notificationType: safeString(entry.notificationType, 80),
+  provider: safeString(entry.provider, 40) || "expo",
+  tokenPreview: safeString(entry.tokenPreview, 80),
+  installationId: safeString(entry.installationId, 200),
+  platform: safeString(entry.platform, 40) || "unknown",
+  appVersion: safeString(entry.appVersion, 40),
+  ticketStatus: safeString(entry.ticketStatus, 40),
+  receiptStatus: safeString(entry.receiptStatus, 40),
+  deliveryStatus: safeString(entry.deliveryStatus, 40),
+  providerErrorCode: safeString(entry.providerErrorCode, 200),
+  providerErrorMessage: safeString(entry.providerErrorMessage, 1000),
+  payload: entry.payload || {},
+  providerResponse: entry.providerResponse || {},
+  sendAttempts: Number(entry.sendAttempts || 0),
+  receiptAttempts: Number(entry.receiptAttempts || 0),
+  sentAt: entry.sentAt || null,
+  providerDeliveredAt: entry.providerDeliveredAt || null,
+  clientDeliveredAt: entry.clientDeliveredAt || null,
+  openedAt: entry.openedAt || null,
+  clickedAt: entry.clickedAt || null,
+  receiptCheckedAt: entry.receiptCheckedAt || null,
+  createdAt: entry.createdAt
+});
+
 const countRegisteredPushTokens = async (userId: string) => {
-  const user = await User.findById(userId).select("pushTokens").lean();
-  const pushTokens = Array.isArray(user?.pushTokens) ? user.pushTokens : [];
+  const pushTokens = await getPushDevicesForUser(userId);
   return {
     pushTokenCount: pushTokens.length,
     validExpoPushTokenCount: pushTokens.filter((entry: Record<string, unknown>) =>
@@ -92,7 +169,7 @@ const countRegisteredPushTokens = async (userId: string) => {
   };
 };
 
-const sendDiagnosticPush = async (userId: string) => {
+const sendDiagnosticPush = async (userId: string, source = "diagnostic", requestId = "") => {
   const notification = await Notification.createNotification({
     recipient: userId,
     type: "system",
@@ -101,33 +178,54 @@ const sendDiagnosticPush = async (userId: string) => {
     data: {
       customData: {
         url: "/notifications",
-        diagnostic: true
+        diagnostic: true,
+        pushSource: source,
+        pushRequestId: requestId
       }
     },
-    sendPush: false
+    sendPush: false,
+    pushDeliveryState: "pending"
   });
 
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { sendPushNotification } = require(path.join(backendRootPath, "utils", "pushNotificationService.js"));
-  const result = await sendPushNotification(userId, notification);
+  const leaseKey = `notification-outbox-${randomUUID()}`;
+  const claimed = await Notification.claimPushDelivery(notification._id, leaseKey);
+  if (!claimed) throw new Error("Diagnostic push outbox could not be claimed");
+  let result;
+  try {
+    result = await sendPushNotification(userId, claimed);
+    await Notification.completePushDelivery(notification._id, leaseKey);
+  } catch (error) {
+    await Notification.retryPushDelivery(notification._id, leaseKey, error).catch(() => undefined);
+    throw error;
+  }
   const diagnostics = {
     notificationId: String(notification?._id || ""),
     sentAt: new Date().toISOString(),
     ...result
   };
-  latestPushDiagnostics.set(userId, diagnostics);
   return diagnostics;
 };
 
-router.post("/push-token", protect, async (req, res) => {
+router.post("/push-token", protect, pushMutationLimiter, async (req, res) => {
   try {
     const userId = getUserId(req as { user?: { _id?: string } });
     const {
       token,
       platform = "unknown",
       deviceName = "",
+      deviceModel = "",
+      deviceBrand = "",
+      manufacturer = "",
+      deviceType = "",
+      osName = "",
+      osVersion = "",
       projectId = "",
       appVersion = "",
+      buildVersion = "",
+      installationId: requestedInstallationId,
+      deviceId,
       nativeToken
     } = req.body ?? {};
 
@@ -135,61 +233,81 @@ router.post("/push-token", protect, async (req, res) => {
       return res.status(401).json({ success: false, message: "Authenticated user is required" });
     }
 
-    if (typeof token !== "string" || token.length > EXPO_PUSH_TOKEN_MAX_LENGTH || !EXPO_PUSH_TOKEN_PATTERN.test(token)) {
+    const normalizedToken = typeof token === "string" ? token.trim() : "";
+    if (!normalizedToken || normalizedToken.length > EXPO_PUSH_TOKEN_MAX_LENGTH || !EXPO_PUSH_TOKEN_PATTERN.test(normalizedToken)) {
       return res.status(400).json({ success: false, message: "Valid Expo push token is required" });
     }
 
     const requestedPlatform = safeString(platform, 40).toLowerCase();
-    const normalizedPlatform = VALID_PLATFORMS.has(requestedPlatform) ? requestedPlatform : "unknown";
-    const normalizedNativeToken = nativeToken && typeof nativeToken === "object"
-      ? {
-          type: safeString((nativeToken as Record<string, unknown>).type, 40),
-          data: safeString((nativeToken as Record<string, unknown>).data, 2048)
-        }
-      : undefined;
+    if (!["ios", "android"].includes(requestedPlatform)) {
+      return res.status(400).json({ success: false, message: "platform must be ios or android" });
+    }
+    const installationId = safeString(requestedInstallationId || deviceId, 200);
+    if (!INSTALLATION_ID_PATTERN.test(installationId)) {
+      return res.status(400).json({ success: false, message: "A stable installationId is required" });
+    }
+    const nativeTokenType = nativeToken && typeof nativeToken === "object"
+      ? safeString((nativeToken as Record<string, unknown>).type, 40)
+      : "";
+    const nativeTokenData = nativeToken && typeof nativeToken === "object"
+      ? safeString((nativeToken as Record<string, unknown>).data, 2048)
+      : "";
 
-    // A physical device token should belong to exactly one authenticated account.
-    // Remove it everywhere first so stale sessions do not receive future pushes.
-    await User.updateMany(
-      { "pushTokens.token": token },
-      {
-        $pull: { pushTokens: { token } }
+    const devices = await registerPushDevice(userId, {
+      token: normalizedToken,
+      installationId,
+      platform: requestedPlatform,
+      deviceName: safeString(deviceName, 120),
+      deviceModel: safeString(deviceModel, 120),
+      deviceBrand: safeString(deviceBrand, 120),
+      manufacturer: safeString(manufacturer, 120),
+      deviceType: safeString(deviceType, 40),
+      osName: safeString(osName, 40),
+      osVersion: safeString(osVersion, 40),
+      projectId: safeString(projectId, 120),
+      appVersion: safeString(appVersion, 40),
+      buildVersion: safeString(buildVersion, 40),
+      nativeTokenType,
+      nativeToken: nativeTokenData
+    });
+    if (devices.length > MAX_PUSH_TOKENS_PER_USER) {
+      const stale = devices
+        .sort((a: Record<string, unknown>, b: Record<string, unknown>) =>
+          new Date(String(a.lastSeenAt || 0)).getTime() - new Date(String(b.lastSeenAt || 0)).getTime())
+        .slice(0, devices.length - MAX_PUSH_TOKENS_PER_USER);
+      for (const entry of stale) {
+        await removePushDevices(userId, { installationId: entry.installationId });
       }
-    );
-
-    await User.updateOne(
-      { _id: userId },
-      {
-        $push: {
-          pushTokens: {
-            $each: [{
-            token,
-            platform: normalizedPlatform,
-            deviceName: safeString(deviceName, 120),
-            projectId: safeString(projectId, 120),
-            appVersion: safeString(appVersion, 40),
-            ...(normalizedNativeToken ? { nativeToken: normalizedNativeToken } : {}),
-            lastUsedAt: new Date(),
-            createdAt: new Date()
-            }],
-            $slice: -MAX_PUSH_TOKENS_PER_USER
-          }
-        }
-      }
-    );
+    }
     const tokenCounts = await countRegisteredPushTokens(userId);
+
+    logger.info("Push installation registered", {
+      userId: String(userId),
+      installation: previewInstallation(installationId),
+      platform: requestedPlatform
+    });
 
     return res.status(200).json({
       success: true,
       message: "Push token registered",
       data: {
-        platform: normalizedPlatform,
+        installationId,
+        platform: requestedPlatform,
+        deviceModel: safeString(deviceModel, 120),
+        osName: safeString(osName, 40),
+        osVersion: safeString(osVersion, 40),
         appVersion: safeString(appVersion, 40),
+        buildVersion: safeString(buildVersion, 40),
         registeredAt: new Date().toISOString(),
         ...tokenCounts
       }
     });
   } catch (error) {
+    logger.error("Push installation registration failed", {
+      userId: String(getUserId(req as { user?: { _id?: string } }) || ""),
+      installation: previewInstallation(req.body?.installationId || req.body?.deviceId),
+      error: String(error)
+    });
     return res.status(500).json({
       success: false,
       message: "Failed to register push token"
@@ -197,7 +315,79 @@ router.post("/push-token", protect, async (req, res) => {
   }
 });
 
-router.post("/client-context", protect, async (req, res) => {
+router.post("/voip-token", protect, pushMutationLimiter, async (req, res) => {
+  try {
+    const userId = getUserId(req as { user?: { _id?: string } });
+    if (!userId) return res.status(401).json({ success: false, message: "Authenticated user is required" });
+    const installationId = safeString(req.body?.installationId || req.body?.deviceId, 200);
+    const token = safeString(req.body?.token, 512).replace(/[<>\s]/g, "").toLowerCase();
+    if (!INSTALLATION_ID_PATTERN.test(installationId)) {
+      return res.status(400).json({ success: false, message: "A stable installationId is required" });
+    }
+    if (!APNS_VOIP_TOKEN_PATTERN.test(token)) {
+      return res.status(400).json({ success: false, message: "A valid APNs VoIP token is required" });
+    }
+    const device = await registerVoipToken(userId, installationId, token);
+    logger.info("APNs VoIP installation registered", {
+      userId: String(userId),
+      installation: previewInstallation(installationId),
+      tokenHash: safeString(device?.voipTokenHash, 64).slice(0, 12)
+    });
+    return res.json({
+      success: true,
+      data: {
+        installationId,
+        tokenPreview: safeString(device?.voipTokenPreview, 80),
+        updatedAt: device?.voipTokenUpdatedAt || new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    const status = Number((error as { statusCode?: number })?.statusCode || 500);
+    logger.error("APNs VoIP installation registration failed", {
+      userId: String(getUserId(req as { user?: { _id?: string } }) || ""),
+      installation: previewInstallation(req.body?.installationId || req.body?.deviceId),
+      error: String(error)
+    });
+    return res.status(status).json({
+      success: false,
+      message: status >= 500 ? "Failed to register APNs VoIP token" : (error as Error).message
+    });
+  }
+});
+
+router.delete("/voip-token", protect, pushMutationLimiter, async (req, res) => {
+  try {
+    const userId = getUserId(req as { user?: { _id?: string } });
+    if (!userId) return res.status(401).json({ success: false, message: "Authenticated user is required" });
+    const installationId = safeString(req.body?.installationId || req.body?.deviceId, 200);
+    const token = safeString(req.body?.token, 512).replace(/[<>\s]/g, "").toLowerCase();
+    if (!installationId && !token) {
+      return res.status(400).json({ success: false, message: "installationId or token is required" });
+    }
+    if (installationId && !INSTALLATION_ID_PATTERN.test(installationId)) {
+      return res.status(400).json({ success: false, message: "Invalid installationId" });
+    }
+    if (token && !APNS_VOIP_TOKEN_PATTERN.test(token)) {
+      return res.status(400).json({ success: false, message: "Invalid APNs VoIP token" });
+    }
+    const result = await removeVoipToken(userId, { installationId, token });
+    logger.info("APNs VoIP installation removed", {
+      userId: String(userId),
+      installation: previewInstallation(installationId),
+      removed: result.removed
+    });
+    return res.json({ success: true, data: result });
+  } catch (error) {
+    logger.error("APNs VoIP installation removal failed", {
+      userId: String(getUserId(req as { user?: { _id?: string } }) || ""),
+      installation: previewInstallation(req.body?.installationId || req.body?.deviceId),
+      error: String(error)
+    });
+    return res.status(500).json({ success: false, message: "Failed to remove APNs VoIP token" });
+  }
+});
+
+router.post("/client-context", protect, pushMutationLimiter, async (req, res) => {
   try {
     const userId = getUserId(req as { user?: { _id?: string } });
     if (!userId) return res.status(401).json({ success: false, message: "Authenticated user is required" });
@@ -263,25 +453,69 @@ router.post("/client-context", protect, async (req, res) => {
   }
 });
 
-router.delete("/push-token", protect, async (req, res) => {
+router.delete("/push-token", protect, pushMutationLimiter, async (req, res) => {
   try {
     const userId = getUserId(req as { user?: { _id?: string } });
-    const { token } = req.body ?? {};
+    const { token, installationId: requestedInstallationId, deviceId } = req.body ?? {};
 
     if (!userId) {
       return res.status(401).json({ success: false, message: "Authenticated user is required" });
     }
 
-    if (typeof token !== "string" || token.length > EXPO_PUSH_TOKEN_MAX_LENGTH || !EXPO_PUSH_TOKEN_PATTERN.test(token)) {
+    const normalizedToken = typeof token === "string" ? token.trim() : "";
+    const installationId = safeString(requestedInstallationId || deviceId, 200);
+    if (!normalizedToken && !installationId) {
+      return res.status(400).json({ success: false, message: "token or installationId is required" });
+    }
+    if (normalizedToken && (normalizedToken.length > EXPO_PUSH_TOKEN_MAX_LENGTH || !EXPO_PUSH_TOKEN_PATTERN.test(normalizedToken))) {
       return res.status(400).json({ success: false, message: "Valid Expo push token is required" });
     }
+    if (installationId && !INSTALLATION_ID_PATTERN.test(installationId)) {
+      return res.status(400).json({ success: false, message: "Invalid installationId" });
+    }
 
-    await User.updateOne({ _id: userId }, { $pull: { pushTokens: { token } } });
-    return res.status(200).json({ success: true, message: "Push token removed" });
+    const result = await removePushDevices(userId, {
+      token: normalizedToken || undefined,
+      installationId: installationId || undefined
+    });
+    logger.info("Push installation removed", {
+      userId: String(userId),
+      installation: previewInstallation(installationId),
+      removed: result.removed
+    });
+    return res.status(200).json({ success: true, message: "Push installation removed", data: result });
   } catch (error) {
+    logger.error("Push installation removal failed", {
+      userId: String(getUserId(req as { user?: { _id?: string } }) || ""),
+      installation: previewInstallation(req.body?.installationId || req.body?.deviceId),
+      error: String(error)
+    });
     return res.status(500).json({
       success: false,
-      message: "Failed to remove push token"
+      message: "Failed to remove push installation"
+    });
+  }
+});
+
+router.delete("/client-context", protect, pushMutationLimiter, async (req, res) => {
+  try {
+    const userId = getUserId(req as { user?: { _id?: string } });
+    if (!userId) return res.status(401).json({ success: false, message: "Authenticated user is required" });
+    const clientId = safeString(req.body?.clientId, 200);
+    if (!clientId || !INSTALLATION_ID_PATTERN.test(clientId)) {
+      return res.status(400).json({ success: false, message: "Valid clientId is required" });
+    }
+
+    await User.updateOne({ _id: userId }, { $pull: { notificationClients: { clientId } } });
+    return res.status(200).json({ success: true, message: "Notification client context removed" });
+  } catch (error) {
+    logger.error("Notification client context removal failed", {
+      userId: String(getUserId(req as { user?: { _id?: string } }) || ""),
+      error: String(error)
+    });
+    return res.status(500).json({
+      success: false,
+      message: "Failed to remove notification client context"
     });
   }
 });
@@ -294,8 +528,11 @@ router.get("/push-status", protect, async (req, res) => {
       return res.status(401).json({ success: false, message: "Authenticated user is required" });
     }
 
-    const user = await User.findById(userId).select("pushTokens notificationClients notificationSettings").lean();
-    const pushTokens = Array.isArray(user?.pushTokens) ? user.pushTokens : [];
+    const [user, pushTokens, latestAttempt] = await Promise.all([
+      User.findById(userId).select("notificationClients notificationSettings").lean(),
+      getPushDevicesForUser(userId),
+      PushDeliveryAttempt.findOne({ recipient: userId }).sort({ createdAt: -1 }).lean()
+    ]);
     const tokens = pushTokens.map((entry: Record<string, unknown>) => serializePushToken(entry));
 
     return res.status(200).json({
@@ -317,7 +554,7 @@ router.get("/push-status", protect, async (req, res) => {
               lastSeenAt: client.lastSeenAt
             }))
           : [],
-        lastTestPush: latestPushDiagnostics.get(userId) ?? null,
+        lastPushAttempt: latestAttempt ? serializePushAttempt(latestAttempt) : null,
         notificationSettings: {
           pushEnabled: true,
           inAppEnabled: true,
@@ -330,6 +567,10 @@ router.get("/push-status", protect, async (req, res) => {
       }
     });
   } catch (error) {
+    logger.error("Push status lookup failed", {
+      userId: String(getUserId(req as { user?: { _id?: string } }) || ""),
+      error: String(error)
+    });
     return res.status(500).json({
       success: false,
       message: "Failed to fetch push notification status"
@@ -337,7 +578,35 @@ router.get("/push-status", protect, async (req, res) => {
   }
 });
 
-router.post("/push-test", protect, async (req, res) => {
+router.get("/push-deliveries", protect, async (req, res) => {
+  try {
+    const userId = getUserId(req as { user?: { _id?: string } });
+    if (!userId) return res.status(401).json({ success: false, message: "Authenticated user is required" });
+    const page = Math.max(1, Number.parseInt(String(req.query.page || "1"), 10) || 1);
+    const limit = Math.max(1, Math.min(50, Number.parseInt(String(req.query.limit || "20"), 10) || 20));
+    const filter: Record<string, unknown> = { recipient: userId };
+    const status = safeString(req.query.status, 40);
+    if (status && new Set(["queued", "sending", "accepted", "failed", "delivered", "pending", "skipped"]).has(status)) {
+      filter.$or = [{ ticketStatus: status }, { receiptStatus: status }];
+    }
+    const [items, total] = await Promise.all([
+      PushDeliveryAttempt.find(filter).sort({ createdAt: -1, _id: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+      PushDeliveryAttempt.countDocuments(filter)
+    ]);
+    return res.json({
+      success: true,
+      data: { items: items.map(serializePushAttempt), pagination: { page, limit, total, pages: Math.ceil(total / limit) } }
+    });
+  } catch (error) {
+    logger.error("Push delivery history lookup failed", {
+      userId: String(getUserId(req as { user?: { _id?: string } }) || ""),
+      error: String(error)
+    });
+    return res.status(500).json({ success: false, message: "Failed to fetch push delivery history" });
+  }
+});
+
+router.post("/push-test", protect, pushTestLimiter, async (req, res) => {
   try {
     const userId = getUserId(req as { user?: { _id?: string } });
 
@@ -354,16 +623,23 @@ router.post("/push-test", protect, async (req, res) => {
       });
     }
 
-    const diagnostics = await sendDiagnosticPush(userId);
-    return res.status(200).json({
-      success: true,
-      message: "Test push notification sent",
+    const requestId = safeString(req.header("Idempotency-Key"), 120);
+    const diagnostics = await sendDiagnosticPush(userId, "diagnostic", requestId);
+    const accepted = Number((diagnostics as Record<string, unknown>).accepted || 0);
+    const statusCode = accepted > 0 ? 202 : 502;
+    return res.status(statusCode).json({
+      success: accepted > 0,
+      message: accepted > 0 ? "Test push accepted by provider" : "Test push was not accepted by the provider",
       data: {
         ...tokenCounts,
         testPush: diagnostics
       }
     });
   } catch (error) {
+    logger.error("Self-service test push failed", {
+      userId: String(getUserId(req as { user?: { _id?: string } }) || ""),
+      error: String(error)
+    });
     return res.status(500).json({
       success: false,
       message: "Failed to send test push notification"
@@ -376,22 +652,123 @@ const resolveOwnedBroadcastDelivery = async (notificationId: string, userId: str
   const notification = await Notification.findOne({ _id: notificationId, recipient: userId, deletedAt: null });
   if (notification) return { notification, persistentNotification: true };
   const deliveryLog = await BroadcastRecipient.findOne({ _id: notificationId, recipient: userId }).lean();
-  if (!deliveryLog) return null;
-  return {
-    persistentNotification: false,
-    notification: {
-      _id: deliveryLog._id,
-      recipient: deliveryLog.recipient,
-      broadcastRecipient: deliveryLog._id,
-      data: {
-        broadcastId: deliveryLog.broadcast,
-        deliveryLogId: deliveryLog._id,
-        customData: {
-          broadcastId: String(deliveryLog.broadcast),
-          deliveryLogId: String(deliveryLog._id)
+  if (deliveryLog) {
+    return {
+      persistentNotification: false,
+      notification: {
+        _id: deliveryLog._id,
+        recipient: deliveryLog.recipient,
+        broadcastRecipient: deliveryLog._id,
+        data: {
+          broadcastId: deliveryLog.broadcast,
+          deliveryLogId: deliveryLog._id,
+          customData: {
+            broadcastId: String(deliveryLog.broadcast),
+            deliveryLogId: String(deliveryLog._id)
+          }
         }
       }
+    };
+  }
+  const pushAttempt = await PushDeliveryAttempt.findOne({ _id: notificationId, recipient: userId }).lean();
+  if (!pushAttempt) {
+    const voipAttempt = await CallVoipPushAttempt.findOne({ _id: notificationId, recipient: userId }).lean();
+    if (!voipAttempt) return null;
+    return {
+      persistentNotification: false,
+      pushAttemptId: String(voipAttempt._id),
+      voipAttempt: true,
+      notification: {
+        _id: voipAttempt._id,
+        recipient: voipAttempt.recipient,
+        data: { customData: voipAttempt.payload || {} }
+      }
+    };
+  }
+  const referencedNotification = pushAttempt.notification
+    ? await Notification.findOne({ _id: pushAttempt.notification, recipient: userId, deletedAt: null })
+    : null;
+  return {
+    persistentNotification: Boolean(referencedNotification),
+    pushAttemptId: String(pushAttempt._id),
+    notification: referencedNotification || {
+      _id: pushAttempt._id,
+      recipient: pushAttempt.recipient,
+      data: pushAttempt.payload?.notificationData || pushAttempt.payload?.data || {}
     }
+  };
+};
+
+const advanceGenericPushDelivery = async (
+  notificationId: string,
+  userId: string,
+  eventType: "delivered" | "open" | "click",
+  installationId = "",
+  pushAttemptId = ""
+) => {
+  if (!isObjectId(notificationId)) return { matched: 0, eventType };
+  const now = new Date();
+  const fields: Record<string, unknown> = {
+    clientDeliveredAt: { $ifNull: ["$clientDeliveredAt", now] },
+    deliveryStatus: "client_delivered"
+  };
+  if (eventType === "open" || eventType === "click") {
+    fields.openedAt = { $ifNull: ["$openedAt", now] };
+  }
+  if (eventType === "click") fields.clickedAt = { $ifNull: ["$clickedAt", now] };
+  const filter = {
+    recipient: userId,
+    ...(isObjectId(pushAttemptId)
+      ? { _id: pushAttemptId }
+      : {
+          notification: notificationId,
+          ...(INSTALLATION_ID_PATTERN.test(installationId) ? { installationId } : {})
+        })
+  };
+  const requestKeys = await PushDeliveryAttempt.distinct("requestKey", filter);
+  const result = await PushDeliveryAttempt.updateMany(
+    filter,
+    [{ $set: fields }]
+  );
+  if (requestKeys.length) {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { refreshPushDeliveryRequests } = require(path.join(backendRootPath, "utils", "pushNotificationService.js"));
+    await refreshPushDeliveryRequests(requestKeys);
+  }
+  let voipMatched = 0;
+  let voipModified = 0;
+  if (Number(result.matchedCount || 0) === 0 && isObjectId(pushAttemptId)) {
+    const voipFilter = {
+      _id: pushAttemptId,
+      recipient: userId,
+      ...(INSTALLATION_ID_PATTERN.test(installationId) ? { installationId } : {})
+    };
+    const voipRequestKeys = await CallVoipPushAttempt.distinct("requestKey", voipFilter);
+    const voipResult = await CallVoipPushAttempt.updateOne(
+      voipFilter,
+      [{ $set: {
+        clientDeliveredAt: { $ifNull: ["$clientDeliveredAt", now] },
+        ...(eventType === "open" || eventType === "click"
+          ? { openedAt: { $ifNull: ["$openedAt", now] } }
+          : {}),
+        ...(eventType === "click" ? { clickedAt: { $ifNull: ["$clickedAt", now] } } : {})
+      } }]
+    );
+    voipMatched = Number(voipResult.matchedCount || 0);
+    voipModified = Number(voipResult.modifiedCount || 0);
+    if (voipMatched && voipRequestKeys.length) {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const PushDeliveryRequest = require(path.join(backendRootPath, "models", "PushDeliveryRequest.js"));
+      await PushDeliveryRequest.updateMany(
+        { requestKey: { $in: voipRequestKeys } },
+        { $set: { status: "client_delivered", completedAt: now } }
+      );
+    }
+  }
+  return {
+    matched: Number(result.matchedCount || 0) + voipMatched,
+    modified: Number(result.modifiedCount || 0) + voipModified,
+    eventType
   };
 };
 
@@ -401,13 +778,20 @@ router.post("/:id/delivered", protect, async (req, res) => {
     if (!userId) return res.status(401).json({ success: false, message: "Authenticated user is required" });
     const owned = await resolveOwnedBroadcastDelivery(req.params.id, userId);
     if (!owned) return res.status(404).json({ success: false, message: "Notification not found" });
-    const result = await trackDelivery({
-      notification: owned.notification,
-      userId,
-      platform: trackingPlatform(req.body?.platform),
-      metadata: { source: safeString(req.body?.source, 80) }
-    });
-    return res.json({ success: true, data: result });
+    const [genericPush, broadcast] = await Promise.all([
+      advanceGenericPushDelivery(
+        String(owned.notification._id), userId, "delivered",
+        safeString(req.body?.installationId || req.body?.deviceId, 200),
+        safeString(req.body?.pushDeliveryAttemptId || owned.pushAttemptId, 24)
+      ),
+      trackDelivery({
+        notification: owned.notification,
+        userId,
+        platform: trackingPlatform(req.body?.platform),
+        metadata: { source: safeString(req.body?.source, 80) }
+      })
+    ]);
+    return res.json({ success: true, data: { ...broadcast, genericPush } });
   } catch (error) {
     const statusCode = Number((error as { statusCode?: number })?.statusCode) || 500;
     return res.status(statusCode).json({
@@ -429,14 +813,21 @@ router.post("/:id/open", protect, async (req, res) => {
         { $set: { isRead: true, readAt: new Date() } }
       );
     }
-    const result = await trackEvent({
-      notification: owned.notification,
-      userId,
-      eventType: "open",
-      platform: trackingPlatform(req.body?.platform),
-      metadata: { source: safeString(req.body?.source, 80) }
-    });
-    return res.json({ success: true, data: result });
+    const [genericPush, broadcast] = await Promise.all([
+      advanceGenericPushDelivery(
+        String(owned.notification._id), userId, "open",
+        safeString(req.body?.installationId || req.body?.deviceId, 200),
+        safeString(req.body?.pushDeliveryAttemptId || owned.pushAttemptId, 24)
+      ),
+      trackEvent({
+        notification: owned.notification,
+        userId,
+        eventType: "open",
+        platform: trackingPlatform(req.body?.platform),
+        metadata: { source: safeString(req.body?.source, 80) }
+      })
+    ]);
+    return res.json({ success: true, data: { ...broadcast, genericPush } });
   } catch (error) {
     const statusCode = Number((error as { statusCode?: number })?.statusCode) || 500;
     return res.status(statusCode).json({
@@ -459,22 +850,29 @@ router.post("/:id/click", protect, async (req, res) => {
         { $set: { isRead: true, readAt: new Date() } }
       );
     }
-    await trackEvent({
-      notification: owned.notification,
-      userId,
-      eventType: "open",
-      platform: trackingPlatform(req.body?.platform),
-      metadata: { source: "click" }
-    });
-    const result = await trackEvent({
-      notification: owned.notification,
-      userId,
-      eventType: "click",
-      url: safeString(req.body?.url, 2048),
-      platform: trackingPlatform(req.body?.platform),
-      metadata: { source: safeString(req.body?.source, 80) }
-    });
-    return res.json({ success: true, data: result });
+    const [genericPush, , broadcast] = await Promise.all([
+      advanceGenericPushDelivery(
+        String(owned.notification._id), userId, "click",
+        safeString(req.body?.installationId || req.body?.deviceId, 200),
+        safeString(req.body?.pushDeliveryAttemptId || owned.pushAttemptId, 24)
+      ),
+      trackEvent({
+        notification: owned.notification,
+        userId,
+        eventType: "open",
+        platform: trackingPlatform(req.body?.platform),
+        metadata: { source: "click" }
+      }),
+      trackEvent({
+        notification: owned.notification,
+        userId,
+        eventType: "click",
+        url: safeString(req.body?.url, 2048),
+        platform: trackingPlatform(req.body?.platform),
+        metadata: { source: safeString(req.body?.source, 80) }
+      })
+    ]);
+    return res.json({ success: true, data: { ...broadcast, genericPush } });
   } catch (error) {
     const statusCode = Number((error as { statusCode?: number })?.statusCode) || 500;
     return res.status(statusCode).json({

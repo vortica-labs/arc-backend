@@ -118,6 +118,7 @@ const messageSchema = new mongoose.Schema({
   },
   // Call summary for messages with messageType: 'call'
   callSummary: {
+    callId: { type: String, maxlength: 160 },
     callType: { type: String, enum: ['voice', 'video'] },
     outcome: { type: String, enum: ['answered', 'missed', 'declined'] },
     durationSeconds: { type: Number, default: 0 },
@@ -269,6 +270,16 @@ messageSchema.index({ sender: 1, createdAt: -1 });
 messageSchema.index({ recipient: 1, createdAt: -1 });
 messageSchema.index({ chatRoom: 1, createdAt: -1 });
 messageSchema.index({ messageType: 1, createdAt: -1 });
+messageSchema.index(
+  { 'callSummary.callId': 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      messageType: 'call',
+      'callSummary.callId': { $type: 'string', $gt: '' }
+    }
+  }
+);
 
 chatRoomSchema.index({ creator: 1 });
 chatRoomSchema.index({ 'members.user': 1 });

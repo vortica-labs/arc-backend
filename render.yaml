@@ -4,6 +4,7 @@ services:
     runtime: node
     rootDir: arc_-main/modular-backend
     buildCommand: npm install && npm run build
+    preDeployCommand: npm run preflight:push-release
     startCommand: npm run start
     envVars:
       - key: NODE_ENV
@@ -28,6 +29,26 @@ services:
         value: 7d
       - key: JWT_REFRESH_EXPIRES_IN
         value: 30d
+      - key: PUSH_NOTIFICATION_PROVIDER
+        value: expo
+      - key: EXPO_ACCESS_TOKEN
+        sync: false
+      - key: EXPO_PUSH_SECURITY_MODE
+        value: enabled
+      - key: APNS_TEAM_ID
+        sync: false
+      - key: APNS_KEY_ID
+        sync: false
+      - key: APNS_PRIVATE_KEY_BASE64
+        sync: false
+      - key: APNS_BUNDLE_ID
+        value: com.arcSquadHunt
+      - key: APNS_VOIP_TOPIC
+        value: com.arcSquadHunt.voip
+      - key: APNS_ENVIRONMENT
+        value: production
+      - key: MAX_CALL_DURATION_SECONDS
+        value: 14400
       - key: CORS_ORIGIN
         value: https://arc.squadhunt.com
       - key: CLOUDINARY_CLOUD_NAME

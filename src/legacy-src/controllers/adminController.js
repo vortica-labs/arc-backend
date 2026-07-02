@@ -24,6 +24,8 @@ const MonetizationApplicationTimeline = require('../models/MonetizationApplicati
 const HostVerificationApplication = require('../models/HostVerificationApplication');
 const mongoose = require('mongoose');
 const { createSystemNotification } = require('../utils/notificationService');
+const { EMAIL_INTENTS } = require('../utils/notificationChannelPolicy');
+const { enqueuePasswordSecurityEmail } = require('../utils/securityEmail');
 const { invalidateUserCache } = require('../middleware/auth');
 const { PLATFORM_DEFAULT_CPM, getOrCreateCurrentCycle } = require('../services/CreatorEarningsCalculationService');
 const {
@@ -34,6 +36,10 @@ const {
 const log = require('../utils/logger');
 
 const dayMs = 24 * 60 * 60 * 1000;
+
+const notificationEmail = (intent, eventType) => ({
+  email: { intent, eventType }
+});
 
 const getDashboardRequestId = () => `admindash_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -595,6 +601,13 @@ const updateUserStatus = async (req, res) => {
     const { userId } = req.params;
     const { isActive } = req.body;
 
+    if (typeof isActive !== 'boolean') {
+      return res.status(400).json({
+        success: false,
+        message: 'isActive must be a boolean'
+      });
+    }
+
     const user = await User.findByIdAndUpdate(
       userId,
       { isActive },
@@ -607,6 +620,20 @@ const updateUserStatus = async (req, res) => {
         message: 'User not found'
       });
     }
+
+    await invalidateUserCache(userId);
+    await createSystemNotification(
+      userId,
+      isActive ? 'Account Access Restored' : 'Account Suspended',
+      isActive
+        ? 'Your ARC account access has been restored by an administrator.'
+        : 'Your ARC account has been suspended by an administrator. Contact ARC support if you believe this was a mistake.',
+      { type: isActive ? 'account_restored' : 'account_suspended' },
+      notificationEmail(
+        EMAIL_INTENTS.ACCOUNT_LIFECYCLE,
+        isActive ? 'account_restored' : 'account_suspended'
+      )
+    );
 
     res.json({
       success: true,
@@ -862,13 +889,23 @@ const updateReport = async (req, res) => {
         await createSystemNotification(
           post.author,
           'Content Report Warning',
-          'Your content was reported and reviewed. Please ensure it follows community guidelines.'
+          'Your content was reported and reviewed. Please ensure it follows community guidelines.',
+          { type: 'content_report_warning', reportId: report._id },
+          notificationEmail(EMAIL_INTENTS.PLATFORM_CRITICAL, 'content_report_warning')
         );
       }
     } else if (adminAction === 'ban_user') {
       const post = await Post.findById(report.targetId).select('author');
       if (post?.author) {
         await User.findByIdAndUpdate(post.author, { isActive: false });
+        await invalidateUserCache(post.author);
+        await createSystemNotification(
+          post.author,
+          'Account Suspended',
+          'Your ARC account has been suspended following a report review. Contact ARC support if you believe this was a mistake.',
+          { type: 'account_suspended', reportId: report._id },
+          notificationEmail(EMAIL_INTENTS.ACCOUNT_LIFECYCLE, 'report_account_suspended')
+        );
       }
     }
 
@@ -908,6 +945,12 @@ const resetUserPassword = async (req, res) => {
     // Update password (the pre-save hook will hash it)
     user.password = newPassword;
     await user.save();
+    void enqueuePasswordSecurityEmail({
+      to: user.email,
+      eventType: 'admin_password_reset'
+    }).catch((emailError) => {
+      log.error('Admin password reset confirmation email enqueue failed:', { error: String(emailError) });
+    });
 
     res.json({
       success: true,
@@ -1360,7 +1403,8 @@ const approveMonetizationApplication = async (req, res) => {
       application.user,
       'Monetization Approved',
       'Your creator monetization application has been approved. You can now add bank details and start earning.',
-      { type: 'monetization_approved', applicationId: application._id }
+      { type: 'monetization_approved', applicationId: application._id },
+      notificationEmail(EMAIL_INTENTS.CREATOR_STATUS, 'monetization_approved')
     );
 
     res.json({
@@ -1420,7 +1464,8 @@ const rejectMonetizationApplication = async (req, res) => {
       application.user,
       'Monetization Application Rejected',
       application.rejectionReason + (reapplyAfter ? ` You can re-apply after ${reapplyAfter.toLocaleDateString()}.` : ''),
-      { type: 'monetization_rejected', applicationId: application._id, reapplyAfter }
+      { type: 'monetization_rejected', applicationId: application._id, reapplyAfter },
+      notificationEmail(EMAIL_INTENTS.CREATOR_STATUS, 'monetization_rejected')
     );
 
     res.json({
@@ -1457,7 +1502,8 @@ const holdCreatorPayout = async (req, res) => {
       userId,
       'Payout On Hold',
       reason || 'Your payout is under review. Our team will contact you if needed.',
-      { type: 'payout_held' }
+      { type: 'payout_held' },
+      notificationEmail(EMAIL_INTENTS.PAYMENT_TRANSACTIONAL, 'payout_held')
     );
 
     res.json({
@@ -1541,7 +1587,8 @@ const revokeMonetization = async (req, res) => {
       userId,
       'Creator Monetization Revoked',
       'Your creator monetization access has been revoked by the platform. Please contact support if you have questions.',
-      { type: 'monetization_revoked' }
+      { type: 'monetization_revoked' },
+      notificationEmail(EMAIL_INTENTS.CREATOR_STATUS, 'monetization_revoked')
     );
 
     res.json({ success: true, message: 'Monetization revoked successfully' });
@@ -1595,7 +1642,8 @@ const grantMonetization = async (req, res) => {
       userId,
       'Creator Monetization Granted',
       'Congratulations! Creator monetization has been enabled for your account. You can now add bank details and start earning.',
-      { type: 'monetization_granted' }
+      { type: 'monetization_granted' },
+      notificationEmail(EMAIL_INTENTS.CREATOR_STATUS, 'monetization_granted')
     );
 
     res.json({ success: true, message: 'Monetization granted successfully' });
@@ -1713,7 +1761,8 @@ const approveWithdrawalRequest = async (req, res) => {
       request.user,
       'Withdrawal Request Approved',
       `Your withdrawal request has been approved${bankReference ? ` (Reference: ${bankReference})` : ''}. The amount will be credited to your bank account.`,
-      { type: 'withdrawal_approved', requestId: request._id }
+      { type: 'withdrawal_approved', requestId: request._id },
+      notificationEmail(EMAIL_INTENTS.PAYMENT_TRANSACTIONAL, 'withdrawal_approved')
     );
 
     res.json({ success: true, message: 'Withdrawal request approved', data: { _id: request._id, status: request.status } });
@@ -1744,7 +1793,8 @@ const rejectWithdrawalRequest = async (req, res) => {
       request.user,
       'Withdrawal Request Rejected',
       `Your withdrawal request has been rejected. Reason: ${rejectionReason}`,
-      { type: 'withdrawal_rejected', requestId: request._id }
+      { type: 'withdrawal_rejected', requestId: request._id },
+      notificationEmail(EMAIL_INTENTS.PAYMENT_TRANSACTIONAL, 'withdrawal_rejected')
     );
 
     res.json({ success: true, message: 'Withdrawal request rejected', data: { _id: request._id, status: request.status } });
@@ -1834,7 +1884,9 @@ const approveHostVerificationApplication = async (req, res) => {
     await createSystemNotification(
       application.user,
       'Verified Host Application Approved',
-      'Congratulations! Your Verified Host application has been approved. You can now host prize pool tournaments and scrims.'
+      'Congratulations! Your Verified Host application has been approved. You can now host prize pool tournaments and scrims.',
+      { type: 'host_verification_approved', applicationId: application._id },
+      notificationEmail(EMAIL_INTENTS.HOST_STATUS, 'host_verification_approved')
     );
 
     res.json({
@@ -1899,7 +1951,9 @@ const rejectHostVerificationApplication = async (req, res) => {
     await createSystemNotification(
       application.user,
       'Verified Host Application Rejected',
-      notificationMessage
+      notificationMessage,
+      { type: 'host_verification_rejected', applicationId: application._id },
+      notificationEmail(EMAIL_INTENTS.HOST_STATUS, 'host_verification_rejected')
     );
 
     res.json({
@@ -1988,6 +2042,14 @@ const revokeHostVerification = async (req, res) => {
     await HostVerificationApplication.findOneAndUpdate(
       { user: userId, status: 'approved' },
       { status: 'rejected', rejectionReason: 'Verification revoked by admin', reviewedAt: new Date(), reviewedBy: req.user._id }
+    );
+
+    await createSystemNotification(
+      userId,
+      'Verified Host Status Revoked',
+      'Your Verified Host status has been revoked by an administrator. Contact ARC support if you believe this was a mistake.',
+      { type: 'host_verification_revoked' },
+      notificationEmail(EMAIL_INTENTS.HOST_STATUS, 'host_verification_revoked')
     );
 
     res.json({
@@ -2080,7 +2142,8 @@ const updateCreatorPayoutStatus = async (req, res, nextStatus, fields = {}) => {
       payout.user,
       'Creator Payout Updated',
       `Your creator payout status is now ${payout.status}.`,
-      { type: 'creator_payout_updated', payoutId: payout._id, status: payout.status }
+      { type: 'creator_payout_updated', payoutId: payout._id, status: payout.status },
+      notificationEmail(EMAIL_INTENTS.PAYMENT_TRANSACTIONAL, `creator_payout_${payout.status}`)
     );
 
     res.json({ success: true, message: `Payout marked ${nextStatus}`, data: { payout } });
@@ -2199,7 +2262,8 @@ const suspendMonetization = async (req, res) => {
       userId,
       'Creator Monetization Suspended',
       String(reason),
-      { type: 'monetization_suspended' }
+      { type: 'monetization_suspended' },
+      notificationEmail(EMAIL_INTENTS.CREATOR_STATUS, 'monetization_suspended')
     );
     res.json({ success: true, message: 'Monetization suspended successfully' });
   } catch (error) {
@@ -2246,7 +2310,8 @@ const resumeMonetization = async (req, res) => {
       userId,
       'Creator Monetization Reactivated',
       'Your creator monetization access has been reactivated.',
-      { type: 'monetization_reactivated' }
+      { type: 'monetization_reactivated' },
+      notificationEmail(EMAIL_INTENTS.CREATOR_STATUS, 'monetization_reactivated')
     );
     res.json({ success: true, message: 'Monetization resumed successfully' });
   } catch (error) {

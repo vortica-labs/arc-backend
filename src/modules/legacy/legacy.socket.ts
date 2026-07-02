@@ -1,6 +1,10 @@
 import type { Server, Socket } from "socket.io";
 import path from "path";
-import { backendControllerPath, backendModelPath } from "./legacy.paths";
+import { logger } from "../../config/logger";
+import { backendControllerPath, backendModelPath, backendRootPath } from "./legacy.paths";
+
+const CALL_RING_TTL_SECONDS = 30;
+const OBJECT_ID_PATTERN = /^[a-f\d]{24}$/i;
 
 type ActiveCallSession = {
   callId: string;
@@ -32,8 +36,58 @@ type RandomConnectController = {
   getSessionTimerState?: (roomId: string, userId: string) => Promise<unknown>;
 };
 
+type DurableCallSession = {
+  _id?: unknown;
+  callId: string;
+  nativeCallId: string;
+  caller: unknown;
+  callee: unknown;
+  callType: "voice" | "video";
+  expiresAt: Date | string;
+  status: string;
+  randomRoomId?: string;
+  callerSnapshot?: Record<string, unknown>;
+};
+
+type CallSessionService = {
+  createCallSession: (input: Record<string, unknown>) => Promise<DurableCallSession>;
+  getCallSessionForParticipant: (callId: string, userId: string) => Promise<DurableCallSession>;
+  transitionCallSession: (input: Record<string, unknown>) => Promise<DurableCallSession>;
+  serializeCallSession: (session: DurableCallSession) => Record<string, unknown>;
+};
+
+type ApnsVoipPushService = {
+  dispatchInitialVoipPush: (session: DurableCallSession) => Promise<Record<string, unknown>>;
+  markVoipFallbackSent: (requestKey: string) => Promise<void>;
+  getVoipFallbackExpoTokenHashes: (recipientId: string) => Promise<string[]>;
+  sendExpoFallbackForVoipFailure: (
+    recipientId: string,
+    notification: Record<string, unknown>,
+    outcome: Record<string, unknown> | null
+  ) => Promise<Record<string, unknown>>;
+};
+
 const activeCalls = new Map<string, ActiveCallSession>();
+const callRequestWindows = new Map<string, number[]>();
+const CALL_REQUEST_WINDOW_MS = 60_000;
+const CALL_REQUEST_MAX_PER_WINDOW = 8;
 let randomMatchLoopStarted = false;
+
+const consumeCallRequestQuota = (userId: string, now = Date.now()) => {
+  const recent = (callRequestWindows.get(userId) || []).filter((timestamp) => now - timestamp < CALL_REQUEST_WINDOW_MS);
+  if (recent.length >= CALL_REQUEST_MAX_PER_WINDOW) {
+    callRequestWindows.set(userId, recent);
+    return false;
+  }
+  recent.push(now);
+  callRequestWindows.set(userId, recent);
+  if (callRequestWindows.size > 10_000) {
+    for (const [key, timestamps] of callRequestWindows) {
+      if (!timestamps.some((timestamp) => now - timestamp < CALL_REQUEST_WINDOW_MS)) callRequestWindows.delete(key);
+    }
+  }
+  return true;
+};
 
 const safeRequire = <T>(modulePath: string): T | null => {
   try {
@@ -50,6 +104,109 @@ const getObjectIdString = (value: unknown): string => {
     return String((value as { _id: unknown })._id);
   }
   return String(value);
+};
+
+const boundedString = (value: unknown, maxLength: number): string =>
+  typeof value === "string" ? value.trim().slice(0, maxLength) : "";
+
+const getCallSessionService = (): CallSessionService | null =>
+  safeRequire<CallSessionService>(path.join(backendRootPath, "services", "callSessionService.js"));
+
+const getApnsVoipPushService = (): ApnsVoipPushService | null =>
+  safeRequire<ApnsVoipPushService>(path.join(backendRootPath, "services", "apnsVoipPushService.js"));
+
+const sendFailedVoipFallback = async (
+  targetUserId: string,
+  notification: any,
+  voipResult: PromiseSettledResult<Record<string, unknown>>
+) => {
+  const apns = getApnsVoipPushService();
+  if (!apns || !notification) return;
+  const fulfilled = voipResult.status === "fulfilled" ? voipResult.value : null;
+  await apns.sendExpoFallbackForVoipFailure(targetUserId, notification, fulfilled);
+};
+
+export const buildIncomingCallNotification = ({
+  callId,
+  callType,
+  callerId,
+  callerName,
+  nativeCallId,
+  randomRoomId,
+  expiresAt: requestedExpiresAt,
+  now = new Date()
+}: {
+  callId: string;
+  callType: "voice" | "video";
+  callerId: string;
+  callerName: string;
+  nativeCallId?: string;
+  randomRoomId?: string;
+  expiresAt?: Date | string;
+  now?: Date;
+}) => {
+  const parsedExpiry = requestedExpiresAt ? new Date(requestedExpiresAt) : null;
+  const expiresAt = parsedExpiry && !Number.isNaN(parsedExpiry.getTime())
+    ? parsedExpiry
+    : new Date(now.getTime() + CALL_RING_TTL_SECONDS * 1000);
+  return {
+    type: "call" as const,
+    title: `${callerName || "Someone"} is calling`,
+    message: `Incoming ${callType} call`,
+    data: {
+      deepLink: `/conversation/direct_${callerId}`,
+      customData: {
+        eventType: "incoming_call",
+        callId,
+        ...(nativeCallId ? { nativeCallId } : {}),
+        notificationDedupeKey: `incoming-call:${callId}`,
+        pushRequestId: `incoming-call:${callId}`,
+        roomId: callId,
+        callType,
+        callerId,
+        callerName,
+        deadlineAt: expiresAt.toISOString(),
+        expiresAt: expiresAt.toISOString(),
+        ...(randomRoomId ? { randomRoomId } : {}),
+        url: `/conversation/direct_${callerId}`,
+        pushOptions: {
+          ttl: CALL_RING_TTL_SECONDS,
+          priority: "high",
+          collapseKey: `incoming-call-${callId}`
+        }
+      }
+    }
+  };
+};
+
+const dispatchIncomingCallNotification = async ({
+  targetUserId,
+  callerId,
+  callerName,
+  callId,
+  nativeCallId,
+  callType,
+  randomRoomId,
+  expiresAt
+}: {
+  targetUserId: string;
+  callerId: string;
+  callerName: string;
+  callId: string;
+  nativeCallId?: string;
+  callType: "voice" | "video";
+  randomRoomId?: string;
+  expiresAt?: Date | string;
+}) => {
+  const emitter = safeRequire<{ createAndEmitNotification?: (payload: Record<string, unknown>) => Promise<unknown> }>(
+    path.join(backendRootPath, "utils", "notificationEmitter.js")
+  );
+  if (!emitter?.createAndEmitNotification) return;
+  return emitter.createAndEmitNotification({
+    recipient: targetUserId,
+    sender: callerId,
+    ...buildIncomingCallNotification({ callId, callType, callerId, callerName, nativeCallId, randomRoomId, expiresAt })
+  });
 };
 
 const getRandomConnectionModel = (): RandomConnectionModel | null =>
@@ -232,42 +389,188 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
     });
   });
 
-  socket.on("call-request", (data: { callId?: string; targetUserId?: string; callType?: "voice" | "video"; fromUsername?: string; fromDisplayName?: string; fromAvatar?: string; randomRoomId?: string }) => {
-    if (!data?.callId || !data?.targetUserId || !data?.callType) {
+  socket.on("call-request", async (data: { callId?: string; targetUserId?: string; callType?: "voice" | "video"; fromUsername?: string; fromDisplayName?: string; fromAvatar?: string; randomRoomId?: string }) => {
+    const callId = boundedString(data?.callId, 160);
+    const targetUserId = boundedString(data?.targetUserId, 64);
+    if (!callId || !OBJECT_ID_PATTERN.test(targetUserId) || !data?.callType || !["voice", "video"].includes(data.callType) || targetUserId === userIdStr) {
       return;
     }
-    io.to(`user-${String(data.targetUserId)}`).emit("call-request", {
-      callId: data.callId,
+    if (!consumeCallRequestQuota(userIdStr)) {
+      socket.emit("call-error", { callId, code: "CALL_RATE_LIMITED" });
+      return;
+    }
+    if (data.randomRoomId) {
+      const session = await findAuthorizedRandomSession(boundedString(data.randomRoomId, 160), userIdStr, targetUserId);
+      if (!session) return;
+    }
+
+    const User = safeRequire<any>(path.join(backendModelPath, "User.js"));
+    if (!User) return;
+    const [caller, target] = await Promise.all([
+      User.findById(userIdStr).select("username profile.displayName profile.avatar blockedUsers isActive").lean(),
+      User.findById(targetUserId).select("username blockedUsers isActive").lean()
+    ]);
+    if (!caller?.isActive || !target?.isActive) return;
+    const callerBlockedTarget = (caller.blockedUsers || []).some((id: unknown) => getObjectIdString(id) === targetUserId);
+    const targetBlockedCaller = (target.blockedUsers || []).some((id: unknown) => getObjectIdString(id) === userIdStr);
+    if (callerBlockedTarget || targetBlockedCaller) return;
+
+    const callerName = boundedString(caller.profile?.displayName || caller.username, 100) || "Someone";
+    const callSessionService = getCallSessionService();
+    if (!callSessionService) {
+      logger.error("Call session service unavailable", { callId, callerId: userIdStr, targetUserId });
+      socket.emit("call-error", { callId, code: "CALL_SESSION_UNAVAILABLE" });
+      return;
+    }
+    let durableSession: DurableCallSession;
+    try {
+      durableSession = await callSessionService.createCallSession({
+        callId,
+        callerId: userIdStr,
+        calleeId: targetUserId,
+        callType: data.callType,
+        source: data.randomRoomId ? "random_connect" : "socket",
+        randomRoomId: boundedString(data.randomRoomId, 160),
+        caller: {
+          username: caller.username,
+          displayName: caller.profile?.displayName || caller.username,
+          avatar: caller.profile?.avatar
+        },
+        expiresAt: new Date(Date.now() + CALL_RING_TTL_SECONDS * 1000)
+      });
+    } catch (error) {
+      logger.warn("Call session creation rejected", { callId, callerId: userIdStr, targetUserId, error: String(error) });
+      socket.emit("call-error", { callId, code: "CALL_SESSION_REJECTED" });
+      return;
+    }
+    const deadlineAt = new Date(durableSession.expiresAt).toISOString();
+    io.to(`user-${targetUserId}`).emit("call-request", {
+      callId,
+      nativeCallId: durableSession.nativeCallId,
       fromUserId: userIdStr,
       callType: data.callType,
-      fromUsername: data.fromUsername,
-      fromDisplayName: data.fromDisplayName,
-      fromAvatar: data.fromAvatar,
-      randomRoomId: data.randomRoomId,
+      fromUsername: caller.username,
+      fromDisplayName: caller.profile?.displayName || caller.username,
+      fromAvatar: caller.profile?.avatar,
+      randomRoomId: boundedString(data.randomRoomId, 160) || undefined,
+      deadlineAt
+    });
+    const incomingCallNotification = {
+      recipient: targetUserId,
+      sender: userIdStr,
+      ...buildIncomingCallNotification({
+        callId,
+        nativeCallId: durableSession.nativeCallId,
+        callType: data.callType,
+        callerId: userIdStr,
+        callerName,
+        randomRoomId: boundedString(data.randomRoomId, 160) || undefined,
+        expiresAt: durableSession.expiresAt
+      })
+    };
+    const standardPush = dispatchIncomingCallNotification({
+      targetUserId,
+      callerId: userIdStr,
+      callerName,
+      callId,
+      nativeCallId: durableSession.nativeCallId,
+      callType: data.callType,
+      randomRoomId: boundedString(data.randomRoomId, 160) || undefined,
+      expiresAt: durableSession.expiresAt
+    });
+    const apnsService = getApnsVoipPushService();
+    const apnsVoipPush = apnsService
+      ? apnsService.dispatchInitialVoipPush(durableSession)
+      : Promise.reject(new Error("APNs VoIP service unavailable"));
+    void Promise.allSettled([standardPush, apnsVoipPush]).then(async (results) => {
+      results.forEach((result, index) => {
+        if (result.status === "rejected") {
+          logger.error(index === 0 ? "Incoming call notification failed" : "APNs VoIP call push failed", {
+            callId,
+            callerId: userIdStr,
+            targetUserId,
+            error: String(result.reason)
+          });
+        }
+      });
+      // If the inbox/outbox write itself failed, the provider fallback can
+      // still use the already-normalized payload. sendPushNotification repeats
+      // the recipient preference check before touching the provider.
+      const fallbackNotification = results[0].status === "fulfilled"
+        ? results[0].value
+        : incomingCallNotification;
+      await sendFailedVoipFallback(targetUserId, fallbackNotification, results[1]).catch((error) => {
+        logger.error("Incoming call Expo fallback failed", { callId, targetUserId, error: String(error) });
+      });
     });
   });
 
   for (const eventName of ["call-accept", "call-reject", "call-end"] as const) {
-    socket.on(eventName, (data: { callId?: string; targetUserId?: string }) => {
+    socket.on(eventName, async (data: { callId?: string; targetUserId?: string; reason?: string }) => {
       if (!data?.callId || !data?.targetUserId) {
         return;
       }
-      io.to(`user-${String(data.targetUserId)}`).emit(eventName, {
-        callId: data.callId,
-        fromUserId: userIdStr
-      });
+      const callSessionService = getCallSessionService();
+      if (!callSessionService) return;
+      try {
+        const action = eventName === "call-accept" ? "accept" : eventName === "call-reject" ? "decline" : "end";
+        const session = await callSessionService.transitionCallSession({
+          callId: boundedString(data.callId, 160),
+          actorId: userIdStr,
+          action,
+          reason: boundedString(data.reason, 80)
+        });
+        const callerId = getObjectIdString(session.caller);
+        const calleeId = getObjectIdString(session.callee);
+        const otherUserId = userIdStr === callerId ? calleeId : callerId;
+        io.to(`user-${otherUserId}`).emit(eventName, {
+          callId: session.callId,
+          nativeCallId: session.nativeCallId,
+          fromUserId: userIdStr,
+          reason: boundedString(data.reason, 80) || undefined
+        });
+        const serialized = callSessionService.serializeCallSession(session);
+        io.to(`user-${callerId}`).emit("call-session-updated", serialized);
+        io.to(`user-${calleeId}`).emit("call-session-updated", serialized);
+      } catch (error) {
+        logger.warn("Call state transition rejected", {
+          eventName,
+          callId: boundedString(data.callId, 160),
+          actorId: userIdStr,
+          error: String(error)
+        });
+        socket.emit("call-error", { callId: data.callId, code: "CALL_STATE_CONFLICT" });
+      }
     });
   }
 
-  socket.on("call-signal", (data: { callId?: string; targetUserId?: string; signal?: unknown }) => {
-    if (!data?.callId || !data?.targetUserId || !data?.signal) {
+  socket.on("call-signal", async (data: { callId?: string; targetUserId?: string; signal?: unknown }) => {
+    const callId = boundedString(data?.callId, 160);
+    const requestedTarget = boundedString(data?.targetUserId, 64);
+    if (!callId || !OBJECT_ID_PATTERN.test(requestedTarget) || !data?.signal || typeof data.signal !== "object") {
       return;
     }
-    io.to(`user-${String(data.targetUserId)}`).emit("call-signal", {
-      callId: data.callId,
-      fromUserId: userIdStr,
-      signal: data.signal
-    });
+    let serializedSignal = "";
+    try { serializedSignal = JSON.stringify(data.signal); } catch { return; }
+    if (Buffer.byteLength(serializedSignal, "utf8") > 64 * 1024) return;
+    const service = getCallSessionService();
+    if (!service) return;
+    try {
+      const session = await service.getCallSessionForParticipant(callId, userIdStr);
+      if (session.status !== "accepted") return;
+      const callerId = getObjectIdString(session.caller);
+      const calleeId = getObjectIdString(session.callee);
+      const authorizedTarget = userIdStr === callerId ? calleeId : callerId;
+      if (requestedTarget !== authorizedTarget) return;
+      io.to(`user-${authorizedTarget}`).emit("call-signal", {
+        callId: session.callId,
+        nativeCallId: session.nativeCallId,
+        fromUserId: userIdStr,
+        signal: data.signal
+      });
+    } catch (error) {
+      logger.warn("Unauthorized call signal rejected", { callId, actorId: userIdStr, error: String(error) });
+    }
   });
 
   socket.on("group-call-request", (data: { callId?: string; chatRoomId?: string; callType?: "voice" | "video" }) => {

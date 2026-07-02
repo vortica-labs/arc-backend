@@ -51,7 +51,41 @@ NEW_REV=$(aws ecs register-task-definition \
   --query 'taskDefinition.revision' --output text)
 echo "==> Task definition: $TASK_FAMILY:$NEW_REV"
 
-# 5. Deploy
+# 5. Run provider credential verification and additive push migrations inside
+# the new image, with the same secrets/network as the service. A failed
+# preflight prevents the broken revision from receiving production traffic.
+echo "==> Running push provider and database preflight..."
+NETWORK_CONFIGURATION=$(aws ecs describe-services \
+  --cluster "$CLUSTER" --services "$SERVICE" \
+  --query 'services[0].networkConfiguration' --output json)
+CONTAINER_NAME=$(aws ecs describe-task-definition \
+  --task-definition "$TASK_FAMILY:$NEW_REV" \
+  --query 'taskDefinition.containerDefinitions[0].name' --output text)
+OVERRIDES=$(node -e "process.stdout.write(JSON.stringify({containerOverrides:[{name:process.argv[1],command:['node','scripts/preflight-push-release.js']}]}))" "$CONTAINER_NAME")
+PREFLIGHT_TASK=$(aws ecs run-task \
+  --cluster "$CLUSTER" \
+  --task-definition "$TASK_FAMILY:$NEW_REV" \
+  --launch-type FARGATE \
+  --network-configuration "$NETWORK_CONFIGURATION" \
+  --overrides "$OVERRIDES" \
+  --query 'tasks[0].taskArn' --output text)
+if [[ -z "$PREFLIGHT_TASK" || "$PREFLIGHT_TASK" == "None" ]]; then
+  echo "Push preflight task could not be started" >&2
+  exit 1
+fi
+aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$PREFLIGHT_TASK"
+PREFLIGHT_EXIT=$(aws ecs describe-tasks \
+  --cluster "$CLUSTER" --tasks "$PREFLIGHT_TASK" \
+  --query 'tasks[0].containers[0].exitCode' --output text)
+if [[ "$PREFLIGHT_EXIT" != "0" ]]; then
+  PREFLIGHT_REASON=$(aws ecs describe-tasks \
+    --cluster "$CLUSTER" --tasks "$PREFLIGHT_TASK" \
+    --query 'tasks[0].containers[0].reason' --output text)
+  echo "Push preflight failed (exit=$PREFLIGHT_EXIT): $PREFLIGHT_REASON" >&2
+  exit 1
+fi
+
+# 6. Deploy
 echo "==> Updating ECS service..."
 aws ecs update-service \
   --cluster "$CLUSTER" \
@@ -61,7 +95,7 @@ aws ecs update-service \
   --output table \
   --query 'service.{taskDef:taskDefinition,running:runningCount,pending:pendingCount}'
 
-# 6. Wait
+# 7. Wait
 echo "==> Waiting for stable deployment (~2 min)..."
 aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
 

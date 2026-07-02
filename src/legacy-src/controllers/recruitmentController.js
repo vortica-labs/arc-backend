@@ -4,6 +4,35 @@ const RecruitmentApplication = require('../models/RecruitmentApplication');
 const User = require('../models/User');
 const safeAsyncHandler = require('../utils/safeAsyncHandler');
 const log = require('../utils/logger');
+const { createAndEmitNotification } = require('../utils/notificationEmitter');
+
+const notifyRecruitmentEvent = ({ recipient, sender, title, message, eventType, deliveryKey, data = {} }) =>
+  createAndEmitNotification({
+    recipient,
+    sender,
+    type: 'recruitment',
+    title,
+    message,
+    data: {
+      deepLink: '/recruitment',
+      customData: {
+        eventType,
+        notificationDedupeKey: deliveryKey,
+        pushRequestId: deliveryKey,
+        ...data
+      }
+    }
+  });
+
+const emitRecruitmentDirectMessage = (applicantId, teamId, message) => {
+  const io = global._arcSocketIO;
+  if (!io?.to) return false;
+  io.to(`user-${String(applicantId)}`).emit('newMessage', {
+    chatId: `direct_${teamId}`,
+    message
+  });
+  return true;
+};
 
 // Team Recruitment Controllers
 
@@ -272,6 +301,26 @@ const updateTeamRecruitment = safeAsyncHandler(async (req, res) => {
     { new: true, runValidators: true }
   ).populate('team', 'username profile.displayName profile.avatar');
 
+  if (Object.prototype.hasOwnProperty.call(updateData, 'status')) {
+    const recipients = Array.from(new Set((recruitment.applicants || []).map((entry) => String(entry.user)).filter(Boolean)));
+    const notificationResults = await Promise.allSettled(recipients.map((recipient) => notifyRecruitmentEvent({
+      recipient,
+      sender: teamId,
+      title: 'Recruitment Post Updated',
+      message: `The recruitment post status is now ${updatedRecruitment.status}.`,
+      eventType: 'recruitment_post_status',
+      deliveryKey: `recruitment-post-status:${recruitment._id}:${updatedRecruitment.status}`,
+      data: { recruitmentId: recruitment._id, status: updatedRecruitment.status }
+    })));
+    notificationResults.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        log.error('Recruitment status fan-out failed', {
+          error: String(result.reason), recruitmentId: String(recruitment._id), recipientId: recipients[index]
+        });
+      }
+    });
+  }
+
   res.json({
     success: true,
     message: 'Recruitment post updated successfully',
@@ -309,7 +358,24 @@ const deleteTeamRecruitment = safeAsyncHandler(async (req, res) => {
     });
   }
 
+  const recipients = Array.from(new Set((recruitment.applicants || []).map((entry) => String(entry.user)).filter(Boolean)));
   await TeamRecruitment.findByIdAndDelete(recruitment._id);
+  const notificationResults = await Promise.allSettled(recipients.map((recipient) => notifyRecruitmentEvent({
+    recipient,
+    sender: teamId,
+    title: 'Recruitment Post Removed',
+    message: 'A recruitment post you applied to has been removed by the team.',
+    eventType: 'recruitment_post_deleted',
+    deliveryKey: `recruitment-post-deleted:${recruitment._id}`,
+    data: { recruitmentId: recruitment._id }
+  })));
+  notificationResults.forEach((result, index) => {
+    if (result.status === 'rejected') {
+      log.error('Recruitment deletion fan-out failed', {
+        error: String(result.reason), recruitmentId: String(recruitment._id), recipientId: recipients[index]
+      });
+    }
+  });
 
   res.json({
     success: true,
@@ -704,6 +770,16 @@ const applyToRecruitment = safeAsyncHandler(async (req, res) => {
 
   await recruitment.save();
 
+  await notifyRecruitmentEvent({
+    recipient: recruitment.team,
+    sender: applicantId,
+    title: 'New Recruitment Application',
+    message: `${req.user.profile?.displayName || req.user.username} applied to your recruitment post.`,
+    eventType: 'recruitment_application_submitted',
+    deliveryKey: `recruitment-application-submitted:${application._id}`,
+    data: { applicationId: application._id, recruitmentId: recruitment._id }
+  });
+
   res.status(201).json({
     success: true,
     message: 'Application submitted successfully',
@@ -754,6 +830,16 @@ const withdrawApplication = safeAsyncHandler(async (req, res) => {
     app => app.user.toString() !== applicantId.toString()
   );
   await recruitment.save();
+
+  await notifyRecruitmentEvent({
+    recipient: recruitment.team,
+    sender: applicantId,
+    title: 'Recruitment Application Withdrawn',
+    message: `${req.user.profile?.displayName || req.user.username} withdrew their application.`,
+    eventType: 'recruitment_application_withdrawn',
+    deliveryKey: `recruitment-application-withdrawn:${application._id}`,
+    data: { applicationId: application._id, recruitmentId: recruitment._id }
+  });
 
   res.json({
     success: true,
@@ -812,6 +898,16 @@ const showInterestInProfile = safeAsyncHandler(async (req, res) => {
   });
 
   await profile.save();
+
+  await notifyRecruitmentEvent({
+    recipient: profile.player,
+    sender: teamId,
+    title: 'A Team Is Interested',
+    message: `${req.user.profile?.displayName || req.user.username} showed interest in your player profile.`,
+    eventType: 'recruitment_profile_interest',
+    deliveryKey: `recruitment-profile-interest:${profile._id}:${teamId}`,
+    data: { profileId: profile._id, teamId }
+  });
 
   res.json({
     success: true,
@@ -1005,24 +1101,25 @@ const updateApplicationStatus = safeAsyncHandler(async (req, res) => {
 
     // 1. In-app notification
     try {
-      const { createAndEmitNotification } = require('../utils/notificationEmitter');
-      await createAndEmitNotification({
+      await notifyRecruitmentEvent({
         recipient: applicantId,
         sender: teamId,
-        type: 'system',
         title: notifTitle,
         message: notifMessage,
-        data: { applicationId: application._id, recruitmentId: recruitment._id }
+        eventType: 'recruitment_application_status',
+        deliveryKey: `recruitment-application-status:${application._id}:${status}`,
+        data: { applicationId: application._id, recruitmentId: recruitment._id, status }
       });
     } catch (e) {
-      console.error('Recruitment notification error:', e.message);
+      log.error('Recruitment status notification failed', {
+        error: String(e), applicationId: String(application._id), recipientId: String(applicantId), status
+      });
     }
 
     // 2. Automated DM from team to applicant
     if (['accepted', 'shortlisted', 'rejected'].includes(status)) {
       try {
         const { Message } = require('../models/Message');
-        const { emitNotification } = require('../utils/notificationEmitter');
 
         if (status === 'shortlisted') {
           log.debug(`[Recruitment] Sending shortlist plain DM to applicant ${applicantId}`);
@@ -1037,7 +1134,7 @@ const updateApplicationStatus = safeAsyncHandler(async (req, res) => {
               media: []
             }
           });
-          emitNotification(applicantId.toString(), { type: 'newMessage', chatId: `direct_${teamId}`, message: dm });
+          emitRecruitmentDirectMessage(applicantId, teamId, dm);
 
         } else if (status === 'accepted') {
           log.debug(`[Recruitment] Sending ACCEPTED card DM to applicant ${applicantId}`);
@@ -1063,7 +1160,7 @@ const updateApplicationStatus = safeAsyncHandler(async (req, res) => {
               recruitmentType: recruitment.recruitmentType || 'roster',
             }
           });
-          emitNotification(applicantId.toString(), { type: 'newMessage', chatId: `direct_${teamId}`, message: dm });
+          emitRecruitmentDirectMessage(applicantId, teamId, dm);
 
         } else if (status === 'rejected') {
           log.debug(`[Recruitment] Sending REJECTED card DM to applicant ${applicantId}`);
@@ -1089,51 +1186,34 @@ const updateApplicationStatus = safeAsyncHandler(async (req, res) => {
               recruitmentType: recruitment.recruitmentType || 'roster',
             }
           });
-          emitNotification(applicantId.toString(), { type: 'newMessage', chatId: `direct_${teamId}`, message: dm });
+          emitRecruitmentDirectMessage(applicantId, teamId, dm);
         }
       } catch (e) {
         console.error('Recruitment DM error:', e.message);
       }
     }
 
-    // 3. Email notification (non-blocking, only if SMTP configured)
+    // 3. Transactional recruitment email (explicitly typed and non-blocking)
     if (process.env.SMTP_USER && process.env.SMTP_PASS && application.applicant.email) {
       try {
-        const { sendMail } = require('../utils/email');
+        const { enqueueEmail } = require('../utils/jobQueue');
+        const { EMAIL_INTENTS } = require('../utils/notificationChannelPolicy');
         const clientUrl = process.env.CLIENT_URL || 'https://arc.squadhunt.com';
-        const html = `
-          <div style="font-family:system-ui,sans-serif;background:#0b1120;padding:24px;">
-            <table width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;margin:0 auto;background:#020617;border-radius:16px;border:1px solid #1e293b;overflow:hidden;">
-              <tr>
-                <td style="padding:20px 24px 16px;background:linear-gradient(135deg,#4f46e5,#7c3aed);">
-                  <h1 style="margin:0;font-size:18px;font-weight:700;color:#e5e7eb;">${notifTitle}</h1>
-                  <p style="margin:4px 0 0;font-size:12px;color:#e5e7eb;opacity:0.85;">ARC Gaming · Recruitment Update</p>
-                </td>
-              </tr>
-              <tr>
-                <td style="padding:20px 24px 8px;color:#e5e7eb;">
-                  <p style="margin:0 0 12px;font-size:14px;">Hi <strong>${application.applicant.profile?.displayName || application.applicant.username}</strong>,</p>
-                  <p style="margin:0 0 12px;font-size:14px;">${notifMessage}</p>
-                  ${message ? `<div style="margin:12px 0;padding:12px 16px;border-radius:10px;background:#1e293b;border-left:3px solid #7c3aed;"><p style="margin:0;font-size:13px;color:#cbd5e1;">"${message}"</p></div>` : ''}
-                  <p style="margin:12px 0 0;"><a href="${clientUrl}/messages" style="display:inline-block;padding:10px 20px;background:#4f46e5;color:#fff;border-radius:8px;text-decoration:none;font-size:13px;font-weight:600;">View in Messages</a></p>
-                </td>
-              </tr>
-              <tr>
-                <td style="padding:12px 24px 16px;border-top:1px solid #1f2937;">
-                  <p style="margin:0;font-size:11px;color:#6b7280;">— ARC Gaming Team</p>
-                </td>
-              </tr>
-            </table>
-          </div>
-        `;
-        sendMail({
-          to: application.applicant.email,
-          subject: `ARC: ${notifTitle}`,
-          text: notifMessage,
-          html
-        }).catch(() => {});
+        void enqueueEmail(
+          application.applicant.email,
+          notifTitle,
+          notifMessage,
+          `${clientUrl.replace(/\/+$/, '')}/messages`,
+          {
+            intent: EMAIL_INTENTS.RECRUITMENT_STATUS,
+            eventType: 'recruitment_application_status',
+            notificationType: 'recruitment'
+          }
+        ).catch((emailError) => {
+          log.error('Recruitment email enqueue failed', { error: String(emailError) });
+        });
       } catch (e) {
-        console.error('Recruitment email error:', e.message);
+        log.error('Recruitment email setup error', { error: String(e) });
       }
     }
   }

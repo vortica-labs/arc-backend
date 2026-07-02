@@ -586,6 +586,16 @@ const userSchema = new mongoose.Schema({
       required: true,
       maxlength: 512
     },
+    installationId: {
+      type: String,
+      default: undefined,
+      maxlength: 200
+    },
+    provider: {
+      type: String,
+      enum: ['expo'],
+      default: 'expo'
+    },
     platform: {
       type: String,
       enum: ['ios', 'android', 'web', 'unknown'],
@@ -593,13 +603,49 @@ const userSchema = new mongoose.Schema({
     },
     deviceName: {
       type: String,
-      default: ''
+      default: '',
+      maxlength: 120
+    },
+    deviceModel: {
+      type: String,
+      default: '',
+      maxlength: 120
+    },
+    deviceBrand: {
+      type: String,
+      default: '',
+      maxlength: 120
+    },
+    manufacturer: {
+      type: String,
+      default: '',
+      maxlength: 120
+    },
+    deviceType: {
+      type: String,
+      default: '',
+      maxlength: 40
+    },
+    osName: {
+      type: String,
+      default: '',
+      maxlength: 40
+    },
+    osVersion: {
+      type: String,
+      default: '',
+      maxlength: 40
     },
     projectId: {
       type: String,
       default: ''
     },
     appVersion: {
+      type: String,
+      default: '',
+      maxlength: 40
+    },
+    buildVersion: {
       type: String,
       default: '',
       maxlength: 40
@@ -617,6 +663,19 @@ const userSchema = new mongoose.Schema({
     lastUsedAt: {
       type: Date,
       default: Date.now
+    },
+    lastDeliveredAt: {
+      type: Date,
+      default: null
+    },
+    lastFailedAt: {
+      type: Date,
+      default: null
+    },
+    failureCount: {
+      type: Number,
+      default: 0,
+      min: 0
     },
     createdAt: {
       type: Date,
@@ -652,6 +711,15 @@ const userSchema = new mongoose.Schema({
   timestamps: true
 });
 
+const stripPrivateDeviceFields = (_document, value) => {
+  delete value.password;
+  delete value.pushTokens;
+  delete value.notificationClients;
+  return value;
+};
+userSchema.set('toJSON', { transform: stripPrivateDeviceFields });
+userSchema.set('toObject', { transform: stripPrivateDeviceFields });
+
 // Index for better search performance
 userSchema.index({ username: 1, email: 1 });
 userSchema.index({ 'profile.displayName': 1 });
@@ -671,6 +739,10 @@ userSchema.index({ 'notificationClients.platform': 1, 'notificationClients.appVe
 userSchema.index({ 'pushTokens.platform': 1, 'pushTokens.appVersion': 1, 'pushTokens.lastUsedAt': -1 });
 userSchema.index({ 'notificationClients.clientId': 1 }, { unique: true, sparse: true });
 userSchema.index({ 'pushTokens.token': 1 }, { unique: true, sparse: true });
+userSchema.index(
+  { 'pushTokens.installationId': 1 },
+  { unique: true, partialFilterExpression: { 'pushTokens.installationId': { $type: 'string', $gt: '' } } }
+);
 
 // Hash password before saving
 userSchema.pre('save', async function(next) {
@@ -712,6 +784,8 @@ userSchema.methods.getPublicProfile = function() {
   const userObject = this.toObject();
   delete userObject.password;
   delete userObject.email;
+  delete userObject.pushTokens;
+  delete userObject.notificationClients;
   
   // Add followers and following counts
   userObject.followersCount = this.followers ? this.followers.length : 0;

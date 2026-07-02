@@ -1,4 +1,9 @@
-const { createAndEmitNotification } = require('./notificationEmitter');
+const {
+  createAndEmitNotification,
+  emitNotification,
+  resolveNotificationChannels
+} = require('./notificationEmitter');
+const { createHash, randomUUID } = require('crypto');
 const log = require('./logger');
 
 // Create like notification
@@ -71,24 +76,99 @@ const createFollowNotification = async (recipientId, senderId) => {
 };
 
 // Create message notification
-const createMessageNotification = async (recipientId, senderId, messageId) => {
+const createMessageNotification = async (recipientId, senderId, messageId, options = {}) => {
   try {
     const Notification = require('../models/Notification');
-    const sender = await require('../models/User').findById(senderId).select('username profile.displayName profile.avatar');
+    const User = require('../models/User');
+    const [sender, recipient] = await Promise.all([
+      User.findById(senderId).select('username profile.displayName profile.avatar'),
+      User.findById(recipientId).select('notificationSettings mutedChats isActive').lean()
+    ]);
+    if (!recipient || recipient.isActive === false) return null;
+    const conversationId = String(options.conversationId || options.chatId || `direct_${senderId}`);
+    const notificationCoalesceKey = `message-thread:${createHash('sha256')
+      .update(`${String(recipientId)}:${String(senderId)}:${conversationId}`)
+      .digest('hex')}`;
+    const muteKey = String(options.muteKey || senderId);
+    if ((recipient?.mutedChats || []).some((entry) => String(entry) === muteKey)) return null;
+    const messageKind = String(options.messageKind || 'text');
+    const hasMedia = options.hasMedia === true;
+    const primaryMediaType = options.primaryMediaType ? String(options.primaryMediaType) : undefined;
+    const notificationDataFields = {
+      messageId,
+      deepLink: options.deepLink || `/conversation/${conversationId}`,
+      customData: {
+        conversationId,
+        chatId: String(options.chatId || conversationId),
+        messageKind,
+        media: { hasMedia, ...(primaryMediaType ? { primaryType: primaryMediaType } : {}) },
+        pushRequestId: `message:${String(messageId)}`,
+        notificationCoalesceKey,
+        ...(options.groupName ? { groupName: String(options.groupName) } : {})
+      }
+    };
+    const notificationTitle = options.title || 'New Message';
+    const notificationMessage = options.message || `${sender.username} sent you a message`;
+    const channels = resolveNotificationChannels(
+      { type: 'message', data: notificationDataFields },
+      recipient?.notificationSettings
+    );
 
     // If an unread message notification from this sender already exists, just update it
     // instead of stacking a new one per message. This prevents notification spam and
     // ensures marking-read clears all messages from that sender in one shot.
     const existing = await Notification.findOneAndUpdate(
-      { recipient: recipientId, sender: senderId, type: 'message', isRead: false },
-      { $set: { 'data.messageId': messageId, updatedAt: new Date() } },
+      {
+        recipient: recipientId,
+        sender: senderId,
+        type: 'message',
+        isRead: false,
+        deletedAt: null,
+        archivedAt: null,
+        $or: [
+          { 'data.customData.notificationCoalesceKey': notificationCoalesceKey },
+          { 'data.customData.conversationId': conversationId }
+        ]
+      },
+      {
+        $set: {
+          title: notificationTitle,
+          message: notificationMessage,
+          data: notificationDataFields,
+          updatedAt: new Date(),
+          pushDeliveryState: channels.push ? 'pending' : 'not_requested',
+          pushDeliveryAttempts: 0,
+          pushDeliveryNextAttemptAt: channels.push ? new Date() : null,
+          pushDeliveryLastError: ''
+        },
+        $unset: { pushDeliveryLeaseAt: 1, pushDeliveryLeaseKey: 1, pushDeliveryCompletedAt: 1 }
+      },
       { new: true }
     );
     if (existing) {
-      const { sendPushNotification } = require('./pushNotificationService');
-      sendPushNotification(recipientId, existing).catch((pushError) => {
-        log.error('Message push notification error', { error: String(pushError) });
-      });
+      try {
+        await existing.populate('sender', 'username profile.displayName profile.avatar');
+      } catch (populateError) {
+        log.warn('Message notification sender population failed', { error: String(populateError) });
+      }
+      if (channels.inApp) emitNotification(recipientId, existing);
+      if (channels.push) {
+        const { sendPushNotification } = require('./pushNotificationService');
+        const leaseKey = `notification-outbox-${randomUUID()}`;
+        try {
+          const claimed = await Notification.claimPushDelivery(existing._id, leaseKey);
+          if (claimed) {
+            // Another message can replace this coalesced row between the
+            // update and the claim. The claimed document is the authoritative
+            // revision; sending the earlier snapshot can lose the newer push.
+            await sendPushNotification(recipientId, claimed);
+            await Notification.completePushDelivery(existing._id, leaseKey);
+          }
+        } catch (pushError) {
+          await Notification.retryPushDelivery(existing._id, leaseKey, pushError).catch(() => undefined);
+          log.error('Message push notification error', { error: String(pushError) });
+        }
+      }
       return existing;
     }
 
@@ -96,14 +176,25 @@ const createMessageNotification = async (recipientId, senderId, messageId) => {
       recipient: recipientId,
       sender: senderId,
       type: 'message',
-      title: 'New Message',
-      message: `${sender.username} sent you a message`,
-      data: {
-        messageId: messageId
-      }
+      title: notificationTitle,
+      message: notificationMessage,
+      data: notificationDataFields
     };
 
-    return await createAndEmitNotification(notificationData);
+    try {
+      return await createAndEmitNotification(notificationData);
+    } catch (error) {
+      // The partial unique coalescing index closes the two-first-messages race.
+      // The duplicate-key loser re-enters once, updates the winner to its newer
+      // message revision, and claims that exact revision for push delivery.
+      if (error?.code === 11000 && options.__coalesceConflictRetried !== true) {
+        return createMessageNotification(recipientId, senderId, messageId, {
+          ...options,
+          __coalesceConflictRetried: true
+        });
+      }
+      throw error;
+    }
   } catch (error) {
     log.error('Notification error', { error: String(error) });
     throw error;
@@ -155,14 +246,18 @@ const createMentionNotification = async (recipientId, senderId, postId) => {
 };
 
 // Create system notification
-const createSystemNotification = async (recipientId, title, message, data = {}) => {
+const createSystemNotification = async (recipientId, title, message, data = {}, options = {}) => {
   try {
+    const email = options?.email && typeof options.email === 'object'
+      ? { intent: options.email.intent, eventType: options.email.eventType }
+      : undefined;
     const notificationData = {
       recipient: recipientId,
       type: 'system',
       title: title,
       message: message,
-      data: data
+      data: data,
+      ...(email ? { email } : {})
     };
 
     return await createAndEmitNotification(notificationData);

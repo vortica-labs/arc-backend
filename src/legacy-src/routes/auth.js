@@ -151,7 +151,7 @@ router.post('/upload-profile-picture', protect, uploadSingle('image'), uploadPro
 router.post('/upload-banner', protect, uploadSingle('image'), uploadBanner);
 router.put('/change-password', protect, changePasswordValidation, changePassword);
 router.delete('/account', protect, deleteAccountValidation, deleteAccount);
-router.post('/logout', logout);
+router.post('/logout', protectAllowIncomplete, logout);
 router.post('/complete-profile', protectAllowIncomplete, completeProfile);
 router.post('/complete-google-profile', protectAllowIncomplete, completeGoogleProfile);
 

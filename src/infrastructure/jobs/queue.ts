@@ -1,5 +1,5 @@
 import { Queue, Worker, type Job } from "bullmq";
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { env } from "../../config/env";
 import { logger } from "../../config/logger";
 
@@ -29,11 +29,17 @@ export const emailQueue = new Queue(QUEUE_NAMES.EMAIL, { connection });
 export const notificationQueue = new Queue(QUEUE_NAMES.NOTIFICATION, { connection });
 export const broadcastQueue = new Queue(QUEUE_NAMES.BROADCAST, { connection });
 
+export type EmailDeliveryContext = {
+  intent: string;
+  eventType?: string;
+  notificationType?: string;
+};
+
 // ── Email Worker ───────────────────────────────────────────────────────────
 export const emailWorker = new Worker(
   QUEUE_NAMES.EMAIL,
   async (job: Job) => {
-    const { to, subject, text, html, link } = job.data;
+    const { to, subject, text, link, context } = job.data;
     try {
       // Dynamic import to avoid loading nodemailer at module scope
       const path = require("path");
@@ -41,13 +47,23 @@ export const emailWorker = new Worker(
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const emailUtil = require(path.join(legacyRoot, "utils", "email.js"));
 
-      if (emailUtil?.sendNotificationEmail) {
-        await emailUtil.sendNotificationEmail(to, subject, text, link);
-      } else if (emailUtil?.sendEmail) {
-        await emailUtil.sendEmail({ to, subject, text, html });
+      if (!emailUtil?.sendNotificationEmail) {
+        throw new Error("Policy-aware email dispatcher is unavailable");
       }
+      const result = await emailUtil.sendNotificationEmail(to, subject, text, link, context || {});
+      if (result?.blocked) {
+        logger.info("Email job suppressed by channel policy", {
+          jobId: String(job.id || ""),
+          intent: context?.intent || "missing",
+          eventType: context?.eventType || context?.notificationType || "",
+          reason: result.reason || "policy_blocked"
+        });
+        return { suppressed: true, reason: result.reason || "policy_blocked" };
+      }
+      if (!result?.sent) throw new Error(result?.error || "Email transport did not confirm delivery");
 
       logger.info("Email sent via worker", { to, subject });
+      return { sent: true, messageId: result.messageId };
     } catch (error) {
       logger.error("Email worker failed", { error: String(error), to, subject });
       throw error; // let BullMQ retry
@@ -64,44 +80,94 @@ export const emailWorker = new Worker(
 export const notificationWorker = new Worker(
   QUEUE_NAMES.NOTIFICATION,
   async (job: Job) => {
-    const { recipientIds, title, message, type, data } = job.data;
     try {
       const path = require("path");
       const legacyRoot = path.resolve(__dirname, "..", "..", "legacy-src");
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const Notification = require(path.join(legacyRoot, "models", "Notification.js"));
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { sendPushNotification } = require(path.join(legacyRoot, "utils", "pushNotificationService.js"));
-
-      const docs = (recipientIds as string[]).map((recipientId: string) => ({
-        recipient: recipientId,
-        type: type || "system",
-        title,
-        message,
-        data: data || {},
-        isRead: false,
-        createdAt: new Date(),
-        updatedAt: new Date()
-      }));
-
-      if (docs.length > 0) {
-        const insertedNotifications = await Notification.insertMany(docs, { ordered: false });
-        const pushResults = await Promise.allSettled(
-          insertedNotifications.map((notification: Record<string, unknown>) =>
-            sendPushNotification(notification.recipient, notification)
-          )
+      if (job.name === "push-send") {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const pushService = require(path.join(legacyRoot, "utils", "pushNotificationService.js"));
+        return pushService.retryPushDeliveryAttempts(job.data.attemptIds);
+      }
+      if (job.name === "push-receipts") {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const pushService = require(path.join(legacyRoot, "utils", "pushNotificationService.js"));
+        const result = await pushService.reconcilePushDeliveryReceipts(
+          job.data.attemptIds,
+          String(job.id || "")
         );
-        const pushFailures = pushResults.filter(result => result.status === "rejected").length;
-        if (pushFailures > 0) {
-          logger.warn("Bulk notification push delivery had failures", {
-            failures: pushFailures,
-            count: insertedNotifications.length,
-            type
-          });
+        if (result?.pendingRecordIds?.length) {
+          await enqueuePushReceipts(
+            result.pendingRecordIds,
+            result.nextRunAt || new Date(Date.now() + 60000),
+            `retry-${Math.floor(new Date(result.nextRunAt || Date.now() + 60000).getTime() / 1000)}`
+          );
         }
+        if (result?.retryRecordIds?.length) {
+          await enqueuePushSend(
+            result.retryRecordIds,
+            result.nextSendAt || new Date(Date.now() + 10000),
+            `receipt-resend-${Math.floor(new Date(result.nextSendAt || Date.now() + 10000).getTime() / 1000)}`
+          );
+        }
+        return result;
+      }
+      if (job.name !== "bulk") throw new Error(`Unknown notification job: ${job.name}`);
+      const { recipientIds, title, message, type, data, deliveryKey } = job.data;
+      const effectiveDeliveryKey = String(deliveryKey || job.id || randomUUID()).trim().slice(0, 250);
+      // Route bulk fan-out through the same preference-aware producer used by
+      // individual events. The stable delivery key makes BullMQ retries safe:
+      // in-app rows are deduplicated and push attempts reuse one request key.
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { createAndEmitNotification } = require(path.join(legacyRoot, "utils", "notificationEmitter.js"));
+      const failures: Array<{ recipientId: string; reason: string }> = [];
+      let delivered = 0;
+      const ids = Array.from(new Set((recipientIds as string[]).map(String).filter(Boolean)));
+      const customData = data?.customData && typeof data.customData === "object" && !Array.isArray(data.customData)
+        ? data.customData
+        : {};
+
+      for (let index = 0; index < ids.length; index += 50) {
+        const slice = ids.slice(index, index + 50);
+        const results = await Promise.allSettled(slice.map((recipientId: string) =>
+          createAndEmitNotification({
+            recipient: recipientId,
+            type: type || "system",
+            title,
+            message,
+            data: {
+              ...(data || {}),
+              customData: {
+                ...customData,
+                notificationDedupeKey: effectiveDeliveryKey,
+                pushRequestId: effectiveDeliveryKey,
+                pushSource: "bulk"
+              }
+            }
+          })
+        ));
+        results.forEach((result, resultIndex) => {
+          if (result.status === "rejected") {
+            failures.push({ recipientId: slice[resultIndex], reason: String(result.reason) });
+          } else if (result.value) {
+            delivered += 1;
+          }
+        });
       }
 
-      logger.info("Bulk notifications created", { count: recipientIds.length, type });
+      if (failures.length > 0) {
+        logger.error("Bulk notification delivery had producer failures", {
+          failures: failures.length,
+          count: ids.length,
+          type,
+          recipients: failures.slice(0, 20).map((entry) => entry.recipientId)
+        });
+        throw new AggregateError(
+          failures.map((entry) => new Error(`${entry.recipientId}: ${entry.reason}`)),
+          `${failures.length} bulk notification deliveries failed`
+        );
+      }
+
+      logger.info("Bulk notifications processed", { count: ids.length, delivered, type, deliveryKey: effectiveDeliveryKey });
     } catch (error) {
       logger.error("Notification worker failed", { error: String(error) });
       throw error;
@@ -109,7 +175,7 @@ export const notificationWorker = new Worker(
   },
   {
     connection,
-    concurrency: 2
+    concurrency: env.PUSH_WORKER_CONCURRENCY
   }
 );
 
@@ -205,9 +271,10 @@ export const enqueueEmail = async (
   to: string,
   subject: string,
   text: string,
-  link?: string
+  link?: string,
+  context?: EmailDeliveryContext
 ): Promise<void> => {
-  await emailQueue.add("send", { to, subject, text, link }, {
+  await emailQueue.add("send", { to, subject, text, link, context }, {
     attempts: 3,
     backoff: { type: "exponential", delay: 5000 },
     removeOnComplete: 100,
@@ -223,25 +290,81 @@ export const enqueueBulkNotifications = async (
   title: string,
   message: string,
   type?: string,
-  data?: Record<string, unknown>
+  data?: Record<string, unknown>,
+  deliveryKey?: string
 ): Promise<void> => {
+  const stableDeliveryKey = String(deliveryKey || randomUUID()).trim().slice(0, 250);
   // Split into batches of 500
   const BATCH = 500;
   for (let i = 0; i < recipientIds.length; i += BATCH) {
     const slice = recipientIds.slice(i, i + BATCH);
+    const recipientDigest = createHash("sha256")
+      .update(slice.map(String).sort().join(","))
+      .digest("hex")
+      .slice(0, 20);
     await notificationQueue.add("bulk", {
       recipientIds: slice,
       title,
       message,
       type,
-      data
+      data,
+      deliveryKey: stableDeliveryKey
     }, {
+      jobId: broadcastJobId("bulk", createHash("sha256").update(stableDeliveryKey).digest("hex").slice(0, 20), recipientDigest),
       attempts: 3,
       backoff: { type: "exponential", delay: 3000 },
       removeOnComplete: 50,
       removeOnFail: 200
     });
   }
+};
+
+export const enqueuePushReceipts = async (
+  attemptIds: string[],
+  runAt: Date | string,
+  reconciliationKey = "primary"
+): Promise<void> => {
+  const ids = Array.from(new Set((attemptIds || []).map(String).filter(Boolean))).sort();
+  if (!ids.length) return;
+  const scheduledAt = new Date(runAt);
+  if (Number.isNaN(scheduledAt.getTime())) throw new Error("Invalid push receipt run time");
+  const digest = createHash("sha256").update(ids.join(",")).digest("hex").slice(0, 24);
+  await notificationQueue.add(
+    "push-receipts",
+    { attemptIds: ids },
+    {
+      jobId: broadcastJobId("push-receipts", digest, reconciliationKey),
+      delay: Math.max(0, scheduledAt.getTime() - Date.now()),
+      attempts: Math.max(1, Number(process.env.EXPO_GENERIC_PUSH_RECEIPT_JOB_ATTEMPTS || 6)),
+      backoff: { type: "exponential", delay: 60000 },
+      removeOnComplete: 5000,
+      removeOnFail: 10000
+    }
+  );
+};
+
+export const enqueuePushSend = async (
+  attemptIds: string[],
+  runAt: Date | string,
+  retryKey = "primary"
+): Promise<void> => {
+  const ids = Array.from(new Set((attemptIds || []).map(String).filter(Boolean))).sort();
+  if (!ids.length) return;
+  const scheduledAt = new Date(runAt);
+  if (Number.isNaN(scheduledAt.getTime())) throw new Error("Invalid push retry run time");
+  const digest = createHash("sha256").update(ids.join(",")).digest("hex").slice(0, 24);
+  await notificationQueue.add(
+    "push-send",
+    { attemptIds: ids },
+    {
+      jobId: broadcastJobId("push-send", digest, retryKey),
+      delay: Math.max(0, scheduledAt.getTime() - Date.now()),
+      attempts: 3,
+      backoff: { type: "exponential", delay: 3000 },
+      removeOnComplete: 5000,
+      removeOnFail: 10000
+    }
+  );
 };
 
 export const enqueueBroadcast = async (
@@ -320,8 +443,83 @@ const recoverDueBroadcasts = async (): Promise<void> => {
     const Broadcast = require(path.join(legacyRoot, "models", "Broadcast.js"));
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const BroadcastPushReceipt = require(path.join(legacyRoot, "models", "BroadcastPushReceipt.js"));
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const PushDeliveryAttempt = require(path.join(legacyRoot, "models", "PushDeliveryAttempt.js"));
     const horizon = new Date(Date.now() + 5 * 60 * 1000);
     const staleLease = new Date(Date.now() - 15 * 60 * 1000);
+
+    // Generic push tickets use MongoDB as the durable source of truth too.
+    // Recover delayed receipt work after Redis/job loss and terminalize an
+    // ambiguous provider submission instead of risking a duplicate resend.
+    const expiredGenericSendLeases = await PushDeliveryAttempt.find(
+      { ticketStatus: "sending", sendLeaseAt: { $lte: staleLease } }
+    ).select("_id requestKey").limit(3000).lean();
+    await PushDeliveryAttempt.updateMany(
+      {
+        _id: { $in: expiredGenericSendLeases.map((attempt: { _id: unknown }) => attempt._id) },
+        ticketStatus: "sending",
+        sendLeaseAt: { $lte: staleLease }
+      },
+      {
+        $set: {
+          ticketStatus: "failed",
+          receiptStatus: "failed",
+          retryable: false,
+          receiptCheckedAt: new Date(),
+          providerErrorCode: "SendLeaseExpired",
+          providerErrorMessage: "Provider submission outcome was ambiguous after worker interruption"
+        },
+        $unset: { sendLeaseAt: 1, sendLeaseKey: 1, nextReceiptAt: 1 }
+      }
+    );
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const genericPushService = require(path.join(legacyRoot, "utils", "pushNotificationService.js"));
+    if (expiredGenericSendLeases.length) {
+      await genericPushService.refreshPushDeliveryRequests(
+        Array.from(new Set(expiredGenericSendLeases.map((attempt: { requestKey: string }) => attempt.requestKey)))
+      );
+    }
+    await genericPushService.recoverPendingNotificationPushes(200);
+    await genericPushService.recoverInterruptedPushRequests(200);
+    const dueGenericReceipts = await PushDeliveryAttempt.find({
+      ticketStatus: "accepted",
+      receiptStatus: "pending",
+      nextReceiptAt: { $ne: null, $lte: horizon },
+      $or: [{ receiptLeaseAt: null }, { receiptLeaseAt: { $lte: staleLease } }]
+    }).select("_id nextReceiptAt").sort({ nextReceiptAt: 1, _id: 1 }).limit(3000).lean();
+    const retryableGenericSends = await PushDeliveryAttempt.find({
+      ticketStatus: { $in: ["queued", "failed"] },
+      retryable: true,
+      sendAttempts: { $lt: Math.max(1, Number(process.env.EXPO_GENERIC_PUSH_SEND_MAX_ATTEMPTS || 5)) },
+      $and: [
+        { $or: [{ nextSendAt: null }, { nextSendAt: { $lte: horizon } }] },
+        { $or: [{ sendLeaseAt: null }, { sendLeaseAt: { $lte: staleLease } }] }
+      ]
+    }).select("_id nextSendAt").sort({ nextSendAt: 1, _id: 1 }).limit(3000).lean();
+    for (let index = 0; index < retryableGenericSends.length; index += 300) {
+      const retryBatch = retryableGenericSends.slice(index, index + 300);
+      const runAt = retryBatch.reduce((latest: Date, attempt: { nextSendAt?: Date }) => {
+        const date = attempt.nextSendAt ? new Date(attempt.nextSendAt) : new Date();
+        return date > latest ? date : latest;
+      }, new Date());
+      await enqueuePushSend(
+        retryBatch.map((attempt: { _id: unknown }) => String(attempt._id)),
+        runAt,
+        `recovery-${Math.floor(Date.now() / 60000)}-${index / 300}`
+      );
+    }
+    for (let index = 0; index < dueGenericReceipts.length; index += 300) {
+      const receiptBatch = dueGenericReceipts.slice(index, index + 300);
+      const runAt = receiptBatch.reduce((latest: Date, receipt: { nextReceiptAt?: Date }) => {
+        const date = receipt.nextReceiptAt ? new Date(receipt.nextReceiptAt) : new Date();
+        return date > latest ? date : latest;
+      }, new Date());
+      await enqueuePushReceipts(
+        receiptBatch.map((receipt: { _id: unknown }) => String(receipt._id)),
+        runAt,
+        `recovery-${Math.floor(Date.now() / 60000)}-${index / 300}`
+      );
+    }
     const scheduled = await Broadcast.find({
       $or: [
         { status: "queued" },

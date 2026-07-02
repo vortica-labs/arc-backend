@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { randomUUID } = require('crypto');
 
 const notificationSchema = new mongoose.Schema({
   recipient: {
@@ -93,7 +94,19 @@ const notificationSchema = new mongoose.Schema({
   },
   readAt: Date,
   archivedAt: { type: Date, default: null },
-  deletedAt: { type: Date, default: null }
+  deletedAt: { type: Date, default: null },
+  pushDeliveryState: {
+    type: String,
+    enum: ['not_requested', 'pending', 'processing', 'completed', 'failed'],
+    default: 'not_requested',
+    select: false
+  },
+  pushDeliveryAttempts: { type: Number, default: 0, min: 0, select: false },
+  pushDeliveryNextAttemptAt: { type: Date, default: null, select: false },
+  pushDeliveryLeaseAt: { type: Date, default: null, select: false },
+  pushDeliveryLeaseKey: { type: String, default: '', maxlength: 120, select: false },
+  pushDeliveryLastError: { type: String, default: '', maxlength: 1000, select: false },
+  pushDeliveryCompletedAt: { type: Date, default: null, select: false }
 }, {
   timestamps: true
 });
@@ -105,11 +118,76 @@ notificationSchema.index({ recipient: 1, deletedAt: 1, archivedAt: 1, createdAt:
 notificationSchema.index({ type: 1, createdAt: -1 });
 notificationSchema.index({ broadcastRecipient: 1 }, { unique: true, sparse: true });
 notificationSchema.index({ 'data.broadcastId': 1, createdAt: -1 });
+notificationSchema.index({ pushDeliveryState: 1, pushDeliveryNextAttemptAt: 1, pushDeliveryLeaseAt: 1 });
+notificationSchema.index(
+  { recipient: 1, 'data.customData.notificationDedupeKey': 1 },
+  {
+    unique: true,
+    partialFilterExpression: { 'data.customData.notificationDedupeKey': { $type: 'string' } }
+  }
+);
+notificationSchema.index(
+  { recipient: 1, 'data.customData.notificationCoalesceKey': 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      'data.customData.notificationCoalesceKey': { $type: 'string' },
+      isRead: false,
+      deletedAt: null,
+      archivedAt: null
+    }
+  }
+);
+
+notificationSchema.statics.claimPushDelivery = function(notificationId, leaseKey = `notification-outbox-${randomUUID()}`) {
+  return this.findOneAndUpdate(
+    {
+      _id: notificationId,
+      pushDeliveryState: 'pending',
+      $or: [{ pushDeliveryNextAttemptAt: null }, { pushDeliveryNextAttemptAt: { $lte: new Date() } }]
+    },
+    {
+      $set: { pushDeliveryState: 'processing', pushDeliveryLeaseAt: new Date(), pushDeliveryLeaseKey: leaseKey },
+      $inc: { pushDeliveryAttempts: 1 },
+      $unset: { pushDeliveryNextAttemptAt: 1 }
+    },
+    { new: true }
+  ).select('+pushDeliveryAttempts +pushDeliveryLeaseKey');
+};
+
+notificationSchema.statics.completePushDelivery = function(notificationId, leaseKey) {
+  return this.updateOne(
+    { _id: notificationId, pushDeliveryLeaseKey: leaseKey },
+    {
+      $set: { pushDeliveryState: 'completed', pushDeliveryCompletedAt: new Date(), pushDeliveryLastError: '' },
+      $unset: { pushDeliveryNextAttemptAt: 1, pushDeliveryLeaseAt: 1, pushDeliveryLeaseKey: 1 }
+    }
+  );
+};
+
+notificationSchema.statics.retryPushDelivery = function(notificationId, leaseKey, error, delayMs = 10000) {
+  return this.updateOne(
+    { _id: notificationId, pushDeliveryLeaseKey: leaseKey },
+    {
+      $set: {
+        pushDeliveryState: 'pending',
+        pushDeliveryNextAttemptAt: new Date(Date.now() + delayMs),
+        pushDeliveryLastError: String(error?.message || error).slice(0, 1000)
+      },
+      $unset: { pushDeliveryLeaseAt: 1, pushDeliveryLeaseKey: 1 }
+    }
+  );
+};
 
 // Static method to create notification
 notificationSchema.statics.createNotification = async function(data) {
   try {
-    const notification = new this(data);
+    const pushRequested = data.sendPush !== false || data.pushDeliveryState === 'pending';
+    const notification = new this({
+      ...data,
+      pushDeliveryState: pushRequested ? 'pending' : 'not_requested',
+      pushDeliveryNextAttemptAt: pushRequested ? new Date() : null
+    });
     await notification.save();
     
     // Populate sender info for real-time sending
@@ -122,20 +200,29 @@ notificationSchema.statics.createNotification = async function(data) {
     }
 
     if (data.sendPush !== false) {
+      const leaseKey = `notification-outbox-${randomUUID()}`;
       try {
+        const claimed = await this.claimPushDelivery(notification._id, leaseKey);
+        if (!claimed) return notification;
         const { sendPushNotification } = require('../utils/pushNotificationService');
-        sendPushNotification(notification.recipient, notification).catch((pushError) => {
-          console.error('Push notification delivery failed:', pushError.message);
-        });
+        // Persist/claim the durable delivery attempt before returning from the
+        // notification write. Provider failures remain isolated from the
+        // in-app record, but a process exit cannot silently lose the push.
+        await sendPushNotification(notification.recipient, claimed);
+        await this.completePushDelivery(notification._id, leaseKey);
       } catch (pushError) {
-        console.error('Could not enqueue push notification:', pushError.message);
+        await this.retryPushDelivery(notification._id, leaseKey, pushError).catch(() => undefined);
+        console.error('Could not persist or enqueue push notification:', pushError.message);
       }
     }
     
     return notification;
   } catch (error) {
     console.error('Error in createNotification:', error);
-    throw new Error(`Failed to create notification: ${error.message}`);
+    const wrapped = new Error(`Failed to create notification: ${error.message}`);
+    wrapped.code = error.code;
+    wrapped.cause = error;
+    throw wrapped;
   }
 };
 

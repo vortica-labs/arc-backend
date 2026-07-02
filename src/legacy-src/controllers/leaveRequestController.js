@@ -1,7 +1,6 @@
 const User = require('../models/User');
 const LeaveRequest = require('../models/LeaveRequest');
-const Notification = require('../models/Notification');
-const { emitNotification, emitNotificationToMultiple } = require('../utils/notificationEmitter');
+const { createAndEmitNotification } = require('../utils/notificationEmitter');
 const log = require('../utils/logger');
 
 // Create leave request
@@ -62,28 +61,31 @@ const createLeaveRequest = async (req, res) => {
     await team.save();
 
     // Send notification to team owner and other admins
-    const notification = {
-      type: 'leave_request',
-      title: 'Staff Leave Request',
-      message: `${req.user.profile.displayName} has requested to leave the team`,
-      data: {
-        leaveRequestId: leaveRequest._id,
-        staffMemberId: staffMemberId,
-        staffMemberName: req.user.profile.displayName,
-        teamId: teamId,
-        teamName: team.profile.displayName,
-        reason: reason
-      }
-    };
-
     // Get team owner and other active staff members
     const teamOwnerId = team._id;
     const otherStaffIds = team.teamInfo.staff
       .filter(staff => staff.isActive && staff.user.toString() !== staffMemberId.toString())
       .map(staff => staff.user);
 
-    const recipients = [teamOwnerId, ...otherStaffIds];
-    emitNotificationToMultiple(recipients, notification);
+    const recipients = Array.from(new Set([teamOwnerId, ...otherStaffIds].map(String)));
+    await Promise.all(recipients.map((recipient) => createAndEmitNotification({
+      recipient,
+      sender: staffMemberId,
+      type: 'system',
+      title: 'Staff Leave Request',
+      message: `${req.user.profile?.displayName || req.user.username} has requested to leave the team`,
+      data: {
+        customData: {
+          eventType: 'leave_request_created',
+          leaveRequestId: leaveRequest._id,
+          staffMemberId,
+          staffMemberName: req.user.profile?.displayName || req.user.username,
+          teamId,
+          teamName: team.profile?.displayName || team.username,
+          reason: reason || ''
+        }
+      }
+    })));
 
     res.status(201).json({
       success: true,
@@ -319,31 +321,21 @@ const respondToLeaveRequest = async (req, res) => {
     }
 
     // Send notification to player/staff member
-    const Notification = require('../models/Notification');
-    await Notification.createNotification({
+    await createAndEmitNotification({
       recipient: playerId,
       sender: adminId,
       type: 'system',
       title: `Leave Request ${action === 'approve' ? 'Approved' : 'Rejected'}`,
       message: `Your leave request from ${team.profile?.displayName || team.username} has been ${action === 'approve' ? 'approved' : 'rejected'}`,
       data: {
-        leaveRequestId: leaveRequest._id,
-        teamId: teamId,
-        status: leaveRequest.status,
-        adminResponse: adminResponse
-      }
-    });
-
-    emitNotification(playerId, {
-      type: 'leave_request_response',
-      title: `Leave Request ${action === 'approve' ? 'Approved' : 'Rejected'}`,
-      message: `Your leave request has been ${action === 'approve' ? 'approved' : 'rejected'}`,
-      data: {
-        leaveRequestId: leaveRequest._id,
-        teamId: teamId,
-        teamName: team.profile?.displayName || team.username,
-        status: leaveRequest.status,
-        adminResponse: adminResponse
+        customData: {
+          eventType: 'leave_request_response',
+          leaveRequestId: leaveRequest._id,
+          teamId,
+          teamName: team.profile?.displayName || team.username,
+          status: leaveRequest.status,
+          adminResponse: adminResponse || ''
+        }
       }
     });
 

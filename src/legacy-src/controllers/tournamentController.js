@@ -1,8 +1,8 @@
 const Tournament = require('../models/Tournament');
 const User = require('../models/User');
-const Notification = require('../models/Notification');
 const TournamentHostActiveLock = require('../models/TournamentHostActiveLock');
-const { emitNotification } = require('../utils/notificationEmitter');
+const { createAndEmitNotification } = require('../utils/notificationEmitter');
+const { enqueueBulkNotifications } = require('../utils/jobQueue');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
@@ -10,6 +10,43 @@ const crypto = require('crypto');
 const log = require('../utils/logger');
 const { normalizeQuerySearch, buildPrefixRegex } = require('../utils/searchQuery');
 const { getRedisClient } = require('../utils/redisCache');
+
+const uniqueNotificationRecipients = (values = []) =>
+  Array.from(new Set(values.map((value) => String(value?._id || value)).filter(Boolean)));
+
+const notifyTournamentRecipients = async ({ tournament, recipients, sender, title, message, eventType, revision, extraData = {} }) => {
+  const recipientIds = uniqueNotificationRecipients(recipients);
+  if (recipientIds.length === 0) return [];
+  const dedupeKey = `tournament:${tournament._id}:${eventType}:${String(revision || tournament.updatedAt || '').slice(0, 80)}`;
+  const results = await Promise.allSettled(recipientIds.map((recipient) => createAndEmitNotification({
+    recipient,
+    sender,
+    type: 'tournament',
+    title,
+    message,
+    data: {
+      tournamentId: tournament._id,
+      deepLink: `/tournament/${tournament._id}`,
+      customData: {
+        eventType,
+        notificationDedupeKey: dedupeKey,
+        pushRequestId: dedupeKey,
+        ...extraData
+      }
+    }
+  })));
+  results.forEach((result, index) => {
+    if (result.status === 'rejected') {
+      log.error('Tournament lifecycle notification failed', {
+        error: String(result.reason),
+        recipientId: recipientIds[index],
+        tournamentId: String(tournament._id),
+        eventType
+      });
+    }
+  });
+  return results;
+};
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
@@ -1443,10 +1480,10 @@ const joinTournament = async (req, res) => {
     }
 
     // Send notification to host
-    const notification = await Notification.createNotification({
+    await createAndEmitNotification({
       recipient: tournament.host,
       sender: userId,
-      type: 'system',
+      type: 'tournament',
       title: 'New Tournament Registration',
       message: `${req.user.username} has joined your tournament "${tournament.name}"`,
       data: {
@@ -1454,9 +1491,6 @@ const joinTournament = async (req, res) => {
         customData: { action: 'tournament_join' }
       }
     });
-    
-    // Emit real-time notification
-    emitNotification(tournament.host, notification);
 
     res.status(200).json({
       success: true,
@@ -1513,6 +1547,19 @@ const leaveTournament = async (req, res) => {
       } catch (historyErr) {
         log.error('[leaveTournament] Failed to remove direct team history entries:', { error: String(historyErr) });
       }
+    }
+
+    if (String(tournament.host) !== String(userId)) {
+      await notifyTournamentRecipients({
+        tournament,
+        recipients: [tournament.host],
+        sender: userId,
+        title: 'Tournament Registration Withdrawn',
+        message: `${req.user.profile?.displayName || req.user.username} left "${tournament.name}"`,
+        eventType: 'tournament_registration_left',
+        revision: tournament.updatedAt,
+        extraData: { participantId: userId }
+      });
     }
 
     res.status(200).json({
@@ -1605,6 +1652,19 @@ const leaveTournamentAsTeam = async (req, res) => {
       await removeHistoryEntriesForTeam(tournament._id, teamId);
     } catch (historyErr) {
       log.error('[leaveTournamentAsTeam] Failed to remove history entries:', { error: String(historyErr) });
+    }
+
+    if (String(tournament.host) !== String(teamId)) {
+      await notifyTournamentRecipients({
+        tournament,
+        recipients: [tournament.host],
+        sender: teamId,
+        title: 'Tournament Registration Withdrawn',
+        message: `${team.profile?.displayName || team.username} left "${tournament.name}"`,
+        eventType: 'tournament_registration_left',
+        revision: tournament.updatedAt,
+        extraData: { participantId: teamId }
+      });
     }
 
     res.status(200).json({
@@ -1730,8 +1790,9 @@ const autoAssignGroups = async (req, res) => {
     } else {
       allTournamentParticipants = [...tournament.participants, ...tournament.teams];
     }
+    allTournamentParticipants = uniqueNotificationRecipients(allTournamentParticipants);
     const notificationPromises = allTournamentParticipants.map(async (participantId) => {
-      const notification = await Notification.createNotification({
+      return createAndEmitNotification({
         recipient: participantId,
         sender: req.user._id,
         type: 'tournament',
@@ -1742,10 +1803,6 @@ const autoAssignGroups = async (req, res) => {
           customData: { action: 'groups_assigned' }
         }
       });
-      
-      // Emit real-time notification
-      emitNotification(participantId, notification);
-      return notification;
     });
 
     await Promise.all(notificationPromises);
@@ -1806,10 +1863,10 @@ const sendTournamentMessage = async (req, res) => {
     await tournament.save();
 
     // Send notifications to all participants
-    const allParticipants = [...tournament.participants, ...tournament.teams];
+    const allParticipants = uniqueNotificationRecipients([...tournament.participants, ...tournament.teams]);
     
     const notificationPromises = allParticipants.map(async (participantId) => {
-      const notification = await Notification.createNotification({
+      return createAndEmitNotification({
         recipient: participantId,
         sender: req.user._id,
         type: 'tournament',
@@ -1820,10 +1877,6 @@ const sendTournamentMessage = async (req, res) => {
           customData: { action: 'tournament_message' }
         }
       });
-      
-      // Emit real-time notification
-      emitNotification(participantId, notification);
-      return notification;
     });
 
     await Promise.all(notificationPromises);
@@ -1897,8 +1950,8 @@ const sendGroupMessage = async (req, res) => {
     // Send notifications to group participants
     const group = tournament.groups.find(g => g._id === groupId || g.name === groupId);
     if (group && group.participants) {
-      const notificationPromises = group.participants.map(async (participantId) => {
-        const notification = await Notification.createNotification({
+      const notificationPromises = uniqueNotificationRecipients(group.participants).map(async (participantId) => {
+        return createAndEmitNotification({
           recipient: participantId,
           sender: req.user._id,
           type: 'tournament',
@@ -1910,10 +1963,6 @@ const sendGroupMessage = async (req, res) => {
             customData: { action: 'group_message' }
           }
         });
-        
-        // Emit real-time notification
-        emitNotification(participantId, notification);
-        return notification;
       });
 
       await Promise.all(notificationPromises);
@@ -2110,7 +2159,17 @@ const deleteTournament = async (req, res) => {
     // Host can delete any tournament regardless of status
     // No status restrictions for deletion
 
+    const recipients = uniqueNotificationRecipients([...tournament.participants, ...tournament.teams]);
     await Tournament.findByIdAndDelete(req.params.id);
+    await notifyTournamentRecipients({
+      tournament,
+      recipients,
+      sender: req.user._id,
+      title: `Tournament Deleted: ${tournament.name}`,
+      message: 'This tournament has been deleted by the host.',
+      eventType: 'tournament_deleted',
+      revision: 'deleted'
+    });
 
     res.status(200).json({
       success: true,
@@ -2157,6 +2216,15 @@ const cancelTournament = async (req, res) => {
     tournament.status = 'Cancelled';
     await tournament.save();
     await releaseHostActiveTournament(tournament.host, tournament._id);
+    await notifyTournamentRecipients({
+      tournament,
+      recipients: [...tournament.participants, ...tournament.teams],
+      sender: req.user._id,
+      title: `Tournament Cancelled: ${tournament.name}`,
+      message: 'This tournament has been cancelled by the host.',
+      eventType: 'tournament_cancelled',
+      revision: 'cancelled'
+    });
 
     res.status(200).json({
       success: true,
@@ -2839,6 +2907,16 @@ const removeParticipant = async (req, res) => {
     });
 
     await tournament.save();
+    await notifyTournamentRecipients({
+      tournament,
+      recipients: [participantId],
+      sender: req.user._id,
+      title: `Removed from ${tournament.name}`,
+      message: 'The host removed you from this tournament.',
+      eventType: 'tournament_participant_removed',
+      revision: tournament.updatedAt,
+      extraData: { participantId }
+    });
 
     res.status(200).json({
       success: true,
@@ -2911,9 +2989,19 @@ const assignParticipantToGroup = async (req, res) => {
 
     // Add participant to the selected group
     group.participants.push(participantId);
-    
+
     await tournament.save();
-    
+    await notifyTournamentRecipients({
+      tournament,
+      recipients: [participantId],
+      sender: req.user._id,
+      title: `Group Assignment: ${tournament.name}`,
+      message: `You were assigned to ${group.name}.`,
+      eventType: 'tournament_group_assigned',
+      revision: tournament.updatedAt,
+      extraData: { participantId, groupId: group._id || group.name, round: group.round || round || 1 }
+    });
+
     res.status(200).json({
       success: true,
       message: 'Participant assigned to group successfully'
@@ -3142,8 +3230,8 @@ const submitGroupResults = async (req, res) => {
     // Send notifications to group participants about results
     const group = tournament.groups.find(g => g._id === groupId || g.name === groupId);
     if (group && group.participants && group.participants.length > 0) {
-      const notificationPromises = group.participants.map(async (participantId) => {
-        const notification = await Notification.createNotification({
+      const notificationPromises = uniqueNotificationRecipients(group.participants).map(async (participantId) => {
+        return createAndEmitNotification({
           recipient: participantId,
           sender: req.user._id,
           type: 'tournament',
@@ -3156,10 +3244,6 @@ const submitGroupResults = async (req, res) => {
             customData: { action: 'results_update' }
           }
         });
-        
-        // Emit real-time notification
-        emitNotification(participantId, notification);
-        return notification;
       });
 
       await Promise.all(notificationPromises);
@@ -3314,8 +3398,8 @@ const broadcastSchedule = async (req, res) => {
 
         // Send notifications to group participants
         if (group.participants && group.participants.length > 0) {
-          const notificationPromises = group.participants.map(async (participantId) => {
-        const notification = await Notification.createNotification({
+          const notificationPromises = uniqueNotificationRecipients(group.participants).map(async (participantId) => {
+        return createAndEmitNotification({
           recipient: participantId,
           sender: req.user._id,
           type: 'tournament',
@@ -3328,10 +3412,6 @@ const broadcastSchedule = async (req, res) => {
             customData: { action: 'schedule_update' }
           }
         });
-            
-            // Emit real-time notification
-            emitNotification(participantId, notification);
-            return notification;
           });
 
           await Promise.all(notificationPromises);
@@ -3437,6 +3517,17 @@ const qualifyTeams = async (req, res) => {
 }
     await tournament.save();
 
+    await notifyTournamentRecipients({
+      tournament,
+      recipients: qualifiedTeams,
+      sender: req.user._id,
+      title: `Qualified: ${tournament.name}`,
+      message: `You qualified from round ${round}.`,
+      eventType: 'tournament_qualified',
+      revision: tournament.updatedAt,
+      extraData: { round: Number(round) }
+    });
+
     res.status(200).json({
       success: true,
       message: 'Teams qualified successfully',
@@ -3531,9 +3622,9 @@ const createNextRoundGroups = async (req, res) => {
     await tournament.save();
 
     // Send notifications to all qualified participants about new round and broadcast channels
-    const allQualifiedParticipants = qualifiedTeams;
+    const allQualifiedParticipants = uniqueNotificationRecipients(qualifiedTeams);
     const notificationPromises = allQualifiedParticipants.map(async (participantId) => {
-      const notification = await Notification.createNotification({
+      return createAndEmitNotification({
         recipient: participantId,
         sender: req.user._id,
         type: 'tournament',
@@ -3545,10 +3636,6 @@ const createNextRoundGroups = async (req, res) => {
           customData: { action: 'new_round_started' }
         }
       });
-      
-      // Emit real-time notification
-      emitNotification(participantId, notification);
-      return notification;
     });
 
     await Promise.all(notificationPromises);
@@ -3938,32 +4025,36 @@ const openRegistration = async (req, res) => {
       });
     }
     
-    // Send notification to all users in batches (prevents OOM at scale)
-    const BATCH_SIZE = 200;
-    const userCursor = User.find({}, '_id').lean().cursor({ batchSize: BATCH_SIZE });
+    // Fan out through the durable, preference-aware bulk producer. A stable
+    // key deduplicates both Notification rows and push attempts if a queue job
+    // retries after partial processing.
+    const BATCH_SIZE = 500;
+    const deliveryKey = `tournament-registration-open:${tournament._id}:${tournament.registrationStartDate.toISOString()}`;
+    const userCursor = User.find({ isActive: { $ne: false } }, '_id').lean().cursor({ batchSize: BATCH_SIZE });
     let batch = [];
     for await (const user of userCursor) {
-      batch.push({
-        insertOne: {
-          document: {
-            recipient: user._id,
-            type: 'tournament',
-            title: 'Registration Opened',
-            message: `Registration opened for "${tournament.name}"! Join now to participate.`,
-            data: { tournamentId: tournament._id },
-            isRead: false,
-            createdAt: new Date(),
-            updatedAt: new Date()
-          }
-        }
-      });
+      batch.push(String(user._id));
       if (batch.length >= BATCH_SIZE) {
-        await Notification.bulkWrite(batch, { ordered: false });
+        await enqueueBulkNotifications(
+          batch,
+          'Registration Opened',
+          `Registration opened for "${tournament.name}"! Join now to participate.`,
+          'tournament',
+          { tournamentId: tournament._id, customData: { action: 'registration_opened' } },
+          deliveryKey
+        );
         batch = [];
       }
     }
     if (batch.length > 0) {
-      await Notification.bulkWrite(batch, { ordered: false });
+      await enqueueBulkNotifications(
+        batch,
+        'Registration Opened',
+        `Registration opened for "${tournament.name}"! Join now to participate.`,
+        'tournament',
+        { tournamentId: tournament._id, customData: { action: 'registration_opened' } },
+        deliveryKey
+      );
     }
     
     res.status(200).json({
@@ -4018,15 +4109,21 @@ const startTournament = async (req, res) => {
     });
     
     // Send notification to all participants
-    const participants = [...tournament.participants, ...tournament.teams];
+    const participants = uniqueNotificationRecipients([...tournament.participants, ...tournament.teams]);
     await Promise.all(participants.map(async (participantId) => {
-      await Notification.create({
+      await createAndEmitNotification({
         recipient: participantId,
+        sender: req.user._id,
         type: 'tournament',
         title: 'Tournament Started',
         message: `Tournament "${tournament.name}" has started! Good luck!`,
         data: {
-          tournamentId: tournament._id
+          tournamentId: tournament._id,
+          customData: {
+            action: 'tournament_started',
+            notificationDedupeKey: `tournament-started:${tournament._id}`,
+            pushRequestId: `tournament-started:${tournament._id}`
+          }
         }
       });
     }));
@@ -4152,6 +4249,16 @@ const generateFinalResult = async (req, res) => {
     } catch (historyErr) {
       log.error('[generateFinalResult] Failed to propagate results to player history:', { error: String(historyErr) });
     }
+
+    await notifyTournamentRecipients({
+      tournament,
+      recipients: [...tournament.participants, ...tournament.teams],
+      sender: req.user._id,
+      title: `Final Results: ${tournament.name}`,
+      message: 'The final tournament standings are now available.',
+      eventType: 'tournament_final_results',
+      revision: tournament.finalResult.generatedAt
+    });
 
     res.status(200).json({
       success: true,

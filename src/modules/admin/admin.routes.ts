@@ -5,6 +5,7 @@ import { requireHardcodedAdminAuth } from "./admin-auth.middleware";
 import broadcastRoutes from "./broadcast.routes";
 import broadcastTemplateRoutes from "./broadcast-template.routes";
 import premiumMembershipRoutes from "./premium-membership.routes";
+import pushRoutes from "./push.routes";
 import { premiumMembershipController } from "./premium-membership.legacy-adapters";
 
 const router = Router();
@@ -26,6 +27,7 @@ router.use((_, res, next) => {
 router.use("/broadcasts", broadcastRoutes);
 router.use("/broadcast-templates", broadcastTemplateRoutes);
 router.use("/premium-memberships", premiumMembershipRoutes);
+router.use("/push", pushRoutes);
 
 router.get("/dashboard", auditLog("VIEW_DASHBOARD"), requireAdminPermission("dashboard:read"), adminController.getDashboardStats);
 router.get("/search", auditLog("GLOBAL_SEARCH"), requireAdminPermission("dashboard:read"), adminController.globalSearch);

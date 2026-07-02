@@ -9,6 +9,7 @@ RUN npm ci
 # Copy source & compile TS → JS
 COPY tsconfig.json ./
 COPY src ./src
+COPY scripts ./scripts
 RUN npm run build
 
 # ---------- Stage 2: Production ----------
@@ -37,6 +38,7 @@ COPY --from=build /app/dist ./dist
 # Legacy JS source — copied to src/legacy-src because runtime require paths
 # resolve relative to dist/ going 3 levels up, landing at /app/src/legacy-src/
 COPY --from=build /app/src/legacy-src ./src/legacy-src
+COPY --from=build /app/scripts ./scripts
 
 # Security: drop to non-root
 USER appusr
@@ -44,4 +46,4 @@ USER appusr
 EXPOSE 5001
 
 # Graceful shutdown + heap limits
-CMD ["node", "--max-old-space-size=1536", "dist/server.js"]
+CMD ["node", "--max-old-space-size=1536", "dist/launcher.js"]

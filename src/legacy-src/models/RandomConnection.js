@@ -86,6 +86,13 @@ const randomConnectionSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
+  // Per-user attribution is required for quota enforcement. The legacy
+  // boolean remains for analytics/backward compatibility but cannot tell
+  // whether one or both participants selected a gender preference.
+  genderFilterUserIds: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  }],
   matchQuality: {
     type: String,
     enum: ['exact_tag', 'partial_tag', 'same_game', 'expanded', 'random', 'unknown'],
@@ -105,5 +112,6 @@ randomConnectionSchema.index({ 'participants.userId': 1 });
 randomConnectionSchema.index({ status: 1, expiresAt: 1 });
 randomConnectionSchema.index({ status: 1, timerStartedAt: 1 });
 randomConnectionSchema.index({ 'participants.userId': 1, status: 1, createdAt: -1 });
+randomConnectionSchema.index({ genderFilterUserIds: 1, status: 1, startTime: -1 });
 
 module.exports = mongoose.model('RandomConnection', randomConnectionSchema);

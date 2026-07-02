@@ -1,4 +1,6 @@
 const log = require('./logger');
+const { randomUUID } = require('crypto');
+const { evaluateNotificationEmailPolicy } = require('./notificationChannelPolicy');
 
 let io;
 
@@ -48,6 +50,45 @@ const NOTIFICATION_SETTING_DEFAULTS = {
   mutedBroadcastCategories: []
 };
 
+// Mongoose's Notification.data schema is intentionally narrow. Legacy
+// producers still pass event-specific fields (applicationId, teamId, round,
+// status, etc.) at data's top level; without normalization Mongoose silently
+// drops them and the resulting push cannot deep-link or hydrate its event.
+const PERSISTED_NOTIFICATION_DATA_KEYS = new Set([
+  'postId',
+  'messageId',
+  'tournamentId',
+  'broadcastId',
+  'deliveryLogId',
+  'deepLink',
+  'deliveryType',
+  'channels',
+  'targetPlatforms',
+  'targetAppVersions',
+  'bannerImage',
+  'thumbnail',
+  'cta'
+]);
+
+const normalizeNotificationPayload = (notificationData = {}) => {
+  const rawData = notificationData?.data && typeof notificationData.data === 'object'
+    ? notificationData.data
+    : {};
+  const normalizedData = {};
+  const customData = rawData.customData && typeof rawData.customData === 'object' && !Array.isArray(rawData.customData)
+    ? { ...rawData.customData }
+    : {};
+
+  Object.entries(rawData).forEach(([key, value]) => {
+    if (key === 'customData') return;
+    if (PERSISTED_NOTIFICATION_DATA_KEYS.has(key)) normalizedData[key] = value;
+    else customData[key] = value;
+  });
+  if (Object.keys(customData).length > 0) normalizedData.customData = customData;
+
+  return { ...notificationData, data: normalizedData };
+};
+
 const getPreferenceKeyForNotification = (notificationData) => {
   switch (notificationData?.type) {
     case 'like':
@@ -77,38 +118,137 @@ const getPreferenceKeyForNotification = (notificationData) => {
   }
 };
 
-const shouldDeliverNotification = async (notificationData) => {
+const resolveNotificationChannels = (notificationData, notificationSettings = {}) => {
   const preferenceKey = getPreferenceKeyForNotification(notificationData);
+  const settings = { ...NOTIFICATION_SETTING_DEFAULTS, ...(notificationSettings || {}) };
+  const categoryAllowed = !preferenceKey || settings[preferenceKey] !== false;
+  return {
+    preferenceKey,
+    categoryAllowed,
+    inApp: notificationData?.sendInApp !== false && settings.inAppEnabled !== false && categoryAllowed,
+    push: notificationData?.sendPush !== false && settings.pushEnabled !== false && categoryAllowed
+  };
+};
+
+const getRecipientDeliveryContext = async (notificationData) => {
   const User = require('../models/User');
-  const user = await User.findById(notificationData.recipient).select('notificationSettings').lean();
-  const settings = { ...NOTIFICATION_SETTING_DEFAULTS, ...(user?.notificationSettings || {}) };
-  return settings.inAppEnabled !== false && (!preferenceKey || settings[preferenceKey] !== false);
+  const user = await User.findById(notificationData.recipient)
+    .select('email notificationSettings isActive')
+    .lean();
+  if (!user || user.isActive === false) {
+    return {
+      user,
+      channels: { preferenceKey: getPreferenceKeyForNotification(notificationData), categoryAllowed: false, inApp: false, push: false }
+    };
+  }
+  return {
+    user,
+    channels: resolveNotificationChannels(notificationData, user?.notificationSettings)
+  };
 };
 
 const createAndEmitNotification = async (notificationData) => {
   try {
-    const allowed = await shouldDeliverNotification(notificationData).catch(() => true);
-    if (!allowed) return null;
+    const normalizedNotificationData = normalizeNotificationPayload(notificationData);
+    // Preference lookup is a delivery precondition. Failing open here would
+    // bypass an explicit opt-out whenever the user lookup has a transient
+    // failure, so surface the error to the producer instead.
+    const delivery = await getRecipientDeliveryContext(normalizedNotificationData);
+    const { user, channels } = delivery;
+    const emailPolicy = evaluateNotificationEmailPolicy(normalizedNotificationData);
+    let notification = null;
 
-    const Notification = require('../models/Notification');
-    const notification = await Notification.createNotification(notificationData);
-    
-    // Emit real-time notification
-    emitNotification(notification.recipient, notification);
-    
-    // Send email via background job queue (non-blocking)
-    if (process.env.SMTP_USER && process.env.SMTP_PASS) {
-      const { enqueueEmail } = require('./jobQueue');
-      const User = require('../models/User');
-      User.findById(notificationData.recipient).select('email').lean().then((recipient) => {
-        if (recipient?.email) {
-          const link = process.env.CLIENT_URL ? `${process.env.CLIENT_URL}/notifications` : '';
-          enqueueEmail(recipient.email, notificationData.title, notificationData.message, link).catch(() => {});
+    if (channels.inApp || channels.push) {
+      const Notification = require('../models/Notification');
+      const dedupeKey = String(normalizedNotificationData?.data?.customData?.notificationDedupeKey || '').trim().slice(0, 250);
+      if (dedupeKey) {
+        notification = await Notification.findOne({
+          recipient: normalizedNotificationData.recipient,
+          'data.customData.notificationDedupeKey': dedupeKey
+        });
+      }
+      let created = false;
+      if (!notification) {
+        try {
+          notification = await Notification.createNotification({
+            ...normalizedNotificationData,
+            sendPush: false,
+            pushDeliveryState: channels.push ? 'pending' : 'not_requested',
+            ...(!channels.inApp ? {
+              isRead: true,
+              readAt: new Date(),
+              archivedAt: new Date(),
+              deletedAt: new Date()
+            } : {})
+          });
+          created = true;
+        } catch (error) {
+          if (dedupeKey && error?.code === 11000) {
+            notification = await Notification.findOne({
+              recipient: normalizedNotificationData.recipient,
+              'data.customData.notificationDedupeKey': dedupeKey
+            });
+          } else {
+            throw error;
+          }
         }
-      }).catch(() => {});
+      }
+      if (created && notification && channels.inApp) emitNotification(notification.recipient, notification);
+    }
+
+    if (channels.push) {
+      const leaseKey = `notification-outbox-${randomUUID()}`;
+      try {
+        const { sendPushNotification } = require('./pushNotificationService');
+        let deliveryNotification = normalizedNotificationData;
+        if (notification) {
+          const Notification = require('../models/Notification');
+          deliveryNotification = await Notification.claimPushDelivery(notification._id, leaseKey);
+        }
+        if (deliveryNotification) {
+          await sendPushNotification(
+            normalizedNotificationData.recipient,
+            deliveryNotification
+          );
+          if (notification) {
+            const Notification = require('../models/Notification');
+            await Notification.completePushDelivery(notification._id, leaseKey);
+          }
+        }
+      } catch (pushError) {
+        if (notification) {
+          const Notification = require('../models/Notification');
+          await Notification.retryPushDelivery(notification._id, leaseKey, pushError).catch(() => undefined);
+        }
+        log.error('Push notification delivery failed', { error: String(pushError) });
+      }
+    }
+
+    // Email is opt-in and independently policy-gated. Routine engagement
+    // notifications are structurally blocked before reaching the queue.
+    if (emailPolicy.allowed && user?.email && process.env.SMTP_USER && process.env.SMTP_PASS) {
+      try {
+        const { enqueueEmail } = require('./jobQueue');
+        const link = process.env.CLIENT_URL ? `${process.env.CLIENT_URL}/notifications` : '';
+        await enqueueEmail(
+          user.email,
+          notificationData.title,
+          notificationData.message,
+          link,
+          {
+            intent: emailPolicy.intent,
+            eventType: normalizedNotificationData.email?.eventType || normalizedNotificationData.emailEventType,
+            notificationType: normalizedNotificationData.type,
+            broadcastId: normalizedNotificationData.data?.broadcastId || normalizedNotificationData.data?.customData?.broadcastId,
+            broadcastRecipientId: normalizedNotificationData.data?.deliveryLogId || normalizedNotificationData.data?.customData?.broadcastRecipientId
+          }
+        );
+      } catch (emailError) {
+        log.error('Notification email enqueue failed', { error: String(emailError), intent: emailPolicy.intent });
+      }
     }
     
-    return notification;
+    return notification || (channels.push ? normalizedNotificationData : null);
   } catch (error) {
     log.error('Notification emit error', { error: String(error) });
     throw error;
@@ -133,5 +273,9 @@ module.exports = {
   emitBroadcastNotification,
   emitBroadcastPushNotification,
   emitNotificationToMultiple,
-  createAndEmitNotification
+  createAndEmitNotification,
+  getPreferenceKeyForNotification,
+  resolveNotificationChannels,
+  getRecipientDeliveryContext,
+  normalizeNotificationPayload
 };

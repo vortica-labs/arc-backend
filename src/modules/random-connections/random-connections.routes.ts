@@ -2,7 +2,6 @@ import { Router, Request, Response } from "express";
 import { body } from "express-validator";
 import {
   randomConnectController,
-  randomConnectionControllerNew,
   protect,
   authorize,
   ConnectionQueue,
@@ -34,6 +33,10 @@ router.get("/queue-status", protect, async (_req: Request, res: Response) => {
 
 // All routes require authentication except test endpoints
 router.use(protect);
+// Every authenticated account can read the canonical capability contract;
+// disabled account types receive enabled:false instead of a generic role 403.
+router.get("/entitlements", randomConnectController.getRandomConnectEntitlements);
+router.get("/daily-gender-matches-remaining", randomConnectController.getDailyGenderMatchesRemaining);
 // Random Connect is for players only
 router.use(authorize("player"));
 
@@ -92,17 +95,17 @@ router.post("/join-queue", protect, joinQueueValidation, randomConnectController
 router.delete("/leave-queue", protect, randomConnectController.leaveQueue);
 router.get("/current-connection", protect, randomConnectController.getCurrentConnection);
 router.get("/active-sessions", protect, randomConnectController.getActiveSessions);
-router.get("/daily-gender-matches-remaining", protect, randomConnectController.getDailyGenderMatchesRemaining);
 router.post("/disconnect", protect, disconnectValidation, randomConnectController.disconnectConnection);
 router.post("/next", protect, nextMatchValidation, randomConnectController.nextConnection);
 router.post("/send-message", protect, sendMessageValidation, randomConnectController.sendMessage);
 router.post("/cleanup-current", protect, randomConnectController.cleanupCurrentConnection);
 
-// New random connections (v2)
-router.post("/v2/join-queue", randomConnectionControllerNew.joinQueue);
-router.delete("/v2/leave-queue", randomConnectionControllerNew.leaveQueue);
-router.get("/v2/current-connection", randomConnectionControllerNew.getCurrentConnection);
-router.post("/v2/disconnect", randomConnectionControllerNew.disconnectConnection);
-router.post("/v2/cleanup-current", randomConnectionControllerNew.cleanupCurrentConnection);
+// Backward-compatible v2 aliases use the same hardened implementation. The
+// former v2 controller bypassed canonical entitlement, admission and quota.
+router.post("/v2/join-queue", joinQueueValidation, randomConnectController.joinQueue);
+router.delete("/v2/leave-queue", randomConnectController.leaveQueue);
+router.get("/v2/current-connection", randomConnectController.getCurrentConnection);
+router.post("/v2/disconnect", disconnectValidation, randomConnectController.disconnectConnection);
+router.post("/v2/cleanup-current", randomConnectController.cleanupCurrentConnection);
 
 export default router;

@@ -5,9 +5,11 @@ const {
     sanitizePreferredGender,
     isPremiumUser,
     buildSessionPolicy,
-    scoreCandidate
+    scoreCandidate,
+    buildGenderFilterUserIds
   }
 } = require('./randomConnectController');
+const RandomConnection = require('../models/RandomConnection');
 
 const id = (value) => ({ toString: () => value });
 
@@ -44,6 +46,26 @@ assert.deepStrictEqual(buildSessionPolicy(premiumUser, freeUser), {
   durationLimitSeconds: null,
   limitReason: 'premium_unlimited'
 });
+
+const filteredUser = id('filter-user');
+const unfilteredUser = id('no-filter-user');
+const alsoFilteredUser = id('also-filter-user');
+assert.deepStrictEqual(
+  buildGenderFilterUserIds(
+    { userId: filteredUser, preferredGender: 'female' },
+    { userId: unfilteredUser, preferredGender: '' },
+    { userId: alsoFilteredUser, preferredGender: 'male' },
+    { userId: filteredUser, preferredGender: 'female' }
+  ),
+  [filteredUser, alsoFilteredUser],
+  'quota attribution must include only users who selected a gender filter and deduplicate them'
+);
+
+const randomConnectionIndexes = RandomConnection.schema.indexes();
+assert(
+  randomConnectionIndexes.some(([fields]) => fields.genderFilterUserIds === 1 && fields.status === 1 && fields.startTime === -1),
+  'RandomConnection must index per-user gender-filter quota lookups'
+);
 
 const currentEntry = {
   userId: id('u1'),

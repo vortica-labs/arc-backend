@@ -1,4 +1,6 @@
 const nodemailer = require('nodemailer');
+const log = require('./logger');
+const { EMAIL_INTENTS, evaluateEmailPolicy } = require('./notificationChannelPolicy');
 
 let transporter = null;
 
@@ -25,7 +27,17 @@ function getTransporter() {
 /**
  * Send a generic email
  */
-async function sendMail({ to, subject, text, html }) {
+async function sendMail({ to, subject, text, html, intent, eventType, notificationType }) {
+  const policy = evaluateEmailPolicy({ intent, eventType, notificationType });
+  if (!policy.allowed) {
+    log.info('Email suppressed by channel policy', {
+      intent: policy.intent || 'missing',
+      eventType: eventType || notificationType || '',
+      reason: policy.reason,
+      routineEventType: policy.routineEventType || ''
+    });
+    return { sent: false, blocked: true, reason: policy.reason };
+  }
   const trans = getTransporter();
   if (!trans) return { sent: false, error: 'Email not configured' };
   try {
@@ -42,6 +54,10 @@ async function sendMail({ to, subject, text, html }) {
     console.error('Send mail error:', err);
     return { sent: false, error: err.message };
   }
+}
+
+async function sendTransactionalEmail({ to, subject, text, html, intent, eventType, notificationType }) {
+  return sendMail({ to, subject, text, html, intent, eventType, notificationType });
 }
 
 /**
@@ -118,30 +134,66 @@ async function sendOTPEmail(to, otp, purpose = 'login') {
     </div>
   `;
 
-  return sendMail({ to, subject, text, html });
+  return sendTransactionalEmail({
+    to,
+    subject,
+    text,
+    html,
+    intent: EMAIL_INTENTS.SECURITY,
+    eventType: `otp_${purpose}`
+  });
 }
 
 /**
- * Send notification email (e.g. new like, comment, follow)
+ * Send a policy-approved notification-shaped transactional email.
  */
-async function sendNotificationEmail(to, title, message, link) {
+const escapeHtml = (value) => String(value ?? '')
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&#39;');
+
+const sanitizeEmailLink = (value) => {
+  if (typeof value !== 'string' || !value.trim()) return '';
+  try {
+    const url = new URL(value.trim());
+    return ['http:', 'https:'].includes(url.protocol) ? url.toString() : '';
+  } catch {
+    return '';
+  }
+};
+
+async function sendNotificationEmail(to, title, message, link, context = {}) {
   const subject = `ARC: ${title}`;
-  const text = `${title}\n\n${message}${link ? `\n\nView: ${link}` : ''}`;
+  const safeLink = sanitizeEmailLink(link);
+  const text = `${title}\n\n${message}${safeLink ? `\n\nView: ${safeLink}` : ''}`;
   const html = `
     <div style="font-family: sans-serif;">
-      <h3>${title}</h3>
-      <p>${message}</p>
-      ${link ? `<p><a href="${link}">View</a></p>` : ''}
+      <h3>${escapeHtml(title)}</h3>
+      <p>${escapeHtml(message)}</p>
+      ${safeLink ? `<p><a href="${escapeHtml(safeLink)}">View</a></p>` : ''}
       <p style="margin:8px 0 2px;color: #999; font-size: 12px;">Need help? Email <a href="mailto:support@squadhunt.com" style="color:#9ca3af;text-decoration:none;">support@squadhunt.com</a>.</p>
       <p style="margin:0;color: #999; font-size: 12px;">— ARC</p>
     </div>
   `;
-  return sendMail({ to, subject, text, html });
+  return sendTransactionalEmail({
+    to,
+    subject,
+    text,
+    html,
+    intent: context.intent,
+    eventType: context.eventType,
+    notificationType: context.notificationType
+  });
 }
 
 module.exports = {
   getTransporter,
   sendMail,
+  sendTransactionalEmail,
   sendOTPEmail,
-  sendNotificationEmail
+  sendNotificationEmail,
+  escapeHtml,
+  sanitizeEmailLink
 };

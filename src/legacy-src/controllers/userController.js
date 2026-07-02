@@ -2,11 +2,11 @@ const User = require('../models/User');
 const Post = require('../models/Post');
 const Tournament = require('../models/Tournament');
 const Follow = require('../models/Follow');
-const { createFollowNotification } = require('../utils/notificationService');
+const { createFollowNotification, createMessageNotification } = require('../utils/notificationService');
 const RosterInvite = require('../models/RosterInvite');
 const StaffInvite = require('../models/StaffInvite');
 const LeaveRequest = require('../models/LeaveRequest');
-const { emitNotification, emitNotificationToMultiple } = require('../utils/notificationEmitter');
+const { createAndEmitNotification } = require('../utils/notificationEmitter');
 const { formatUserDTO, formatPostDTO } = require('../utils/dto');
 const { getJson, setJson, del } = require('../utils/redisCache');
 const { invalidateUserCache } = require('../middleware/auth');
@@ -638,8 +638,17 @@ const toggleFollow = async (req, res) => {
         User.updateOne({ _id: targetUserId }, { $addToSet: { followers: currentUserId } })
       ]);
 
-      // Create notification (non-blocking)
-      createFollowNotification(targetUserId, currentUserId).catch(() => {});
+      // Await the canonical producer so the durable push attempt is persisted
+      // before the follow response is acknowledged.
+      try {
+        await createFollowNotification(targetUserId, currentUserId);
+      } catch (notificationError) {
+        log.error('Follow notification delivery failed', {
+          error: String(notificationError),
+          senderId: String(currentUserId),
+          recipientId: String(targetUserId)
+        });
+      }
     }
 
     // Invalidate caches — delete both ObjectId-keyed AND username-keyed entries
@@ -2018,27 +2027,30 @@ const leaveTeam = async (req, res) => {
 }
     // Send notification to team about player leaving
     try {
-      const notification = {
-        type: 'player_left_team',
-        title: 'Player Left Team',
-        message: `${player.profile.displayName} has left your team`,
-        data: {
-          playerId: player._id,
-          playerName: player.profile.displayName,
-          game: game,
-          teamId: team._id,
-          teamName: team.profile.displayName
-        }
-      };
-      
       // Notify team owner and active staff members
       const teamOwnerId = team._id;
       const staffIds = team.teamInfo.staff
         .filter(staff => staff.isActive && staff.user.toString() !== playerId.toString())
         .map(staff => staff.user);
       
-      const recipients = [teamOwnerId, ...staffIds];
-      emitNotificationToMultiple(recipients, notification);
+      const recipients = Array.from(new Set([teamOwnerId, ...staffIds].map(String)));
+      await Promise.all(recipients.map((recipient) => createAndEmitNotification({
+        recipient,
+        sender: player._id,
+        type: 'system',
+        title: 'Player Left Team',
+        message: `${player.profile?.displayName || player.username} has left your team`,
+        data: {
+          customData: {
+            eventType: 'player_left_team',
+            playerId: player._id,
+            playerName: player.profile?.displayName || player.username,
+            game,
+            teamId: team._id,
+            teamName: team.profile?.displayName || team.username
+          }
+        }
+      })));
       
       if (process.env.NODE_ENV === 'development') { console.log('Notification sent to team members about player leaving');}
     } catch (notificationError) {
@@ -2067,7 +2079,6 @@ const clashRoyaleAPI = require('../utils/clashRoyaleAPI');
 const sendInviteMessage = async (teamId, playerId, inviteType, inviteData) => {
   try {
     const { Message } = require('../models/Message');
-    const Notification = require('../models/Notification');
     const team = await User.findById(teamId);
     const player = await User.findById(playerId);
     
@@ -2131,16 +2142,14 @@ const sendInviteMessage = async (teamId, playerId, inviteType, inviteData) => {
       { path: 'recipient', select: 'username profile.displayName profile.avatar' }
     ]);
 
-    // Create a simple notification for the message (not the invite)
-    await Notification.createNotification({
-      recipient: playerId,
-      sender: teamId,
-      type: 'message',
-      title: 'New Message',
-      message: `${team.profile?.displayName || team.username} sent you a message`,
-      data: {
-        messageId: message._id
-      }
+    // Use the same durable, preference-aware path as ordinary direct messages.
+    await createMessageNotification(playerId, teamId, message._id, {
+      conversationId: `direct_${teamId}`,
+      chatId: `direct_${teamId}`,
+      muteKey: teamId,
+      messageKind: 'invite',
+      hasMedia: false,
+      deepLink: `/conversation/direct_${teamId}`
     });
 
     return message;
@@ -2755,8 +2764,7 @@ const sendLeaveRequest = async (req, res) => {
       await team.save();
 
       // Send notification to team owner
-      const Notification = require('../models/Notification');
-      await Notification.createNotification({
+      await createAndEmitNotification({
         recipient: team._id,
         sender: userId,
         type: 'system',
@@ -2764,7 +2772,9 @@ const sendLeaveRequest = async (req, res) => {
         message: `${player.profile?.displayName || player.username} wants to leave as staff member`,
         data: {
           customData: {
+            eventType: 'leave_request_created',
             leaveRequestId: leaveRequest._id,
+            teamId: team._id,
             game: 'Staff',
             reason: leaveReason
           }
@@ -2843,8 +2853,7 @@ const sendLeaveRequest = async (req, res) => {
     await leaveRequest.save();
 
     // Send notification to team owner
-    const Notification = require('../models/Notification');
-    await Notification.createNotification({
+    await createAndEmitNotification({
       recipient: team._id,
       sender: userId,
       type: 'system',
@@ -2852,9 +2861,11 @@ const sendLeaveRequest = async (req, res) => {
       message: `${player.profile?.displayName || player.username} wants to leave the ${game} roster`,
       data: {
         customData: {
-        leaveRequestId: leaveRequest._id,
-        game,
-        reason: leaveReason
+          eventType: 'leave_request_created',
+          leaveRequestId: leaveRequest._id,
+          teamId: team._id,
+          game,
+          reason: leaveReason
         }
       }
     });
@@ -3098,12 +3109,9 @@ const approveLeaveRequest = async (req, res) => {
     }
 
     // Send notification to player
-    const Notification = require('../models/Notification');
-    const { emitNotification } = require('../utils/notificationEmitter');
-    
     const playerIdForNotif = leaveRequest.player._id ? leaveRequest.player._id.toString() : leaveRequest.player.toString();
-    
-    await Notification.createNotification({
+
+    await createAndEmitNotification({
       recipient: playerIdForNotif,
       sender: userId,
       type: 'system',
@@ -3111,21 +3119,12 @@ const approveLeaveRequest = async (req, res) => {
       message: `Your leave request from ${team.profile?.displayName || team.username} has been approved`,
       data: {
         customData: {
+          eventType: 'leave_request_response',
+          leaveRequestId: leaveRequest._id,
           teamId: team._id,
-          game: leaveRequest.game
+          game: leaveRequest.game,
+          status: 'approved'
         }
-      }
-    });
-    
-    // Emit real-time notification
-    emitNotification(playerIdForNotif, {
-      type: 'leave_request_response',
-      title: 'Leave Request Approved',
-      message: `Your leave request from ${team.profile?.displayName || team.username} has been approved`,
-      data: {
-        leaveRequestId: leaveRequest._id,
-        teamId: team._id,
-        game: leaveRequest.game
       }
     });
 
@@ -3184,32 +3183,21 @@ const rejectLeaveRequest = async (req, res) => {
     await leaveRequest.save();
 
     // Send notification to player
-    const Notification = require('../models/Notification');
-    const { emitNotification } = require('../utils/notificationEmitter');
-    
-    await Notification.createNotification({
+    await createAndEmitNotification({
       recipient: leaveRequest.player._id,
       sender: userId,
       type: 'system',
       title: 'Leave Request Rejected',
       message: `Your leave request from ${leaveRequest.team.profile?.displayName || leaveRequest.team.username} has been rejected`,
       data: {
-        teamId: leaveRequest.team._id,
-        game: leaveRequest.game,
-        reviewNotes: reviewNotes || ''
-      }
-    });
-    
-    // Emit real-time notification
-    emitNotification(leaveRequest.player._id, {
-      type: 'leave_request_response',
-      title: 'Leave Request Rejected',
-      message: `Your leave request from ${leaveRequest.team.profile?.displayName || leaveRequest.team.username} has been rejected`,
-      data: {
-        leaveRequestId: leaveRequest._id,
-        teamId: leaveRequest.team._id,
-        game: leaveRequest.game,
-        reviewNotes: reviewNotes || ''
+        customData: {
+          eventType: 'leave_request_response',
+          leaveRequestId: leaveRequest._id,
+          teamId: leaveRequest.team._id,
+          game: leaveRequest.game,
+          status: 'rejected',
+          reviewNotes: reviewNotes || ''
+        }
       }
     });
 

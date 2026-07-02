@@ -2,13 +2,14 @@ import { createServer } from "http";
 import { createApp } from "./app";
 import { env } from "./config/env";
 import { logger } from "./config/logger";
-import { loadSecretsManagerEnv } from "./config/secrets";
 import { connectMongo } from "./infrastructure/database/mongodb";
 import { connectRedis, disconnectRedis, redisCacheClient } from "./infrastructure/cache/redis";
 import { attachSocketRedisAdapter, createSocketServer } from "./infrastructure/websocket/socket";
 import {
   enqueueEmail,
   enqueueBulkNotifications,
+  enqueuePushReceipts,
+  enqueuePushSend,
   enqueueBroadcast,
   enqueueBroadcastReceipts,
   removeBroadcastJobs,
@@ -29,8 +30,16 @@ const safeRequire = <T>(modulePath: string): T | null => {
 };
 
 const bootstrap = async () => {
-  // Load secrets from AWS Secrets Manager into process.env before anything else
-  await loadSecretsManagerEnv();
+  if (env.NODE_ENV === "production") {
+    const apnsPreflight = safeRequire<{ assertConfigured?: () => unknown }>(
+      path.join(backendRootPath, "services", "apnsVoipPushService.js")
+    );
+    if (!apnsPreflight?.assertConfigured) {
+      throw new Error("APNs VoIP provider preflight is unavailable");
+    }
+    apnsPreflight.assertConfigured();
+    logger.info("Push provider startup preflight passed", { standard: "expo", incomingCalls: "apns_voip" });
+  }
 
   await connectMongo();
   try {
@@ -52,6 +61,8 @@ const bootstrap = async () => {
   jobQueue?.setQueueFunctions?.({
     enqueueEmail,
     enqueueBulkNotifications,
+    enqueuePushReceipts,
+    enqueuePushSend,
     enqueueBroadcast,
     enqueueBroadcastReceipts,
     removeBroadcastJobs
@@ -73,6 +84,17 @@ const bootstrap = async () => {
     path.join(backendControllerPath, "messageController.js")
   );
   messageController?.setIoInstance?.(io);
+
+  const callSessionService = safeRequire<{
+    startCallSessionSweeper?: () => void;
+    stopCallSessionSweeper?: () => void;
+  }>(path.join(backendRootPath, "services", "callSessionService.js"));
+  callSessionService?.startCallSessionSweeper?.();
+  const apnsVoipPushService = safeRequire<{
+    startApnsVoipPushSweeper?: () => void;
+    stopApnsVoipPushSweeper?: () => void;
+  }>(path.join(backendRootPath, "services", "apnsVoipPushService.js"));
+  apnsVoipPushService?.startApnsVoipPushSweeper?.();
 
   startLegacyBackgroundJobs(io);
 
@@ -112,6 +134,8 @@ const bootstrap = async () => {
     // 3. Close BullMQ workers
     try {
       stopBroadcastScheduler();
+      callSessionService?.stopCallSessionSweeper?.();
+      apnsVoipPushService?.stopApnsVoipPushSweeper?.();
       premiumMembershipCron?.stopPremiumMembershipCron?.();
       const { emailWorker, notificationWorker, broadcastWorker } = await import("./infrastructure/jobs/queue");
       await Promise.allSettled([emailWorker.close(), notificationWorker.close(), broadcastWorker.close()]);

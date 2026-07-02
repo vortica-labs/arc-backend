@@ -15,6 +15,16 @@ const setIoInstance = (ioInstance) => {
 const sharedPostSelect = 'content.text content.media author likes comments shares createdAt postType';
 const sharedPostAuthorSelect = 'username profile.displayName profile.avatar profilePicture avatar profileImage avatarUrl userType role';
 
+const getMessageKind = ({ media = [], sharedPost, sharedProfile, replyTo, forwardedFrom, invite }) => {
+  if (invite) return 'invite';
+  if (sharedPost) return 'shared_post';
+  if (sharedProfile) return 'shared_profile';
+  if (forwardedFrom) return 'forwarded';
+  if (replyTo) return 'reply';
+  if (media.length > 0) return 'media';
+  return 'text';
+};
+
 function formatActivityStatus(lastSeen, showActivityStatus) {
   if (!showActivityStatus || !lastSeen) return null;
   const diffMs = Date.now() - new Date(lastSeen).getTime();
@@ -201,11 +211,10 @@ const sendDirectMessage = async (req, res) => {
     // Plain object so nested populated (e.g. sharedPost.author) serializes correctly in JSON/socket
     const messagePojo = message.toObject ? message.toObject() : message;
 
-    // Emit real-time message to recipient
-    let recipientIsOnline = false;
+    // Emit the chat event immediately. Socket connectivity is transport
+    // presence, not proof that a particular conversation is visible on any
+    // device, so notification delivery must not be suppressed by this room.
     if (io) {
-      // Check if recipient has an active socket connection
-      recipientIsOnline = (io.sockets?.adapter?.rooms?.get(`user-${recipientIdResolved}`)?.size || 0) > 0;
       io.to(`user-${recipientIdResolved}`).emit('newMessage', {
         chatId: `direct_${senderId}`,
         message: messagePojo
@@ -215,11 +224,18 @@ const sendDirectMessage = async (req, res) => {
       if (process.env.NODE_ENV === 'development') { console.log('Socket.io not available for real-time messaging');}
     }
 
-    // Only create a DB notification when recipient is offline — avoids notification
-    // bell incrementing for messages the user already saw in real-time.
-    if (!recipientIsOnline) {
-      await createMessageNotification(recipientIdResolved, senderId, message._id);
-    }
+    // Always create/update the durable notification. Active-conversation push
+    // suppression must be installation-scoped; a process-local Socket.IO room
+    // cannot distinguish foreground chat, background app, or another device.
+    await createMessageNotification(recipientIdResolved, senderId, message._id, {
+      conversationId: `direct_${senderId}`,
+      chatId: `direct_${senderId}`,
+      muteKey: senderId,
+      messageKind: getMessageKind({ media: mediaData, sharedPost: sharedPostObj, sharedProfile: sharedProfileObj, replyTo, forwardedFrom }),
+      hasMedia: mediaData.length > 0,
+      primaryMediaType: mediaData[0]?.type,
+      deepLink: `/conversation/direct_${senderId}`
+    });
 
     res.status(201).json({
       success: true,
@@ -901,21 +917,64 @@ const sendGroupMessage = async (req, res) => {
       const senderName = senderUser?.username || 'Someone';
       for (const mentionedId of mentionedUserIds) {
         try {
-          const notification = await Notification.createNotification({
-            recipient: mentionedId,
-            sender: senderId,
-            type: 'mention',
+          await createMessageNotification(mentionedId, senderId, message._id, {
+            conversationId: String(chatRoomId),
+            chatId: String(chatRoomId),
+            muteKey: String(chatRoomId),
+            groupName: chatRoom.name,
             title: 'You were mentioned',
             message: `${senderName} mentioned you in ${chatRoom.name}`,
-            data: { messageId: message._id, customData: { chatRoomId, chatRoomName: chatRoom.name } }
+            messageKind: 'mention',
+            hasMedia: mediaData.length > 0,
+            primaryMediaType: mediaData[0]?.type,
+            deepLink: `/conversation/${chatRoomId}`
           });
-          if (io) {
-            io.to(`user-${mentionedId}`).emit('notification', notification);
-          }
         } catch (notifErr) {
-          console.error('Failed to send mention notification:', notifErr.message);
+          log.error('Failed to deliver group mention notification', {
+            error: String(notifErr),
+            recipientId: String(mentionedId),
+            chatRoomId: String(chatRoomId)
+          });
         }
       }
+    }
+
+    // Ordinary group messages receive the same durable push/in-app fallback as
+    // DMs. Mentioned members already have a higher-signal mention notification.
+    const mentionedIds = new Set(mentionedUserIds.map((id) => String(id)));
+    const groupRecipientIds = Array.from(new Set(chatRoom.members
+      .map((member) => String(member.user))
+      .filter((memberId) => memberId !== String(senderId) && !mentionedIds.has(memberId))));
+    if (groupRecipientIds.length > 0) {
+      const senderName = messagePojo?.sender?.username || req.user?.username || 'Someone';
+      const messageKind = getMessageKind({ media: mediaData, sharedPost: sharedPostObj, replyTo, forwardedFrom });
+      const notificationResults = await Promise.allSettled(groupRecipientIds.map((recipientId) => createMessageNotification(
+        recipientId,
+        senderId,
+        message._id,
+        {
+          conversationId: String(chatRoomId),
+          chatId: String(chatRoomId),
+          muteKey: String(chatRoomId),
+          groupName: chatRoom.name,
+          title: chatRoom.name,
+          message: `${senderName} sent a message in ${chatRoom.name}`,
+          messageKind,
+          hasMedia: mediaData.length > 0,
+          primaryMediaType: mediaData[0]?.type,
+          deepLink: `/conversation/${chatRoomId}`
+        }
+      )));
+      notificationResults.forEach((result, index) => {
+        if (result.status === 'rejected') {
+          log.error('Failed to deliver group message notification', {
+            error: String(result.reason),
+            recipientId: groupRecipientIds[index],
+            chatRoomId: String(chatRoomId),
+            messageId: String(message._id)
+          });
+        }
+      });
     }
 
     // Emit real-time message to all group members
@@ -1897,16 +1956,17 @@ const handleInviteResponse = async (req, res) => {
       { path: 'recipient', select: 'username profile.displayName profile.avatar' }
     ]);
 
-    // Create notification for the team
-    await Notification.createNotification({
-      recipient: message.inviteData.teamId,
-      sender: userId,
-      type: 'message',
+    // Route the automated response through the same mute-aware message
+    // producer as every other direct message.
+    await createMessageNotification(message.inviteData.teamId, userId, responseMsg._id, {
+      conversationId: `direct_${userId}`,
+      chatId: `direct_${userId}`,
+      muteKey: userId,
       title: 'New Message',
       message: `${req.user.profile?.displayName || req.user.username} sent you a message`,
-      data: {
-        messageId: responseMsg._id
-      }
+      messageKind: 'invite_response',
+      hasMedia: false,
+      deepLink: `/conversation/direct_${userId}`
     });
 
     // Update the original invite message to include status
@@ -2685,6 +2745,18 @@ const sendGroupInviteDM = async (req, res) => {
         message: message.toObject ? message.toObject() : message
       });
     }
+
+    await createMessageNotification(targetUserId, callerId, message._id, {
+      conversationId: `direct_${callerId}`,
+      chatId: `direct_${callerId}`,
+      muteKey: callerId,
+      messageKind: 'invite',
+      groupName: chatRoom.name,
+      title: 'Group Invitation',
+      message: `${req.user.profile?.displayName || req.user.username} invited you to ${chatRoom.name}`,
+      hasMedia: false,
+      deepLink: `/conversation/direct_${callerId}`
+    });
 
     return res.status(201).json({ success: true, data: { message } });
   } catch (err) {

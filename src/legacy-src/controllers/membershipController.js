@@ -198,27 +198,32 @@ async function getMembership(req, res) {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
 
-    const membership = user.membership || {
+    const projectedMembership = user.membership || {
       tier: 'free',
       validUntil: null,
       credits: 0
     };
+    const premiumService = require('../services/premiumMembershipService');
+    const { resolvePremiumEntitlement } = require('../services/entitlementService');
+    const canonical = await premiumService.currentForUser(req.user._id).lean();
+    const premiumEntitlement = await resolvePremiumEntitlement({
+      userId: req.user._id,
+      requestSource: 'membership_api'
+    });
 
-    const tier = membership.tier || 'free';
-    const validUntil = membership.validUntil || null;
-    const credits = Math.max(0, Number(membership.credits) || 0);
-
-    const isPro = ['player_pro', 'player_pro_plus', 'team_pro', 'team_org'].includes(tier);
-    // If validUntil is null, treat as never expiring (manual assignment)
-    // If validUntil exists, check if it's expired
-    const isExpired = validUntil ? new Date(validUntil) < new Date() : false;
-    const isActivePro = isPro && !isExpired;
-
+    // PremiumMembership is authoritative once present. The User membership
+    // fields are retained only as a compatibility projection for accounts that
+    // have not yet been backfilled.
+    const isActivePro = premiumEntitlement.isPremium;
+    const tier = premiumEntitlement.plan;
+    const validUntil = premiumEntitlement.validUntil;
+    const credits = isActivePro ? Math.max(0, Number(projectedMembership.credits) || 0) : 0;
+    const isExpired = Boolean(validUntil && new Date(validUntil) <= new Date());
     const currentPlanId = tier;
     const plans = user.userType === 'team' ? TEAM_PLANS : PLAYER_PLANS;
     const benefits = (plans.find(p => p.id === currentPlanId) || plans[0]).features;
-    const premiumService = require('../services/premiumMembershipService');
-    const canonical = await premiumService.currentForUser(req.user._id).lean();
+
+    res.set('Cache-Control', 'private, no-store');
 
     res.status(200).json({
       success: true,
@@ -226,16 +231,17 @@ async function getMembership(req, res) {
         tier,
         validUntil,
         credits,
+        isPremium: isActivePro,
         isActivePro,
         isExpired,
         userType: user.userType,
         currentPlanId,
         benefits,
         membershipId: canonical?._id || null,
-        source: canonical?.source || (isActivePro ? 'legacy' : null),
-        billingPeriod: canonical?.billingPeriod || null,
-        membershipStatus: canonical?.membershipStatus || (isActivePro ? 'active' : 'expired'),
-        subscriptionStatus: canonical?.subscriptionStatus || 'not_applicable',
+        source: premiumEntitlement.source,
+        billingPeriod: premiumEntitlement.subscriptionType === 'legacy' ? null : premiumEntitlement.subscriptionType,
+        membershipStatus: premiumEntitlement.membershipStatus,
+        subscriptionStatus: premiumEntitlement.subscriptionStatus,
         autoRenew: canonical?.autoRenew === true,
         cancelAtCycleEnd: canonical?.cancelAtCycleEnd === true,
         currentPeriodStart: canonical?.currentPeriodStart || null,

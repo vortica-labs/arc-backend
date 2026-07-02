@@ -1,10 +1,36 @@
 const Scrim = require('../models/Scrim');
 const User = require('../models/User'); // Required for populate()
-const Notification = require('../models/Notification');
-const { emitNotification } = require('../utils/notificationEmitter');
+const { createAndEmitNotification } = require('../utils/notificationEmitter');
 const { calculateBGMIPoints } = require('../utils/bgmiPoints');
 const mongoose = require('mongoose');
 const log = require('../utils/logger');
+
+const uniqueRecipientIds = (values = []) =>
+  Array.from(new Set(values.map((value) => String(value?._id || value)).filter(Boolean)));
+
+const notifyScrimRecipients = async ({ scrim, recipients, sender, title, message, eventType, revision, extraData = {} }) => {
+  const recipientIds = uniqueRecipientIds(recipients);
+  if (recipientIds.length === 0) return [];
+  const dedupeKey = `scrim:${scrim._id}:${eventType}:${String(revision || scrim.updatedAt || '').slice(0, 80)}`;
+  return Promise.all(recipientIds.map((recipient) => createAndEmitNotification({
+    recipient,
+    sender,
+    type: 'tournament',
+    title,
+    message,
+    data: {
+      deepLink: `/scrim/${scrim.scrimCode || scrim._id}`,
+      customData: {
+        eventType,
+        scrimId: scrim._id,
+        scrimCode: scrim.scrimCode,
+        notificationDedupeKey: dedupeKey,
+        pushRequestId: dedupeKey,
+        ...extraData
+      }
+    }
+  })));
+};
 
 // Helper to find scrim by ObjectId or Scrim Code
 const findScrimByIdOrCode = async (idOrCode) => {
@@ -414,6 +440,19 @@ const joinScrim = async (req, res) => {
 
     await scrim.save();
 
+    if (String(scrim.host) !== String(userId)) {
+      await notifyScrimRecipients({
+        scrim,
+        recipients: [scrim.host],
+        sender: userId,
+        title: 'New Scrim Registration',
+        message: `${req.user.profile?.displayName || req.user.username} joined "${scrim.name}"`,
+        eventType: 'scrim_registration_joined',
+        revision: scrim.updatedAt,
+        extraData: { participantId: userId }
+      });
+    }
+
     // Populate team info
     await scrim.populate('registeredTeams', 'username profile.displayName profile.avatar');
 
@@ -467,6 +506,19 @@ const leaveScrim = async (req, res) => {
     }
 
     await scrim.save();
+
+    if (String(scrim.host) !== String(userId)) {
+      await notifyScrimRecipients({
+        scrim,
+        recipients: [scrim.host],
+        sender: userId,
+        title: 'Scrim Registration Withdrawn',
+        message: `${req.user.profile?.displayName || req.user.username} left "${scrim.name}"`,
+        eventType: 'scrim_registration_left',
+        revision: scrim.updatedAt,
+        extraData: { participantId: userId }
+      });
+    }
 
     // Populate team info
     await scrim.populate('registeredTeams', 'username profile.displayName profile.avatar');
@@ -573,6 +625,17 @@ const submitMatchResults = async (req, res) => {
     scrim.calculateOverallStandings();
 
     await scrim.save();
+
+    await notifyScrimRecipients({
+      scrim,
+      recipients: scrim.registeredTeams,
+      sender: req.user._id,
+      title: `Results Update: ${scrim.name}`,
+      message: `Match ${matchNumber} results are now available.`,
+      eventType: 'scrim_match_results',
+      revision: scrim.updatedAt,
+      extraData: { matchNumber: Number(matchNumber) }
+    });
 
     res.status(200).json({
       success: true,
@@ -707,6 +770,16 @@ const cancelScrim = async (req, res) => {
     scrim.status = 'Cancelled';
     await scrim.save();
 
+    await notifyScrimRecipients({
+      scrim,
+      recipients: scrim.registeredTeams,
+      sender: req.user._id,
+      title: `Scrim Cancelled: ${scrim.name}`,
+      message: 'This scrim has been cancelled by the host.',
+      eventType: 'scrim_cancelled',
+      revision: 'cancelled'
+    });
+
     res.status(200).json({
       success: true,
       message: 'Scrim cancelled successfully',
@@ -805,6 +878,16 @@ const generateScrimFinalResult = async (req, res) => {
 
     await scrim.save();
 
+    await notifyScrimRecipients({
+      scrim,
+      recipients: scrim.registeredTeams,
+      sender: req.user._id,
+      title: `Final Results: ${scrim.name}`,
+      message: 'The final scrim standings are now available.',
+      eventType: 'scrim_final_results',
+      revision: scrim.finalResult.generatedAt
+    });
+
     res.status(200).json({
       success: true,
       message: 'Final result generated successfully',
@@ -895,10 +978,10 @@ const broadcastScrimMessage = async (req, res) => {
     }
     await scrim.save();
 
-    const { createAndEmitNotification } = require('../utils/notificationEmitter');
-
-    // Send notification to all registered participants
-    const notificationPromises = scrim.registeredTeams.map(teamId =>
+    // Send notification to all registered participants.
+    const broadcastDeliveryKey = `scrim-broadcast:${scrim._id}:${broadcastEntry.sentAt.toISOString()}`;
+    const broadcastRecipients = uniqueRecipientIds(scrim.registeredTeams);
+    const notificationPromises = broadcastRecipients.map(teamId =>
       createAndEmitNotification({
         recipient: teamId,
         sender: req.user._id,
@@ -909,12 +992,29 @@ const broadcastScrimMessage = async (req, res) => {
           scrimId: scrim._id,
           scrimCode: scrim.scrimCode,
           broadcastType: type || 'info',
-          openTab: 'broadcast'
+          openTab: 'broadcast',
+          customData: {
+            scrimId: scrim._id,
+            scrimCode: scrim.scrimCode,
+            broadcastType: type || 'info',
+            openTab: 'broadcast',
+            notificationDedupeKey: broadcastDeliveryKey,
+            pushRequestId: broadcastDeliveryKey
+          }
         }
-      }).catch(err => log.error('Notification error:', { error: String(err) }))
+      })
     );
 
-    await Promise.allSettled(notificationPromises);
+    const notificationResults = await Promise.allSettled(notificationPromises);
+    notificationResults.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        log.error('Scrim broadcast notification failed', {
+          error: String(result.reason),
+          recipientId: broadcastRecipients[index],
+          scrimId: String(scrim._id)
+        });
+      }
+    });
 
     res.status(200).json({
       success: true,

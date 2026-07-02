@@ -4,12 +4,21 @@ const Follow = require('../models/Follow');
 const { generateToken, generateRefreshToken } = require('../utils/jwt');
 const { uploadAvatar, uploadImage } = require('../utils/cloudinary');
 const { sendOTPEmail } = require('../utils/email');
+const { enqueuePasswordSecurityEmail } = require('../utils/securityEmail');
 const log = require('../utils/logger');
 const { invalidateUserCache } = require('../middleware/auth');
 const { validateOnboardingProfile } = require('../utils/onboardingValidation');
 const { recordSuccessfulLogin } = require('../utils/userLoginAudit');
 
 const INVALID_LOGIN_MESSAGE = 'Invalid email or password.';
+
+const sanitizeUserResponse = (user) => {
+  const value = user?.toObject ? user.toObject() : { ...(user || {}) };
+  delete value.password;
+  delete value.pushTokens;
+  delete value.notificationClients;
+  return value;
+};
 
 const sendAuthRateLimit = (res, limit) => {
   res.setHeader('Retry-After', String(limit.retryAfter));
@@ -325,8 +334,7 @@ const register = async (req, res) => {
     const refreshToken = generateRefreshToken({ id: user._id });
 
     // Remove password from response
-    const userResponse = user.toObject();
-    delete userResponse.password;
+    const userResponse = sanitizeUserResponse(user);
 
     res.status(201).json({
       success: true,
@@ -460,6 +468,12 @@ const resetPasswordWithOtp = async (req, res) => {
     // update password (pre-save hook will hash it)
     user.password = newPassword;
     await user.save();
+    void enqueuePasswordSecurityEmail({
+      to: user.email,
+      eventType: 'password_reset'
+    }).catch((emailError) => {
+      log.error('Password reset confirmation email enqueue failed:', { error: String(emailError) });
+    });
 
     return res.status(200).json({
       success: true,
@@ -539,8 +553,7 @@ const login = async (req, res) => {
     const refreshToken = generateRefreshToken({ id: user._id });
 
     // Remove password from response
-    const userResponse = user.toObject();
-    delete userResponse.password;
+    const userResponse = sanitizeUserResponse(user);
 
     void recordSuccessfulLogin({ user, authMethod: 'password', request: req });
 
@@ -571,10 +584,11 @@ const login = async (req, res) => {
 const getMe = async (req, res) => {
   try {
     const user = await User.findById(req.user._id)
+      .select('-pushTokens -notificationClients')
       .populate('followers', 'username profile.displayName profile.avatar')
       .populate('following', 'username profile.displayName profile.avatar');
 
-    const userResponse = user.toObject();
+    const userResponse = sanitizeUserResponse(user);
     userResponse.followersCount = await Follow.getFollowerCount(user._id).catch(() => user.followers?.length || 0);
     userResponse.followingCount = await Follow.getFollowingCount(user._id).catch(() => user.following?.length || 0);
 
@@ -680,10 +694,11 @@ const updateProfile = async (req, res) => {
       userId,
       updateObject,
       { new: true, runValidators: true }
-    ).populate('followers', 'username profile.displayName profile.avatar')
+    ).select('-pushTokens -notificationClients')
+     .populate('followers', 'username profile.displayName profile.avatar')
      .populate('following', 'username profile.displayName profile.avatar');
 
-    const userResponse = user.toObject();
+    const userResponse = sanitizeUserResponse(user);
     userResponse.followersCount = await Follow.getFollowerCount(user._id).catch(() => user.followers?.length || 0);
     userResponse.followingCount = await Follow.getFollowingCount(user._id).catch(() => user.following?.length || 0);
 
@@ -735,6 +750,12 @@ const changePassword = async (req, res) => {
     // Update password
     user.password = newPassword;
     await user.save();
+    void enqueuePasswordSecurityEmail({
+      to: user.email,
+      eventType: 'password_changed'
+    }).catch((emailError) => {
+      log.error('Password change confirmation email enqueue failed:', { error: String(emailError) });
+    });
 
     res.status(200).json({
       success: true,
@@ -768,14 +789,14 @@ const uploadProfilePicture = async (req, res) => {
       req.user._id,
       { 'profile.avatar': uploadResult.url },
       { new: true }
-    ).select('-password');
+    ).select('-password -pushTokens -notificationClients');
 
     res.status(200).json({
       success: true,
       message: 'Profile picture uploaded successfully',
       data: {
         imageUrl: uploadResult.url,
-        user
+        user: sanitizeUserResponse(user)
       }
     });
 
@@ -806,14 +827,14 @@ const uploadBanner = async (req, res) => {
       req.user._id,
       { 'profile.banner': uploadResult.url },
       { new: true }
-    ).select('-password');
+    ).select('-password -pushTokens -notificationClients');
 
     res.status(200).json({
       success: true,
       message: 'Banner uploaded successfully',
       data: {
         imageUrl: uploadResult.url,
-        user
+        user: sanitizeUserResponse(user)
       }
     });
 
@@ -863,6 +884,8 @@ const deleteAccount = async (req, res) => {
     user.isActive = false;
     user.deletedAt = new Date();
     await user.save();
+    const { removeAllPushDevicesForUser } = require('../services/pushDeviceService');
+    await removeAllPushDevicesForUser(userId);
 
     res.status(200).json({
       success: true,
@@ -878,12 +901,33 @@ const deleteAccount = async (req, res) => {
   }
 };
 
-// Logout user (client-side token removal)
+// Logout one installation without revoking other signed-in devices.
 const logout = async (req, res) => {
   try {
+    const userId = req.user?._id;
+    const token = typeof req.body?.pushToken === 'string'
+      ? req.body.pushToken.trim()
+      : (typeof req.body?.token === 'string' ? req.body.token.trim() : '');
+    const installationId = typeof (req.body?.installationId || req.body?.deviceId) === 'string'
+      ? String(req.body.installationId || req.body.deviceId).trim().slice(0, 200)
+      : '';
+    const clientId = typeof req.body?.clientId === 'string' ? req.body.clientId.trim().slice(0, 200) : '';
+    let removedPushInstallations = 0;
+    if (userId && (token || installationId)) {
+      const { removePushDevices } = require('../services/pushDeviceService');
+      const result = await removePushDevices(userId, {
+        token: token || undefined,
+        installationId: installationId || undefined
+      });
+      removedPushInstallations = Number(result.removed || 0);
+    }
+    if (userId && clientId) {
+      await User.updateOne({ _id: userId }, { $pull: { notificationClients: { clientId } } });
+    }
     res.status(200).json({
       success: true,
-      message: 'Logged out successfully'
+      message: 'Logged out successfully',
+      data: { removedPushInstallations, removedClientContext: Boolean(clientId) }
     });
   } catch (error) {
     res.status(500).json({
@@ -983,8 +1027,7 @@ const completeProfile = async (req, res) => {
     const refreshToken = generateRefreshToken({ id: user._id });
 
     // Remove password from response
-    const userResponse = user.toObject();
-    delete userResponse.password;
+    const userResponse = sanitizeUserResponse(user);
 
     res.status(200).json({
       success: true,
@@ -1137,8 +1180,7 @@ const verifyOtpAndLogin = async (req, res) => {
     await user.save();
     const token = generateToken({ id: user._id, username: user.username, userType: user.userType });
     const refreshToken = generateRefreshToken({ id: user._id });
-    const userResponse = user.toObject();
-    delete userResponse.password;
+    const userResponse = sanitizeUserResponse(user);
     void recordSuccessfulLogin({ user, authMethod: 'otp', request: req });
     res.status(200).json({
       success: true,
@@ -1265,8 +1307,7 @@ const googleTokenLogin = async (req, res) => {
     const token = generateToken({ id: user._id, username: user.username, userType: user.userType });
     const refreshToken = generateRefreshToken({ id: user._id });
 
-    const userResponse = user.toObject();
-    delete userResponse.password;
+    const userResponse = sanitizeUserResponse(user);
 
     void recordSuccessfulLogin({ user, authMethod: 'google_token', request: req });
 
@@ -1453,8 +1494,7 @@ const appleMobileLogin = async (req, res) => {
 
     const token = generateToken({ id: user._id, username: user.username, userType: user.userType });
     const refreshToken = generateRefreshToken({ id: user._id });
-    const userResponse = user.toObject();
-    delete userResponse.password;
+    const userResponse = sanitizeUserResponse(user);
 
     void recordSuccessfulLogin({ user, authMethod: 'apple_mobile', request: req });
 

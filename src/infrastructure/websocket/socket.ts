@@ -6,7 +6,6 @@ import path from "path";
 import { env } from "../../config/env";
 import { logger } from "../../config/logger";
 import { registerChatSocketHandlers } from "../../modules/chat/chat.socket";
-import { registerCallSocketHandlers } from "../../modules/calls/calls.socket";
 import { registerLegacySocketHandlers } from "../../modules/legacy/legacy.socket";
 import { backendMiddlewarePath } from "../../modules/legacy/legacy.paths";
 import { socketRedisPubClient, socketRedisSubClient } from "../cache/redis";
@@ -99,7 +98,9 @@ export const createSocketServer = (httpServer: HttpServer): Server => {
 
     socket.on("ping", () => socket.emit("pong"));
     registerChatSocketHandlers(io, socket);
-    registerCallSocketHandlers(io, socket);
+    // Calls are registered only by the durable legacy bridge below. The old
+    // colon-event relay accepted client-supplied target IDs without proving
+    // CallSession participation and must never be mounted in parallel.
     registerLegacySocketHandlers(io, socket);
 
     logger.info("Socket connected", { socketId: socket.id, userId });
