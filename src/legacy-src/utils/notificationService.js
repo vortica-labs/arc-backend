@@ -6,6 +6,21 @@ const {
 const { createHash, randomUUID } = require('crypto');
 const log = require('./logger');
 
+const buildMessageNotificationBody = (senderName, messageKind = 'text', primaryMediaType = '') => {
+  const sender = String(senderName || 'Someone');
+  const mediaType = String(primaryMediaType || '').toLowerCase();
+  if (messageKind === 'media') {
+    if (mediaType === 'audio' || mediaType === 'voice') return `You received a voice message from ${sender}`;
+    if (mediaType === 'image' || mediaType === 'photo') return `You received an image from ${sender}`;
+    if (mediaType === 'video') return `You received a video from ${sender}`;
+    return `You received a media message from ${sender}`;
+  }
+  if (messageKind === 'shared_post') return `${sender} shared a post with you`;
+  if (messageKind === 'shared_profile') return `${sender} shared a profile with you`;
+  if (messageKind === 'reply') return `You received a reply from ${sender}`;
+  return `You received a new message from ${sender}`;
+};
+
 // Create like notification
 const createLikeNotification = async (recipientId, senderId, postId) => {
   try {
@@ -108,7 +123,11 @@ const createMessageNotification = async (recipientId, senderId, messageId, optio
       }
     };
     const notificationTitle = options.title || 'New Message';
-    const notificationMessage = options.message || `${sender.username} sent you a message`;
+    const notificationMessage = options.message || buildMessageNotificationBody(
+      sender?.username,
+      messageKind,
+      primaryMediaType
+    );
     const channels = resolveNotificationChannels(
       { type: 'message', data: notificationDataFields },
       recipient?.notificationSettings
@@ -274,5 +293,6 @@ module.exports = {
   createMessageNotification,
   createTournamentNotification,
   createSystemNotification,
-  createMentionNotification
+  createMentionNotification,
+  buildMessageNotificationBody
 };

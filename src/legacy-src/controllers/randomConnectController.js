@@ -19,6 +19,13 @@ const {
 } = require('../services/randomConnectAdmissionService');
 const { v4: uuidv4 } = require('uuid');
 const log = require('../utils/logger');
+const {
+  normalizeMatchmakingGender,
+  normalizePreferredGender,
+  evaluateGenderCompatibility,
+  buildGenderCandidateQuery,
+  buildCompatiblePreferenceQuery
+} = require('../utils/randomConnectGender');
 
 // Free users: daily match limit. Premium: unlimited matches.
 const FREE_DAILY_MATCH_LIMIT = FREE_DAILY_GENDER_MATCH_LIMIT;
@@ -42,8 +49,12 @@ const normalizeTags = (tags = []) => {
     .slice(0, 10);
 };
 
-const sanitizePreferredGender = (preferredGender) =>
-  (preferredGender === 'male' || preferredGender === 'female') ? preferredGender : '';
+const sanitizePreferredGender = normalizePreferredGender;
+
+const matchDebugEnabled = () => process.env.RANDOM_CONNECT_MATCH_DEBUG === 'true';
+const logMatchDebug = (message, meta = {}) => {
+  if (matchDebugEnabled()) log.info(message, meta);
+};
 
 const requestSource = (req) => String(
   req?.get?.('x-client-platform') || req?.get?.('x-app-platform') || 'unspecified'
@@ -381,7 +392,6 @@ const queueAndTryMatch = async ({
 }) => {
   const { selectedGame, tags = [], videoEnabled = true, preferredGender } = body;
   const userId = user?._id;
-  const userGender = user?.profile?.gender || '';
 
   if (!userId) {
     throw createHttpError(401, {
@@ -389,6 +399,18 @@ const queueAndTryMatch = async ({
       message: 'User not authenticated'
     });
   }
+
+  // Authorization uses a short-lived cached user. Matchmaking gender must use
+  // the canonical profile so a recent profile update cannot queue a stale or
+  // empty value for several minutes.
+  const canonicalProfile = await User.findById(userId).select('profile.gender').lean();
+  if (!canonicalProfile) {
+    throw createHttpError(404, {
+      success: false,
+      message: 'User profile not found'
+    });
+  }
+  const userGender = normalizeMatchmakingGender(canonicalProfile.profile?.gender);
 
   // Never authorize Premium behavior from req.user/JWT/client state. The
   // resolver reads the current canonical membership and a fresh User fallback.
@@ -463,6 +485,15 @@ const queueAndTryMatch = async ({
   }
 
   const normalizedTags = normalizeTags(tags);
+  logMatchDebug('Random Connect queue registration received', {
+    userId: String(userId),
+    source,
+    gender: userGender || 'unspecified',
+    preferredGender: queuePreferredGender || 'any',
+    isPremium,
+    conversationType: videoEnabled ? 'video' : 'audio',
+    tagCount: normalizedTags.length
+  });
   if (process.env.NODE_ENV === 'development') {
     console.log(`User ${userId} attempting to join queue - Game: ${selectedGame || 'none'}, Tags: ${normalizedTags.join(', ')}`);
   }
@@ -521,6 +552,13 @@ const queueAndTryMatch = async ({
   }
 
   const currentEntry = await ConnectionQueue.findOne({ userId, status: 'waiting' }).lean();
+  logMatchDebug('Random Connect queue registration stored', {
+    userId: String(userId),
+    queueEntryId: String(currentEntry?._id || ''),
+    gender: normalizeMatchmakingGender(currentEntry?.gender) || 'unspecified',
+    preferredGender: normalizePreferredGender(currentEntry?.preferredGender) || 'any',
+    status: currentEntry?.status || 'missing'
+  });
   const matchOptions = {
     preferredGender: queuePreferredGender || null,
     currentGender: userGender,
@@ -694,12 +732,26 @@ const getRecentPartnerIds = async (userId) => {
     .filter(participantId => participantId && participantId !== currentUserId));
 };
 
-const scoreCandidate = ({ currentEntry, candidate, tags, selectedGame, currentGender, allowFallback, recentPartnerIds }) => {
+const scoreCandidate = ({ currentEntry, candidate, tags, selectedGame, currentGender, allowFallback, recentPartnerIds, onReject }) => {
   const candidateId = getUserIdString(candidate.userId);
-  if (!candidateId || candidateId === getUserIdString(currentEntry.userId)) return null;
-  if (!allowFallback && recentPartnerIds.has(candidateId)) return null;
+  const reject = (reason, details = {}) => {
+    if (typeof onReject === 'function') onReject(reason, details);
+    return null;
+  };
+  if (!candidateId) return reject('candidate_user_missing');
+  if (candidateId === getUserIdString(currentEntry.userId)) return reject('same_user');
+  if (!allowFallback && recentPartnerIds.has(candidateId)) return reject('recent_partner');
 
-  if (candidate.preferredGender && candidate.preferredGender !== currentGender) return null;
+  const genderCompatibility = evaluateGenderCompatibility(
+    {
+      ...currentEntry,
+      gender: normalizeMatchmakingGender(currentEntry.gender || currentGender)
+    },
+    candidate
+  );
+  if (!genderCompatibility.compatible) {
+    return reject(genderCompatibility.reason, genderCompatibility);
+  }
 
   const candidateTags = Array.isArray(candidate.tags) ? candidate.tags : [];
   const commonTags = tags.filter(tag => candidateTags.includes(tag));
@@ -715,7 +767,7 @@ const scoreCandidate = ({ currentEntry, candidate, tags, selectedGame, currentGe
       score += 100 + commonTags.length * 25;
       matchQuality = commonTags.length === tags.length && commonTags.length === candidateTags.length ? 'exact_tag' : 'partial_tag';
     } else if (!allowFallback) {
-      return null;
+      return reject('tag_mismatch');
     } else {
       score += hasCandidateTags ? 12 : 4;
       matchQuality = 'expanded';
@@ -729,7 +781,7 @@ const scoreCandidate = ({ currentEntry, candidate, tags, selectedGame, currentGe
     score += 35;
     if (matchQuality === 'random') matchQuality = 'same_game';
   } else if (selectedGame && !allowFallback) {
-    return null;
+    return reject('game_mismatch');
   }
 
   if (recentPartnerIds.has(candidateId)) score -= 200;
@@ -746,19 +798,26 @@ const findMatch = async (userId, selectedGame, tags = [], options = {}) => {
     const { preferredGender, currentGender = '', currentEntry: providedCurrentEntry } = options;
     const currentEntry = providedCurrentEntry || await ConnectionQueue.findOne({ userId, status: 'waiting' }).lean();
     if (!currentEntry) return null;
+    const normalizedCurrentEntry = {
+      ...currentEntry,
+      gender: normalizeMatchmakingGender(currentEntry.gender || currentGender),
+      preferredGender: normalizePreferredGender(preferredGender || currentEntry.preferredGender)
+    };
 
-    const joinedAt = new Date(currentEntry.joinedAt || currentEntry.createdAt || Date.now()).getTime();
+    const joinedAt = new Date(normalizedCurrentEntry.joinedAt || normalizedCurrentEntry.createdAt || Date.now()).getTime();
     const allowFallback = Date.now() - joinedAt >= TAG_FALLBACK_MS;
     const recentPartnerIds = await getRecentPartnerIds(userId);
 
     const query = {
       userId: { $ne: userId },
-      status: 'waiting'
+      status: 'waiting',
+      $and: [buildCompatiblePreferenceQuery(normalizedCurrentEntry.gender)]
     };
 
-    if (preferredGender) {
-      query.gender = preferredGender;
-      if (process.env.NODE_ENV === 'development') { console.log(`🔍 Random Connect (Premium): filter by gender ${preferredGender}`);}
+    const candidateGenderQuery = buildGenderCandidateQuery(normalizedCurrentEntry.preferredGender);
+    if (candidateGenderQuery) {
+      query.gender = candidateGenderQuery;
+      if (process.env.NODE_ENV === 'development') { console.log(`🔍 Random Connect: filter by gender ${normalizedCurrentEntry.preferredGender}`);}
     }
 
     if (tags.length > 0 && !allowFallback) {
@@ -772,15 +831,29 @@ const findMatch = async (userId, selectedGame, tags = [], options = {}) => {
       .limit(MATCH_BATCH_LIMIT)
       .lean();
 
+    logMatchDebug('Random Connect eligible candidates loaded', {
+      userId: userIdStr,
+      gender: normalizedCurrentEntry.gender || 'unspecified',
+      preferredGender: normalizedCurrentEntry.preferredGender || 'any',
+      candidateCount: potentialMatches.length,
+      fallbackExpanded: allowFallback
+    });
+
     const scored = potentialMatches
       .map(candidate => scoreCandidate({
-        currentEntry,
+        currentEntry: normalizedCurrentEntry,
         candidate,
         tags,
         selectedGame,
         currentGender,
         allowFallback,
-        recentPartnerIds
+        recentPartnerIds,
+        onReject: (reason, details) => logMatchDebug('Random Connect candidate rejected', {
+          userId: userIdStr,
+          candidateId: getUserIdString(candidate.userId),
+          reason,
+          ...details
+        })
       }))
       .filter(Boolean)
       .sort((a, b) => b.score - a.score || new Date(a.candidate.joinedAt || a.candidate.createdAt).getTime() - new Date(b.candidate.joinedAt || b.candidate.createdAt).getTime());
@@ -788,6 +861,13 @@ const findMatch = async (userId, selectedGame, tags = [], options = {}) => {
     if (scored.length > 0) {
       const best = scored[0];
       const match = best.candidate;
+      logMatchDebug('Random Connect candidate accepted', {
+        userId: userIdStr,
+        candidateId: getUserIdString(match.userId),
+        matchQuality: best.matchQuality,
+        score: best.score,
+        commonTagCount: best.commonTags.length
+      });
       if (process.env.NODE_ENV === 'development') {
         console.log(`✅ Matched user ${userIdStr} with ${match.userId} (${best.matchQuality}, score ${best.score})`);
       }
@@ -800,6 +880,7 @@ const findMatch = async (userId, selectedGame, tags = [], options = {}) => {
         videoEnabled: match.videoEnabled,
         tags: match.tags || [],
         selectedGame: match.selectedGame,
+        gender: normalizeMatchmakingGender(match.gender),
         preferredGender: match.preferredGender || '',
         commonTags: best.commonTags,
         matchQuality: best.matchQuality
@@ -977,6 +1058,13 @@ const createConnectionForPair = async ({
       }
     ),
     findCommittedConnection: () => RandomConnection.findOne({ roomId })
+  });
+
+  logMatchDebug('Random Connect room created', {
+    roomId,
+    userIds: [String(user1Id), String(user2Id)],
+    usedGenderFilter: genderFilterUserIds.length > 0,
+    matchQuality
   });
 
   return cleanupCommittedPairQueue(connection, [dbUser1._id, dbUser2._id]);
@@ -1729,6 +1817,10 @@ module.exports = {
   _private: {
     normalizeTags,
     sanitizePreferredGender,
+    normalizeMatchmakingGender,
+    evaluateGenderCompatibility,
+    buildGenderCandidateQuery,
+    buildCompatiblePreferenceQuery,
     isPremiumUser,
     buildSessionPolicy,
     scoreCandidate,

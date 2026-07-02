@@ -1,6 +1,7 @@
 const TeamRecruitment = require('../models/TeamRecruitment');
 const PlayerProfile = require('../models/PlayerProfile');
 const RecruitmentApplication = require('../models/RecruitmentApplication');
+const User = require('../models/User');
 const mongoose = require('mongoose');
 const safeAsyncHandler = require('../utils/safeAsyncHandler');
 const log = require('../utils/logger');
@@ -13,6 +14,13 @@ const {
   serializePlayerProfile,
   isRecruitmentLive,
   isPlayerProfileLive,
+  addTeamRecruitmentIntegrityFilters,
+  addPlayerProfileIntegrityFilters,
+  getValidRecruitmentOwnerMatch,
+  isTeamRecruitmentStructurallyValid,
+  isPlayerProfileStructurallyValid,
+  listCanonicalRecruitmentRecords,
+  listCanonicalRecruitmentApplications,
   sameId,
   parsePagination,
   escapeRegex,
@@ -228,7 +236,9 @@ const getTeamRecruitments = safeAsyncHandler(async (req, res) => {
   } = req.query;
   const { page, limit } = parsePagination(req.query.page, req.query.limit);
   const ownListing = my === 'true';
-  const query = ownListing ? { team: req.user._id } : addLiveFilters({});
+  const query = addTeamRecruitmentIntegrityFilters(
+    ownListing ? { team: req.user._id, isActive: true } : addLiveFilters({})
+  );
 
   if (ownListing && status) {
     // The Web management page shares one status selector across tabs. Preserve
@@ -263,30 +273,18 @@ const getTeamRecruitments = safeAsyncHandler(async (req, res) => {
   const sortDirection = sortOrder === 'desc' ? -1 : 1;
   const allowedSortFields = new Set(['createdAt', 'game', 'role', 'staffRole', 'applicantCount']);
   const safeSortBy = allowedSortFields.has(sortBy) ? sortBy : 'createdAt';
-  const sortOptions = { [safeSortBy]: sortDirection };
-
-  let recruitments;
-  if (safeSortBy === 'applicantCount') {
-    const docs = await TeamRecruitment.aggregate([
-      { $match: query },
-      { $addFields: { applicantCount: { $size: { $ifNull: ['$applicants', []] } } } },
-      { $sort: { applicantCount: sortDirection, createdAt: -1 } },
-      { $skip: (page - 1) * limit },
-      { $limit: limit }
-    ]);
-    recruitments = await TeamRecruitment.populate(docs, {
-      path: 'team',
-      select: 'username profile.displayName profile.avatar'
-    });
-  } else {
-    recruitments = await TeamRecruitment.find(query)
-      .populate('team', 'username profile.displayName profile.avatar')
-      .sort(sortOptions)
-      .limit(limit)
-      .skip((page - 1) * limit);
-  }
-
-  const total = await TeamRecruitment.countDocuments(query);
+  const { records: recruitments, total } = await listCanonicalRecruitmentRecords({
+    model: TeamRecruitment,
+    userModel: User,
+    query,
+    ownerField: 'team',
+    expectedUserType: 'team',
+    countField: 'applicantCount',
+    sortBy: safeSortBy,
+    sortDirection,
+    page,
+    limit
+  });
   const totalPages = Math.ceil(total / limit);
 
   res.json({
@@ -308,9 +306,13 @@ const getTeamRecruitments = safeAsyncHandler(async (req, res) => {
 const getTeamRecruitment = safeAsyncHandler(async (req, res) => {
   const id = req.params.id || req.params.code;
   const recruitment = await findTeamRecruitmentByIdentifier(id)
-    .populate('team', 'username profile.displayName profile.avatar profile.bio teamInfo.teamType');
+    .populate({
+      path: 'team',
+      match: getValidRecruitmentOwnerMatch('team'),
+      select: 'username profile.displayName profile.avatar profile.bio teamInfo.teamType'
+    });
 
-  if (!recruitment) {
+  if (!recruitment || !recruitment.team || !isTeamRecruitmentStructurallyValid(recruitment)) {
     return res.status(404).json({
       success: false,
       message: 'Recruitment post not found. The link may be invalid or the post has been removed.'
@@ -621,7 +623,9 @@ const getPlayerProfiles = safeAsyncHandler(async (req, res) => {
   } = req.query;
   const { page, limit } = parsePagination(req.query.page, req.query.limit);
   const ownListing = my === 'true';
-  const query = ownListing ? { player: req.user._id } : addLiveFilters({});
+  const query = addPlayerProfileIntegrityFilters(
+    ownListing ? { player: req.user._id, isActive: true } : addLiveFilters({})
+  );
 
   if (ownListing && status) {
     if (PLAYER_PROFILE_STATUSES.includes(status)) query.status = status;
@@ -658,31 +662,18 @@ const getPlayerProfiles = safeAsyncHandler(async (req, res) => {
   const sortDirection = sortOrder === 'desc' ? -1 : 1;
   const allowedSortFields = new Set(['createdAt', 'game', 'profileType', 'interestedTeamsCount']);
   const safeSortBy = allowedSortFields.has(sortBy) ? sortBy : 'createdAt';
-  const sortOptions = { [safeSortBy]: sortDirection };
-
-  let profiles;
-  if (safeSortBy === 'interestedTeamsCount') {
-    const docs = await PlayerProfile.aggregate([
-      { $match: query },
-      { $addFields: { interestedTeamsCount: { $size: { $ifNull: ['$interestedTeams', []] } } } },
-      { $sort: { interestedTeamsCount: sortDirection, createdAt: -1 } },
-      { $skip: (page - 1) * limit },
-      { $limit: limit }
-    ]);
-    profiles = await PlayerProfile.populate(docs, {
-      path: 'player',
-      select: 'username profile.displayName profile.avatar'
-    });
-  } else {
-    profiles = await PlayerProfile.find(query)
-      .populate('player', 'username profile.displayName profile.avatar')
-      .sort(sortOptions)
-      .limit(limit)
-      .skip((page - 1) * limit)
-      .lean();
-  }
-
-  const total = await PlayerProfile.countDocuments(query);
+  const { records: profiles, total } = await listCanonicalRecruitmentRecords({
+    model: PlayerProfile,
+    userModel: User,
+    query,
+    ownerField: 'player',
+    expectedUserType: 'player',
+    countField: 'interestedTeamsCount',
+    sortBy: safeSortBy,
+    sortDirection,
+    page,
+    limit
+  });
   const totalPages = Math.ceil(total / limit);
 
   res.json({
@@ -704,9 +695,13 @@ const getPlayerProfiles = safeAsyncHandler(async (req, res) => {
 const getPlayerProfile = safeAsyncHandler(async (req, res) => {
   const id = req.params.id || req.params.code;
   const profile = await findPlayerProfileByIdentifier(id)
-    .populate('player', 'username profile.displayName profile.avatar profile.bio');
+    .populate({
+      path: 'player',
+      match: getValidRecruitmentOwnerMatch('player'),
+      select: 'username profile.displayName profile.avatar profile.bio'
+    });
 
-  if (!profile) {
+  if (!profile || !profile.player || !isPlayerProfileStructurallyValid(profile)) {
     return res.status(404).json({
       success: false,
       message: 'Player profile not found'
@@ -882,8 +877,12 @@ const applyToRecruitment = safeAsyncHandler(async (req, res) => {
 
   if (!requireUserType(req, res, 'player', 'Only individual users can apply to team recruitments')) return;
 
-  const recruitment = await findTeamRecruitmentByIdentifier(recruitmentId);
-  if (!recruitment) {
+  const recruitment = await findTeamRecruitmentByIdentifier(recruitmentId).populate({
+    path: 'team',
+    match: getValidRecruitmentOwnerMatch('team'),
+    select: 'username profile.displayName profile.avatar'
+  });
+  if (!recruitment || !recruitment.team || !isTeamRecruitmentStructurallyValid(recruitment)) {
     return res.status(404).json({
       success: false,
       message: 'Recruitment post not found'
@@ -1054,8 +1053,12 @@ const showInterestInProfile = safeAsyncHandler(async (req, res) => {
 
   if (!requireUserType(req, res, 'team', 'Only teams can show interest in player profiles')) return;
 
-  const profile = await findPlayerProfileByIdentifier(profileId);
-  if (!profile) {
+  const profile = await findPlayerProfileByIdentifier(profileId).populate({
+    path: 'player',
+    match: getValidRecruitmentOwnerMatch('player'),
+    select: 'username profile.displayName profile.avatar'
+  });
+  if (!profile || !profile.player || !isPlayerProfileStructurallyValid(profile)) {
     return res.status(404).json({
       success: false,
       message: 'Player profile not found'
@@ -1141,26 +1144,20 @@ const getUserApplications = safeAsyncHandler(async (req, res) => {
     else query._id = null;
   }
 
-  const applications = await RecruitmentApplication.find(query)
-    .populate({
-      path: 'recruitment',
-      select: 'game role staffRole recruitmentType team status isActive expiresAt',
-      populate: { path: 'team', select: 'username profile.displayName profile.avatar' }
-    })
-    .sort({ createdAt: -1 })
-    .limit(limit)
-    .skip((page - 1) * limit);
-
-  const total = await RecruitmentApplication.countDocuments(query);
+  const { records: applications, total } = await listCanonicalRecruitmentApplications({
+    applicationModel: RecruitmentApplication,
+    recruitmentModel: TeamRecruitment,
+    userModel: User,
+    query,
+    page,
+    limit
+  });
   const totalPages = Math.ceil(total / limit);
 
   res.json({
     success: true,
     data: {
-      applications: applications.map((application) => ({
-        ...application.toObject(),
-        appliedAt: application.createdAt
-      })),
+      applications,
       pagination: {
         currentPage: page,
         totalPages,
@@ -1190,7 +1187,12 @@ const getTeamApplications = safeAsyncHandler(async (req, res) => {
   if (recruitmentId) {
     const recruitment = await findTeamRecruitmentByIdentifier(recruitmentId);
     
-    if (!recruitment || !sameId(recruitment.team, teamId)) {
+    if (
+      !recruitment
+      || !sameId(recruitment.team, teamId)
+      || recruitment.isActive !== true
+      || !isTeamRecruitmentStructurallyValid(recruitment)
+    ) {
       return res.status(404).json({
         success: false,
         message: 'Recruitment not found or not authorized'
@@ -1209,23 +1211,20 @@ const getTeamApplications = safeAsyncHandler(async (req, res) => {
     else query._id = null;
   }
 
-  const applications = await RecruitmentApplication.find(query)
-    .populate('applicant', 'username profile.displayName profile.avatar')
-    .populate('recruitment', 'game role staffRole recruitmentType')
-    .sort({ createdAt: -1 })
-    .limit(limit)
-    .skip((page - 1) * limit);
-
-  const total = await RecruitmentApplication.countDocuments(query);
+  const { records: applications, total } = await listCanonicalRecruitmentApplications({
+    applicationModel: RecruitmentApplication,
+    recruitmentModel: TeamRecruitment,
+    userModel: User,
+    query,
+    page,
+    limit
+  });
   const totalPages = Math.ceil(total / limit);
 
   res.json({
     success: true,
     data: {
-      applications: applications.map((application) => ({
-        ...application.toObject(),
-        appliedAt: application.createdAt
-      })),
+      applications,
       pagination: {
         currentPage: page,
         totalPages,
@@ -1256,7 +1255,7 @@ const updateApplicationStatus = safeAsyncHandler(async (req, res) => {
     .populate('recruitment')
     .populate('applicant', 'username email profile.displayName profile.avatar');
 
-  if (!application) {
+  if (!application || !application.applicant) {
     return res.status(404).json({
       success: false,
       message: 'Application not found'
@@ -1483,29 +1482,10 @@ const updateApplicationStatus = safeAsyncHandler(async (req, res) => {
       }
     }
 
-    // 3. Transactional recruitment email (explicitly typed and non-blocking)
-    if (process.env.SMTP_USER && process.env.SMTP_PASS && application.applicant.email) {
-      try {
-        const { enqueueEmail } = require('../utils/jobQueue');
-        const { EMAIL_INTENTS } = require('../utils/notificationChannelPolicy');
-        const clientUrl = process.env.CLIENT_URL || 'https://arc.squadhunt.com';
-        void enqueueEmail(
-          application.applicant.email,
-          notifTitle,
-          notifMessage,
-          `${clientUrl.replace(/\/+$/, '')}/messages`,
-          {
-            intent: EMAIL_INTENTS.RECRUITMENT_STATUS,
-            eventType: 'recruitment_application_status',
-            notificationType: 'recruitment'
-          }
-        ).catch((emailError) => {
-          log.error('Recruitment email enqueue failed', { error: String(emailError) });
-        });
-      } catch (e) {
-        log.error('Recruitment email setup error', { error: String(e) });
-      }
-    }
+    // Recruitment decisions are activity notifications: the in-app row,
+    // push, and direct message above are the complete delivery contract.
+    // Email is intentionally reserved for account/security/billing/legal and
+    // critical platform events.
   }
   // ─────────────────────────────────────────────────────────────────────────
 

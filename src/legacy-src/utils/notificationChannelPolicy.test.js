@@ -10,7 +10,7 @@ const {
 
 const routineMatrix = {
   like: ['like', 'post_like', 'post.like', 'post/like', 'clip_like', 'story_like', 'achievement_like', 'tournament_like', 'recruitment_like'],
-  comment: ['comment', 'comment_reply', 'achievement_comment'],
+  comment: ['comment', 'comment_reply', 'achievement_comment', 'post_comment_created'],
   share: ['share', 'post_share', 'clip_share'],
   follow: ['follow', 'new_follower', 'follow_request', 'follow_acceptance'],
   mention: ['mention', 'post_mention', 'comment_mention'],
@@ -19,8 +19,17 @@ const routineMatrix = {
   reaction: ['reaction', 'post_reaction', 'comment_reaction', 'message_reaction'],
   profile_visit: ['profile_visit', 'profile_view', 'visited_profile'],
   achievement: ['achievement'],
-  tournament: ['tournament'],
-  recruitment: ['recruitment']
+  tournament: ['tournament', 'tournament_registration', 'tournament_update', 'tournament_match_update', 'match_update'],
+  recruitment: ['recruitment', 'recruitment_application', 'recruitment_invitation', 'recruitment_application_accepted', 'recruitment_application_rejected'],
+  message: ['message', 'new_message', 'voice_message', 'media_message', 'group_message', 'shared_post_message'],
+  story: ['story', 'story_view', 'story_reaction', 'story_reply'],
+  clip: ['clip', 'clip_comment', 'clip_view'],
+  call: ['call', 'voice_call', 'video_call'],
+  random_connect: ['random_connect', 'random_connect_match_found', 'random_connect_session_update'],
+  presence: ['presence', 'presence_update'],
+  recommendation: ['recommendation', 'recommendations'],
+  feed_activity: ['feed_activity', 'engagement'],
+  friend_suggestion: ['friend_suggestion', 'friend_suggestions']
 };
 
 for (const [expectedType, variants] of Object.entries(routineMatrix)) {
@@ -35,20 +44,10 @@ for (const [expectedType, variants] of Object.entries(routineMatrix)) {
 }
 
 assert.equal(
-  evaluateEmailPolicy({ intent: EMAIL_INTENTS.RECRUITMENT_STATUS, eventType: 'recruitment' }).allowed,
-  true,
-  'an explicitly typed recruitment decision is transactional'
-);
-assert.equal(
-  evaluateEmailPolicy({ intent: EMAIL_INTENTS.TOURNAMENT_REGISTRATION_PRIZE, eventType: 'tournament_registration' }).allowed,
-  true,
-  'registration and prize outcomes are explicit tournament transactions'
-);
-assert.equal(
   evaluateNotificationEmailPolicy({
     type: 'system',
     data: { applicationId: 'creator-application-id' },
-    email: { intent: EMAIL_INTENTS.CREATOR_STATUS, eventType: 'creator_application_approved' }
+    email: { intent: EMAIL_INTENTS.ACCOUNT_LIFECYCLE, eventType: 'account_reactivation' }
   }).allowed,
   true,
   'a generic applicationId must not be misclassified as recruitment'
@@ -59,28 +58,29 @@ assert.equal(
   'notification type itself is a final engagement guard'
 );
 assert.equal(
-  evaluateEmailPolicy({ intent: EMAIL_INTENTS.BROADCAST_EXPLICIT, eventType: 'tournament' }).allowed,
+  evaluateEmailPolicy({ intent: 'broadcast_explicit', eventType: 'tournament' }).allowed,
   false,
-  'broadcast intent cannot bypass an engagement guard without a configured durable transport'
+  'a legacy broadcast intent cannot bypass an engagement guard'
 );
 assert.equal(
   evaluateEmailPolicy({
-    intent: EMAIL_INTENTS.BROADCAST_EXPLICIT,
+    intent: 'broadcast_explicit',
     eventType: 'tournament',
     broadcastId: 'broadcast-id',
     broadcastRecipientId: 'recipient-id'
   }).allowed,
   false,
-  'caller-supplied IDs are not a substitute for worker-side identity revalidation'
+  'caller-supplied IDs cannot bypass the policy'
 );
 
-for (const intent of Object.values(EMAIL_INTENTS).filter((value) => value !== EMAIL_INTENTS.BROADCAST_EXPLICIT)) {
-  const eventType = intent === EMAIL_INTENTS.RECRUITMENT_STATUS
-    ? 'recruitment_status_changed'
-    : intent === EMAIL_INTENTS.TOURNAMENT_REGISTRATION_PRIZE
-      ? 'tournament_registration'
-      : `${intent}_event`;
+for (const intent of Object.values(EMAIL_INTENTS)) {
+  const eventType = `${intent}_event`;
   assert.equal(evaluateEmailPolicy({ intent, eventType }).allowed, true, `${intent} should allow its explicit transactional family`);
+}
+for (const intent of ['creator_status', 'host_status', 'tournament_registration_prize', 'recruitment_status', 'broadcast_explicit']) {
+  const result = evaluateEmailPolicy({ intent, eventType: 'legacy_queued_email' });
+  assert.equal(result.allowed, false, `${intent} must remain disabled for queued legacy jobs`);
+  assert.equal(result.reason, 'email_intent_disabled_by_policy');
 }
 assert.equal(evaluateEmailPolicy({}).allowed, false);
 assert.equal(evaluateEmailPolicy({ intent: 'transactional' }).allowed, false, 'there is no generic transactional bypass');
@@ -128,9 +128,9 @@ const run = async () => {
     to: 'user@example.com',
     subject: 'Application accepted',
     text: 'Your application was accepted.',
-    intent: EMAIL_INTENTS.RECRUITMENT_STATUS,
+    intent: 'recruitment_status',
     eventType: 'recruitment'
-  })).sent, true);
+  })).blocked, true);
 
   const escaped = await email.sendNotificationEmail(
     'user@example.com',
@@ -149,7 +149,7 @@ const run = async () => {
     'Tournament broadcast',
     'Explicit admin broadcast',
     'https://arc.example/tournament/1',
-    { intent: EMAIL_INTENTS.BROADCAST_EXPLICIT, eventType: 'tournament' }
+    { intent: 'broadcast_explicit', eventType: 'tournament' }
   )).blocked, true, 'broadcast transport must revalidate durable broadcast identity');
   assert.equal((await email.sendNotificationEmail(
     'user@example.com',
@@ -157,7 +157,7 @@ const run = async () => {
     'Explicit admin broadcast',
     'https://arc.example/tournament/1',
     {
-      intent: EMAIL_INTENTS.BROADCAST_EXPLICIT,
+      intent: 'broadcast_explicit',
       eventType: 'tournament',
       broadcastId: 'broadcast-id',
       broadcastRecipientId: 'recipient-id'

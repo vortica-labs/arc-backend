@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
 import { body } from "express-validator";
+import { normalizePreferredGender } from "../../legacy-src/utils/randomConnectGender";
 import {
   randomConnectController,
   protect,
@@ -62,7 +63,8 @@ const joinQueueValidation = [
     .withMessage("Video enabled must be a boolean"),
   body("preferredGender")
     .optional()
-    .isIn(["male", "female"])
+    .customSanitizer(normalizePreferredGender)
+    .isIn(["", "male", "female"])
     .withMessage("Preferred gender must be male or female (use Any for no filter)")
 ];
 

@@ -156,6 +156,24 @@ const [randomConnectMessage] = buildExpoMessages(['ExpoPushToken[test-token]'], 
 assert.equal(randomConnectMessage.categoryId, undefined);
 assert.equal(randomConnectMessage.ttl, 120);
 
+const [storyMessage] = buildExpoMessages(['ExpoPushToken[test-story-token]'], {
+  type: 'story', title: 'Story reaction', message: 'A teammate reacted to your story',
+  data: { customData: { storyId: 'story-1', targetType: 'story', targetId: 'story-1' } }
+}, 2);
+assert.equal(storyMessage.channelId, 'social');
+assert.equal(storyMessage.data.storyId, 'story-1');
+assert.equal(storyMessage.data.targetType, 'story');
+assert.equal(storyMessage.data.targetId, 'story-1');
+assert.equal(storyMessage.data.route, '/story/story-1');
+
+const [recruitmentMessage] = buildExpoMessages(['ExpoPushToken[test-recruitment-token]'], {
+  type: 'recruitment', title: 'Recruitment update', message: 'Your application was reviewed',
+  data: { recruitmentId: 'recruitment-1' }
+}, 1);
+assert.equal(recruitmentMessage.channelId, 'tournaments');
+assert.equal(recruitmentMessage.data.recruitmentId, 'recruitment-1');
+assert.equal(recruitmentMessage.data.route, '/recruitment/recruitment-1');
+
 const callData = buildPushData(callNotification);
 for (const field of ['eventType', 'callId', 'nativeCallId', 'roomId', 'randomRoomId', 'callType', 'callerId', 'deadlineAt', 'expiresAt']) {
   assert.ok(Object.prototype.hasOwnProperty.call(callData, field), `missing allowlisted call field ${field}`);
