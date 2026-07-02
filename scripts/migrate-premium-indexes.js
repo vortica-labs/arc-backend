@@ -16,7 +16,8 @@ const modelNames = [
   'PremiumMutationClaim',
   'RazorpayWebhookEvent',
   'PaymentTransaction',
-  'AdminAuditLog'
+  'AdminAuditLog',
+  'UserLoginEvent'
 ];
 const loadModels = () => modelNames.map((name) => require(
   path.resolve(__dirname, '..', 'src', 'legacy-src', 'models', `${name}.js`)
@@ -38,6 +39,7 @@ async function verifyModel(Model) {
     same(index.key, key) &&
     Boolean(index.unique) === Boolean(options.unique) &&
     Boolean(index.sparse) === Boolean(options.sparse) &&
+    Number(index.expireAfterSeconds ?? -1) === Number(options.expireAfterSeconds ?? -1) &&
     same(index.partialFilterExpression, options.partialFilterExpression)
   ));
   if (missing.length) {

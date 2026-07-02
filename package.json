@@ -11,6 +11,7 @@
     "test:auth-oauth-contracts": "node src/legacy-src/controllers/authController.oauth.test.js",
     "test:auth-onboarding": "node src/legacy-src/utils/onboardingValidation.test.js && node src/legacy-src/middleware/auth.profile-completion.test.js && node src/legacy-src/controllers/authController.oauth.test.js && node src/legacy-src/config/passport.oauth.test.js",
     "test:auth-limiter": "node src/legacy-src/middleware/progressiveAuthLimiter.test.js",
+    "test:auth-login-audit": "node src/legacy-src/utils/userLoginAudit.test.js && node src/legacy-src/models/UserLoginEvent.test.js",
     "test:broadcast": "node src/legacy-src/services/broadcastService.test.js",
     "test:recommendations": "node src/legacy-src/services/recommendationService.test.js",
     "test:random-connect": "node src/legacy-src/controllers/randomConnectController.test.js",
@@ -20,7 +21,7 @@
     "verify:premium-indexes": "node scripts/migrate-premium-indexes.js --verify",
     "backfill:premium": "node scripts/backfill-premium-memberships.js",
     "backfill:premium:apply": "node scripts/backfill-premium-memberships.js --apply",
-    "test:premium": "node src/legacy-src/services/premiumMembershipService.test.js && node src/legacy-src/services/premiumMembership.security.test.js && node src/legacy-src/services/premiumMembership.models.security.test.js && node src/legacy-src/services/premiumMembershipService.security.test.js && node --check scripts/migrate-premium-indexes.js && node --check scripts/backfill-premium-memberships.js && node scripts/backfill-premium-memberships.test.js"
+    "test:premium": "node src/legacy-src/services/premiumMembershipService.test.js && node src/legacy-src/services/premiumMembership.security.test.js && node src/legacy-src/services/premiumMembership.models.security.test.js && node src/legacy-src/services/premiumMembershipService.security.test.js && node src/legacy-src/services/premiumLoginHistoryService.test.js && node --check scripts/migrate-premium-indexes.js && node --check scripts/backfill-premium-memberships.js && node scripts/backfill-premium-memberships.test.js"
   },
   "keywords": [
     "modular-monolith",

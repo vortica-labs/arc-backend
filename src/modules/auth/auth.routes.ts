@@ -8,6 +8,7 @@ import {
   progressiveOtpLoginLimiter,
   protect,
   protectAllowIncomplete,
+  recordSuccessfulLogin,
   uploadSingle
 } from "./auth.legacy-adapters";
 
@@ -116,8 +117,13 @@ router.get(
   passport.authenticate("google", { session: false, failureRedirect: `${process.env.CLIENT_URL}/login?error=google_auth_failed` }),
   async (req, res) => {
     try {
-      const authReq = req as unknown as { user?: { token?: string } };
+      const authReq = req as unknown as { user?: { token?: string; user?: { _id?: unknown } } };
       const token = authReq.user?.token ?? "";
+      void recordSuccessfulLogin({
+        user: authReq.user?.user,
+        authMethod: "google_passport",
+        request: req,
+      });
       const isMobile = req.query.state === "mobile";
       if (isMobile) {
         return res.redirect(`arcmobile://google-auth?token=${encodeURIComponent(token)}`);

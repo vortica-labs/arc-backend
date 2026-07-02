@@ -1,6 +1,7 @@
 const User = require('../models/User');
 const PremiumMembership = require('../models/PremiumMembership');
 const service = require('../services/premiumMembershipService');
+const { listPremiumMemberLogins } = require('../services/premiumLoginHistoryService');
 
 const respondError = (res, error) => res.status(Number(error?.statusCode) || 500).json({
   success: false,
@@ -38,7 +39,11 @@ const executeMutation = async (req, res, operation, payload, callback) => {
     const value = await callback(admin);
     businessCompleted = true;
     const serialized = value?.membership
-      ? { ...value, membership: service.serializeMembership(value.membership) }
+      ? {
+        membership: service.serializeMembership(value.membership),
+        ...(value.transaction ? { payment: service.serializePaymentTransaction(value.transaction) } : {}),
+        ...(value.refund ? { refund: value.refund } : {})
+      }
       : service.serializeMembership(value);
     await service.completeMutation(claim, value?.membership || value, serialized);
     res.locals.auditAfter = serialized;
@@ -109,6 +114,10 @@ const getTimeline = async (req, res) => {
   try { return res.json({ success: true, data: await service.listTimeline(req.params.id, req.query) }); }
   catch (error) { return respondError(res, error); }
 };
+const getLoginHistory = async (req, res) => {
+  try { return res.json({ success: true, data: await listPremiumMemberLogins(req.params.id, req.query) }); }
+  catch (error) { return respondError(res, error); }
+};
 
 const grant = (req, res) => executeMutation(req, res, 'grant', req.body, (admin) => service.grantMembership({
   userId: req.body?.userId,
@@ -164,6 +173,7 @@ module.exports = {
   getMembership,
   getPayments,
   getTimeline,
+  getLoginHistory,
   grant,
   extend,
   changePlan,

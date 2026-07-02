@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const User = require('../models/User');
+const premiumMembershipService = require('../services/premiumMembershipService');
 require('dotenv').config();
 
 /**
@@ -86,49 +87,27 @@ const assignPremium = async () => {
     const validUntil = new Date();
     validUntil.setFullYear(validUntil.getFullYear() + 10);
 
-    // Initialize credits based on plan
-    let initialCredits = 0;
-    if (newTier === 'player_pro') {
-      // Player Pro gets 2 credits/week, give initial 2 credits
-      initialCredits = 2;
-    } else if (newTier === 'player_pro_plus') {
-      // Player Pro+ gets 5 credits/week, give initial 5 credits
-      initialCredits = 5;
-    } else if (newTier === 'team_pro') {
-      initialCredits = 25; // Monthly credits for team pro
-    } else if (newTier === 'team_org') {
-      initialCredits = 60; // Monthly credits for team org
-    }
-
-    // Update user to premium
-    user.isPremium = true;
-    
-    // Update membership
-    if (!user.membership) {
-      user.membership = {
-        tier: newTier,
-        validUntil: validUntil,
-        credits: initialCredits
-      };
-    } else {
-      user.membership.tier = newTier;
-      user.membership.validUntil = validUntil;
-      // Only update credits if they're 0 or less (don't overwrite existing credits)
-      if (!user.membership.credits || user.membership.credits <= 0) {
-        user.membership.credits = initialCredits;
-      }
-    }
-
-    await user.save();
+    const membership = await premiumMembershipService.grantMembership({
+      userId: user._id,
+      planKey: newTier,
+      billingPeriod: 'yearly',
+      startAt: new Date(),
+      expiresAt: validUntil,
+      reason: 'Granted by the canonical premium assignment script',
+      platform: 'admin',
+      actor: premiumMembershipService.systemActor('script:assign-premium')
+    });
+    const projectedUser = await User.findById(user._id).select('membership').lean();
 
     console.log('\n✅ Premium status assigned successfully!');
     console.log(`   Username: ${user.username}`);
     console.log(`   Premium Status: ✅ Premium`);
-    console.log(`   Membership Tier: ${user.membership.tier}`);
+    console.log(`   Membership Tier: ${membership.planKey}`);
     console.log(`   Valid Until: ${validUntil.toLocaleDateString()} (10 years)`);
-    console.log(`   Credits: ${user.membership.credits}`);
+    console.log(`   Credits: ${projectedUser?.membership?.credits || 0}`);
 
   } catch (error) {
+    process.exitCode = 1;
     console.error('❌ Error assigning premium:', error.message);
     if (error.code === 11000) {
       console.error('   Duplicate key error - username might already exist');
@@ -137,7 +116,6 @@ const assignPremium = async () => {
   } finally {
     await mongoose.disconnect();
     console.log('\n👋 Database connection closed');
-    process.exit(0);
   }
 };
 

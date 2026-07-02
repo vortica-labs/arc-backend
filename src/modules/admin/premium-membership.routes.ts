@@ -18,6 +18,7 @@ router.get("/", auditLog("VIEW_PREMIUM_MEMBERSHIPS"), requireAdminPermission("pr
 router.post("/grant", auditLog("GRANT_PREMIUM_MEMBERSHIP"), mutationLimiter, requireAdminPermission("premium:manage"), durableMutationAudit("GRANT_PREMIUM_MEMBERSHIP"), premiumMembershipController.grant);
 router.get("/:id/payments", auditLog("VIEW_PREMIUM_PAYMENTS"), requireAdminPermission("premium:read"), premiumMembershipController.getPayments);
 router.get("/:id/timeline", auditLog("VIEW_PREMIUM_TIMELINE"), requireAdminPermission("premium:read"), premiumMembershipController.getTimeline);
+router.get("/:id/login-history", auditLog("VIEW_PREMIUM_LOGIN_HISTORY"), requireAdminPermission("premium:read"), premiumMembershipController.getLoginHistory);
 router.get("/:id", auditLog("VIEW_PREMIUM_MEMBERSHIP"), requireAdminPermission("premium:read"), premiumMembershipController.getMembership);
 router.post("/:id/extend", auditLog("EXTEND_PREMIUM_MEMBERSHIP"), mutationLimiter, requireAdminPermission("premium:manage"), durableMutationAudit("EXTEND_PREMIUM_MEMBERSHIP"), premiumMembershipController.extend);
 router.post("/:id/change-plan", auditLog("CHANGE_PREMIUM_PLAN"), mutationLimiter, requireAdminPermission("premium:manage"), durableMutationAudit("CHANGE_PREMIUM_PLAN"), premiumMembershipController.changePlan);

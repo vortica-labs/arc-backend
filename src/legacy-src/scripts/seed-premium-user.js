@@ -13,6 +13,7 @@
 
 const mongoose = require('mongoose');
 const User = require('../models/User');
+const premiumMembershipService = require('../services/premiumMembershipService');
 require('dotenv').config();
 
 const VALID_UNTIL_YEARS = 10;
@@ -67,29 +68,37 @@ const seedPremiumUser = async () => {
   const validUntil = new Date();
   validUntil.setFullYear(validUntil.getFullYear() + VALID_UNTIL_YEARS);
 
-  user.isPremium = true;
-  user.isVerified = true;
-  user.isVerifiedHost = true;
-  user.isCreator = true;
-  user.creatorCpm = user.creatorCpm || 5;
+  const membership = await premiumMembershipService.grantMembership({
+    userId: user._id,
+    planKey: tier,
+    billingPeriod: 'yearly',
+    startAt: new Date(),
+    expiresAt: validUntil,
+    reason: 'Granted by the canonical premium test seeding script',
+    platform: 'admin',
+    actor: premiumMembershipService.systemActor('script:seed-premium-user')
+  });
 
-  user.membership = {
-    tier,
-    validUntil,
-    credits: CREDITS_BY_TIER[tier],
-  };
+  const premiumUser = await User.findById(user._id);
+  if (!premiumUser) throw new Error('User disappeared after premium grant');
+  premiumUser.isVerified = true;
+  premiumUser.isVerifiedHost = true;
+  premiumUser.isCreator = true;
+  premiumUser.creatorCpm = premiumUser.creatorCpm || 5;
 
-  await user.save();
+  premiumUser.membership.credits = CREDITS_BY_TIER[tier];
+
+  await premiumUser.save();
 
   console.log('\nPremium seed complete:');
-  console.log(`  username       : ${user.username}`);
-  console.log(`  isPremium      : ${user.isPremium}`);
-  console.log(`  isVerified     : ${user.isVerified}`);
-  console.log(`  isVerifiedHost : ${user.isVerifiedHost}`);
-  console.log(`  isCreator      : ${user.isCreator}`);
-  console.log(`  creatorCpm     : ${user.creatorCpm}`);
-  console.log(`  tier           : ${user.membership.tier}`);
-  console.log(`  credits        : ${user.membership.credits}`);
+  console.log(`  username       : ${premiumUser.username}`);
+  console.log(`  isPremium      : ${premiumUser.isPremium}`);
+  console.log(`  isVerified     : ${premiumUser.isVerified}`);
+  console.log(`  isVerifiedHost : ${premiumUser.isVerifiedHost}`);
+  console.log(`  isCreator      : ${premiumUser.isCreator}`);
+  console.log(`  creatorCpm     : ${premiumUser.creatorCpm}`);
+  console.log(`  tier           : ${membership.planKey}`);
+  console.log(`  credits        : ${premiumUser.membership.credits}`);
   console.log(`  valid until    : ${validUntil.toISOString().split('T')[0]} (+${VALID_UNTIL_YEARS}y)`);
 
   await mongoose.disconnect();

@@ -7,6 +7,7 @@ const PaymentTransaction = require('../models/PaymentTransaction');
 const User = require('../models/User');
 const Notification = require('../models/Notification');
 const Report = require('../models/Report');
+const UserLoginEvent = require('../models/UserLoginEvent');
 const provider = require('./razorpayPremiumProvider');
 
 const ACTIVE_MEMBERSHIP_STATUSES = new Set(['active']);
@@ -211,6 +212,19 @@ const snapshotState = (membership) => ({
   cancelAtCycleEnd: Boolean(membership?.cancelAtCycleEnd),
   expiresAt: membership?.expiresAt || null
 });
+
+const transactionOwnsCurrentProviderEntitlement = (membership, transaction) => {
+  if (!membership?.isCurrent || !transaction) return false;
+  if (membership.source === 'razorpay_subscription') {
+    const currentSubscriptionId = safeString(membership.razorpay?.subscriptionId, 200);
+    return Boolean(currentSubscriptionId && transaction.providerSubscriptionId === currentSubscriptionId);
+  }
+  if (membership.source === 'razorpay_order') {
+    const currentPaymentId = safeString(membership.razorpay?.paymentId, 200);
+    return Boolean(currentPaymentId && [transaction.providerPaymentId, transaction.paymentId].includes(currentPaymentId));
+  }
+  return false;
+};
 
 const appendEvent = async ({ membership, action, source, actor, previousState, reason, amount, currency, correlationId, dedupeKey, metadata, timestamp, razorpay }) => {
   const current = membership.toObject ? membership.toObject() : membership;
@@ -803,6 +817,12 @@ const createRecurringSubscription = async ({ userId, planKey, billingPeriod, pla
   }
   if (current && isEntitled(current)) throw fail('Cancel or expire the current membership before starting recurring billing', 409, 'ACTIVE_MEMBERSHIP_EXISTS');
 
+  // Configuration failures are deterministic and retryable once an operator fixes
+  // the environment. Validate them before creating any local subscription state so
+  // a missing plan or credential cannot strand the user in a pending trial.
+  provider.getConfiguredPlanId(plan.id, period);
+  provider.getClient();
+
   const startedAt = new Date();
   let membership = await upsertCurrentMembership({
     user,
@@ -1110,6 +1130,9 @@ const changePlan = async ({ membershipId, planKey, billingPeriod, expiresAt, sch
     });
     return membership;
   }
+  if (!isEntitled(membership)) {
+    throw fail('Only an active membership can change plan; grant or extend access first', 409, 'INACTIVE_MEMBERSHIP');
+  }
   const explicitExpiry = toDate(expiresAt, 'expiresAt');
   const derived = period === 'lifetime' ? null : deriveExpiry(new Date(), period);
   const expiry = period === 'lifetime'
@@ -1128,14 +1151,18 @@ const changePlan = async ({ membershipId, planKey, billingPeriod, expiresAt, sch
 const cancelMembership = async ({ membershipId, mode = 'cycle_end', reason, actor, source = 'admin' }) => {
   const membership = await getMembershipOrThrow(membershipId);
   if (!['immediate', 'cycle_end'].includes(mode)) throw fail('Cancellation mode must be immediate or cycle_end');
-  if (['cancelled', 'expired', 'removed', 'refunded'].includes(membership.membershipStatus)) return membership;
+  if (['cancelled', 'expired', 'removed', 'refunded'].includes(membership.membershipStatus)) {
+    await projectEntitlement(membership);
+    return membership;
+  }
   if (mode === 'cycle_end' && !membership.expiresAt) {
     throw fail('A no-expiry lifetime membership can only be cancelled immediately', 400, 'LIFETIME_REQUIRES_IMMEDIATE_CANCELLATION');
   }
   if (mode === 'cycle_end' && membership.cancelAtCycleEnd && !membership.autoRenew) return membership;
   const previousState = snapshotState(membership);
   let providerResult = null;
-  if (membership.razorpay?.subscriptionId) {
+  const providerCancellationAlreadyScheduled = membership.cancelAtCycleEnd && !membership.autoRenew;
+  if (membership.razorpay?.subscriptionId && !(mode === 'immediate' && providerCancellationAlreadyScheduled)) {
     providerResult = await provider.cancelSubscription(membership.razorpay.subscriptionId, mode === 'cycle_end');
   }
   if (mode === 'cycle_end') {
@@ -1172,7 +1199,10 @@ const cancelMembership = async ({ membershipId, mode = 'cycle_end', reason, acto
 const removeMembership = async ({ membershipId, reason, actor }) => {
   if (safeString(reason, 1000).length < 3) throw fail('A reason of at least 3 characters is required');
   const membership = await getMembershipOrThrow(membershipId);
-  if (['removed', 'refunded', 'expired', 'cancelled'].includes(membership.membershipStatus)) return membership;
+  if (['removed', 'refunded', 'expired', 'cancelled'].includes(membership.membershipStatus)) {
+    await projectEntitlement(membership);
+    return membership;
+  }
   if (membership.razorpay?.subscriptionId && !TERMINAL_PROVIDER_STATUSES.has(membership.subscriptionStatus)) {
     await provider.cancelSubscription(membership.razorpay.subscriptionId, false);
   }
@@ -1311,49 +1341,71 @@ const refundMembershipPayment = async ({ membershipId, paymentTransactionId, amo
     throw error;
   }
 
-  const processed = refund.status === 'processed';
-  const failed = refund.status === 'failed';
-  const totalRefunded = refunded + (processed ? requested : 0);
-  const transactionUpdate = {
-    $set: {
-      refundLockToken: '',
-      refundLockAt: null,
-      refundLockAmount: 0,
-      refundLockReceipt: '',
-      providerRefundId: refund.id,
-      refundStatus: failed ? 'failed' : (processed ? (totalRefunded >= captured ? 'full' : 'partial') : 'pending')
-    },
-    $push: { refundHistory: { refundId: refund.id, amount: requested, status: processed ? 'processed' : (failed ? 'failed' : 'pending'), reservedAmount: (!processed && !failed) ? requested : 0, reason } }
-  };
-  if (processed) transactionUpdate.$inc = { refundReservedAmount: -requested, refundedAmount: requested };
-  if (failed) transactionUpdate.$inc = { refundReservedAmount: -requested };
-  if (processed && totalRefunded >= captured) transactionUpdate.$set.status = 'refunded';
-  transaction = await PaymentTransaction.findOneAndUpdate(
-    { _id: transaction._id, refundLockToken: lockToken, 'refundHistory.refundId': { $ne: refund.id } },
-    transactionUpdate,
-    { new: true, runValidators: true }
-  );
-  if (!transaction) {
-    transaction = await PaymentTransaction.findOne({ _id: candidate._id, 'refundHistory.refundId': refund.id });
-    const racedEntry = transaction?.refundHistory?.find((entry) => entry.refundId === refund.id);
-    if (!transaction || !racedEntry) {
-      const divergence = fail('Refund was submitted but local reconciliation is required', 503, 'REFUND_RECONCILIATION_REQUIRED');
-      divergence.providerStatus = refund.status || 'submitted';
-      divergence.localStatus = 'reconciliation_required';
-      throw divergence;
-    }
-    await PaymentTransaction.updateOne(
+  const providerStatus = safeString(refund.status, 40).toLowerCase();
+  if (['processed', 'failed'].includes(providerStatus)) {
+    const transition = await transitionRefundTransaction({
+      transactionId: transaction._id,
+      refund: {
+        ...refund,
+        receipt: refund.receipt || refundReceipt,
+        notes: { ...(refund.notes || {}), receipt: refund.notes?.receipt || refundReceipt, reason }
+      },
+      status: providerStatus,
+      amount: requested
+    });
+    transaction = transition.transaction;
+    const released = await PaymentTransaction.updateOne(
       { _id: transaction._id, refundLockToken: lockToken },
       {
         $inc: { refundReservedAmount: -requested },
         $set: { refundLockToken: '', refundLockAt: null, refundLockAmount: 0, refundLockReceipt: '' }
       }
     );
-    transaction = await PaymentTransaction.findById(transaction._id);
+    if (Number(released?.modifiedCount ?? released?.nModified ?? 0) > 0) {
+      transaction = await PaymentTransaction.findById(transaction._id);
+    }
+  } else {
+    transaction = await PaymentTransaction.findOneAndUpdate(
+      { _id: transaction._id, refundLockToken: lockToken, 'refundHistory.refundId': { $ne: refund.id } },
+      {
+        $set: {
+          refundLockToken: '',
+          refundLockAt: null,
+          refundLockAmount: 0,
+          refundLockReceipt: '',
+          providerRefundId: refund.id,
+          refundStatus: 'pending'
+        },
+        $push: { refundHistory: { refundId: refund.id, amount: requested, status: 'pending', reservedAmount: requested, reason } },
+        $inc: { refundStateVersion: 1 }
+      },
+      { new: true, runValidators: true }
+    );
+    if (!transaction) {
+      transaction = await PaymentTransaction.findOne({ _id: candidate._id, 'refundHistory.refundId': refund.id });
+      if (!transaction) {
+        const divergence = fail('Refund was submitted but local reconciliation is required', 503, 'REFUND_RECONCILIATION_REQUIRED');
+        divergence.providerStatus = refund.status || 'submitted';
+        divergence.localStatus = 'reconciliation_required';
+        throw divergence;
+      }
+      await PaymentTransaction.updateOne(
+        { _id: transaction._id, refundLockToken: lockToken },
+        {
+          $inc: { refundReservedAmount: -requested },
+          $set: { refundLockToken: '', refundLockAt: null, refundLockAmount: 0, refundLockReceipt: '' }
+        }
+      );
+      transaction = await PaymentTransaction.findById(transaction._id);
+    }
   }
 
-  const fullRefundRequested = refunded + requested >= captured;
-  if (processed && fullRefundRequested && !newerFundingExists && membership.razorpay?.subscriptionId && !TERMINAL_PROVIDER_STATUSES.has(membership.subscriptionStatus)) {
+  const finalRefundEntry = transaction.refundHistory.find((entry) => entry.refundId === refund.id);
+  const finalRefundStatus = finalRefundEntry?.status || 'pending';
+  const processed = finalRefundStatus === 'processed';
+  const ownsCurrentEntitlement = transactionOwnsCurrentProviderEntitlement(membership, transaction);
+  const fullRefund = transaction.refundStatus === 'full';
+  if (processed && fullRefund && !newerFundingExists && ownsCurrentEntitlement && membership.razorpay?.subscriptionId && !TERMINAL_PROVIDER_STATUSES.has(membership.subscriptionStatus)) {
     try {
       await provider.cancelSubscription(membership.razorpay.subscriptionId, false);
     } catch (error) {
@@ -1366,7 +1418,7 @@ const refundMembershipPayment = async ({ membershipId, paymentTransactionId, amo
     }
   }
   const previousState = snapshotState(membership);
-  if (processed && totalRefunded >= captured && !newerFundingExists) {
+  if (processed && fullRefund && !newerFundingExists && ownsCurrentEntitlement) {
     const now = new Date();
     await safeMembershipUpdate(membership, {
       membershipStatus: 'refunded',
@@ -1379,8 +1431,13 @@ const refundMembershipPayment = async ({ membershipId, paymentTransactionId, amo
     });
     await projectEntitlement(membership);
   }
-  await appendEvent({ membership, action: 'refund', source: 'admin', actor, previousState, reason, amount: requested, dedupeKey: `refund:${refund.id}`, razorpay: { ...membership.razorpay, refundId: refund.id } });
-  await notifyLifecycle(membership, { title: 'Premium payment refunded', message: `A refund of ₹${requested.toFixed(2)} was ${processed ? 'processed' : 'requested'}.`, action: 'refund' });
+  await appendEvent({ membership, action: 'refund', source: 'admin', actor, previousState, reason, amount: requested, dedupeKey: `refund:${refund.id}`, razorpay: { ...membership.razorpay, refundId: refund.id }, metadata: { providerStatus, finalStatus: finalRefundStatus, ownsCurrentEntitlement } });
+  const notification = finalRefundStatus === 'processed'
+    ? { title: 'Premium refund processed', message: `Your ₹${requested.toFixed(2)} refund has been processed.` }
+    : finalRefundStatus === 'failed'
+      ? { title: 'Premium refund failed', message: 'Your premium refund could not be processed. Please contact support.' }
+      : { title: 'Premium refund requested', message: `Your ₹${requested.toFixed(2)} refund request is being processed.` };
+  await notifyLifecycle(membership, { ...notification, action: 'refund' });
   return { membership, transaction, refund: provider.sanitizeProviderSnapshot(refund) };
 };
 
@@ -1391,6 +1448,19 @@ const providerStatusToMembership = (status, periodEnd) => {
   if (['completed', 'expired'].includes(status)) return 'expired';
   return null;
 };
+
+const shouldPreserveTerminalReconciliationState = (membership, providerStatus) => {
+  const localTerminal = ['cancelled', 'expired', 'removed', 'refunded'].includes(membership?.membershipStatus) ||
+    TERMINAL_PROVIDER_STATUSES.has(membership?.subscriptionStatus);
+  return localTerminal && !TERMINAL_PROVIDER_STATUSES.has(providerStatus);
+};
+
+const shouldPreserveImmediateCancellationEnd = (membership) => Boolean(
+  membership?.membershipStatus === 'cancelled' &&
+  membership?.subscriptionStatus === 'cancelled' &&
+  membership?.cancelAtCycleEnd === false &&
+  membership?.endedAt
+);
 
 const providerBoolean = (value, fallback) => {
   if (value === true || value === 1 || value === '1') return true;
@@ -1446,6 +1516,14 @@ const applySubscriptionEvent = async ({ eventId, eventType, providerCreatedAt, s
     }
   }
   if (!membership) return { ignored: false, retryable: true, reason: 'membership_not_found' };
+  if (
+    !membership.isCurrent ||
+    membership.source !== 'razorpay_subscription' ||
+    !subscription?.id ||
+    membership.razorpay?.subscriptionId !== subscription.id
+  ) {
+    return { ignored: true, reason: 'stale_subscription_generation' };
+  }
   if (['removed', 'refunded'].includes(membership.membershipStatus)) return { ignored: true, reason: 'terminal_membership' };
   const eventAt = providerCreatedAt || new Date();
   if (membership.providerLastEventAt && eventAt < membership.providerLastEventAt) return { ignored: true, reason: 'out_of_order', membership };
@@ -1490,6 +1568,7 @@ const applySubscriptionEvent = async ({ eventId, eventType, providerCreatedAt, s
   const suffix = eventType.split('.')[1];
   const providerCancelAtEnd = providerBoolean(subscription.cancel_at_cycle_end, membership.cancelAtCycleEnd);
   const terminalProvider = ['cancelled', 'completed', 'expired'].includes(providerStatus);
+  const preserveImmediateCancellationEnd = shouldPreserveImmediateCancellationEnd(membership);
   await safeMembershipUpdate(membership, {
     ...(pendingActivated ? {
       planKey: effectivePlanKey,
@@ -1502,12 +1581,12 @@ const applySubscriptionEvent = async ({ eventId, eventType, providerCreatedAt, s
     membershipStatus: mappedMembershipStatus || membership.membershipStatus,
     subscriptionStatus: providerStatus === 'resumed' ? 'active' : providerStatus,
     autoRenew: terminalProvider ? false : !providerCancelAtEnd,
-    cancelAtCycleEnd: providerCancelAtEnd,
+    cancelAtCycleEnd: preserveImmediateCancellationEnd ? false : providerCancelAtEnd,
     currentPeriodStart: periodStart,
-    currentPeriodEnd: periodEnd,
-    expiresAt: periodEnd,
-    cancelledAt: providerStatus === 'cancelled' ? eventAt : membership.cancelledAt,
-    endedAt: mappedMembershipStatus && mappedMembershipStatus !== 'active' ? eventAt : null,
+    currentPeriodEnd: preserveImmediateCancellationEnd ? membership.currentPeriodEnd : periodEnd,
+    expiresAt: preserveImmediateCancellationEnd ? membership.expiresAt : periodEnd,
+    cancelledAt: preserveImmediateCancellationEnd ? membership.cancelledAt : (providerStatus === 'cancelled' ? eventAt : membership.cancelledAt),
+    endedAt: preserveImmediateCancellationEnd ? membership.endedAt : (mappedMembershipStatus && mappedMembershipStatus !== 'active' ? eventAt : null),
     lastPaymentAt: payment ? (fromUnix(payment.created_at) || eventAt) : membership.lastPaymentAt,
     providerLastEventAt: eventAt,
     providerLastEventId: eventId,
@@ -1550,60 +1629,122 @@ const applySubscriptionEvent = async ({ eventId, eventType, providerCreatedAt, s
   return { membership, ignored: false };
 };
 
+const recomputeRefundSummary = async (transactionId, refundId) => {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const current = await PaymentTransaction.findById(transactionId);
+    if (!current) throw fail('Refund transaction was not found', 503, 'REFUND_RECONCILIATION_REQUIRED');
+    const captured = Number(current.capturedAmount || current.amount);
+    const refunded = Number(current.refundedAmount || 0);
+    const hasPending = current.refundHistory.some((entry) => entry.status === 'pending');
+    const refundStatus = refunded >= captured
+      ? 'full'
+      : (refunded > 0 ? 'partial' : (hasPending ? 'pending' : 'failed'));
+    const version = Number(current.refundStateVersion || 0);
+    const versionFilter = version === 0
+      ? { $or: [{ refundStateVersion: 0 }, { refundStateVersion: { $exists: false } }] }
+      : { refundStateVersion: version };
+    const result = await PaymentTransaction.updateOne(
+      { _id: transactionId, ...versionFilter },
+      {
+        $set: {
+          providerRefundId: refundId,
+          refundStatus,
+          ...(refundStatus === 'full' ? { status: 'refunded' } : {})
+        }
+      }
+    );
+    if (Number(result?.matchedCount ?? result?.n ?? 0) > 0) return;
+  }
+  throw fail('Refund summary could not be reconciled safely', 503, 'REFUND_RECONCILIATION_REQUIRED');
+};
+
+const transitionRefundTransaction = async ({ transactionId, refund, status, amount }) => {
+  const refundId = safeString(refund?.id, 200);
+  if (!refundId || !['failed', 'processed'].includes(status) || !Number.isFinite(amount) || amount < 0) {
+    throw fail('Refund event is invalid', 400, 'INVALID_REFUND_EVENT');
+  }
+
+  let transitioned = false;
+  let previousStatus = null;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const current = await PaymentTransaction.findById(transactionId);
+    if (!current) throw fail('Refund transaction was not found', 503, 'REFUND_RECONCILIATION_REQUIRED');
+    const existingEntry = current.refundHistory.find((entry) => entry.refundId === refundId);
+    if (attempt === 0) previousStatus = existingEntry?.status || null;
+
+    // Processed is terminal. A delayed failure may never downgrade it, while a
+    // processed event is allowed to repair a previously-recorded failure.
+    if (existingEntry?.status === 'processed' || (existingEntry?.status === 'failed' && status === 'failed')) break;
+
+    let result;
+    if (existingEntry?.status === 'pending') {
+      const reservedAmount = Number(existingEntry.reservedAmount || 0);
+      const increments = { refundStateVersion: 1 };
+      if (reservedAmount > 0) increments.refundReservedAmount = -reservedAmount;
+      if (status === 'processed') increments.refundedAmount = amount;
+      result = await PaymentTransaction.updateOne(
+        { _id: current._id, refundHistory: { $elemMatch: { refundId, status: 'pending' } } },
+        {
+          $set: { 'refundHistory.$.status': status, 'refundHistory.$.reservedAmount': 0, providerRefundId: refundId },
+          $inc: increments
+        }
+      );
+    } else if (existingEntry?.status === 'failed' && status === 'processed') {
+      result = await PaymentTransaction.updateOne(
+        { _id: current._id, refundHistory: { $elemMatch: { refundId, status: 'failed' } } },
+        { $set: { 'refundHistory.$.status': 'processed', providerRefundId: refundId }, $inc: { refundedAmount: amount, refundStateVersion: 1 } }
+      );
+    } else if (!existingEntry) {
+      const lockMatches = Boolean(
+        current.refundLockReceipt &&
+        (refund.receipt === current.refundLockReceipt || refund.notes?.receipt === current.refundLockReceipt)
+      );
+      const reservedAmount = lockMatches ? Number(current.refundLockAmount || amount) : 0;
+      const update = {
+        $push: { refundHistory: { refundId, amount, status, reservedAmount: 0, reason: safeString(refund.notes?.reason, 1000) } },
+        $set: {
+          providerRefundId: refundId,
+          ...(lockMatches ? { refundLockToken: '', refundLockAt: null, refundLockAmount: 0, refundLockReceipt: '' } : {})
+        }
+      };
+      update.$inc = { refundStateVersion: 1 };
+      if (status === 'processed') update.$inc.refundedAmount = amount;
+      if (reservedAmount > 0) update.$inc.refundReservedAmount = -reservedAmount;
+      result = await PaymentTransaction.updateOne(
+        { _id: current._id, 'refundHistory.refundId': { $ne: refundId } },
+        update
+      );
+    }
+
+    if (Number(result?.modifiedCount ?? result?.nModified ?? 0) > 0) {
+      transitioned = true;
+      break;
+    }
+  }
+
+  await recomputeRefundSummary(transactionId, refundId);
+  const transaction = await PaymentTransaction.findById(transactionId);
+  const effectiveStatus = transaction?.refundHistory.find((entry) => entry.refundId === refundId)?.status;
+  const acceptable = status === 'processed'
+    ? effectiveStatus === 'processed'
+    : ['failed', 'processed'].includes(effectiveStatus);
+  if (!transaction || !acceptable) {
+    throw fail('Refund state could not be reconciled safely', 503, 'REFUND_RECONCILIATION_REQUIRED');
+  }
+  return { transaction, transitioned, previousStatus, effectiveStatus };
+};
+
 const applyRefundEvent = async ({ eventId, eventType, providerCreatedAt, refund }) => {
   const paymentId = refund?.payment_id;
   if (!paymentId) return { ignored: true, reason: 'payment_missing' };
-  let transaction = await PaymentTransaction.findOne({ $or: [{ paymentId }, { providerPaymentId: paymentId }] });
-  if (!transaction?.membership) return { ignored: false, retryable: true, reason: 'transaction_not_found' };
-  const membership = await PremiumMembership.findById(transaction.membership);
+  const initialTransaction = await PaymentTransaction.findOne({ $or: [{ paymentId }, { providerPaymentId: paymentId }] });
+  if (!initialTransaction?.membership) return { ignored: false, retryable: true, reason: 'transaction_not_found' };
+  const membership = await PremiumMembership.findById(initialTransaction.membership);
   if (!membership) return { ignored: false, retryable: true, reason: 'membership_not_found' };
   const amount = Number(refund.amount || 0) / 100;
-  const status = eventType === 'refund.failed' ? 'failed' : 'processed';
-  const existingEntry = transaction.refundHistory.find((entry) => entry.refundId === refund.id);
-  if (existingEntry?.status === 'pending') {
-    const reservedAmount = Number(existingEntry.reservedAmount || 0);
-    const increments = reservedAmount > 0 ? { refundReservedAmount: -reservedAmount } : {};
-    if (status === 'processed') increments.refundedAmount = amount;
-    await PaymentTransaction.updateOne(
-      { _id: transaction._id, refundHistory: { $elemMatch: { refundId: refund.id, status: 'pending' } } },
-      {
-        $set: { 'refundHistory.$.status': status, 'refundHistory.$.reservedAmount': 0, providerRefundId: refund.id },
-        $inc: increments
-      }
-    );
-  } else if (existingEntry?.status === 'failed' && status === 'processed') {
-    await PaymentTransaction.updateOne(
-      { _id: transaction._id, refundHistory: { $elemMatch: { refundId: refund.id, status: 'failed' } } },
-      { $set: { 'refundHistory.$.status': 'processed', providerRefundId: refund.id }, $inc: { refundedAmount: amount } }
-    );
-  } else if (!existingEntry) {
-    const lockMatches = Boolean(
-      transaction.refundLockReceipt &&
-      (refund.receipt === transaction.refundLockReceipt || refund.notes?.receipt === transaction.refundLockReceipt)
-    );
-    const reservedAmount = lockMatches ? Number(transaction.refundLockAmount || amount) : 0;
-    const update = {
-      $push: { refundHistory: { refundId: refund.id, amount, status, reservedAmount: 0, reason: safeString(refund.notes?.reason, 1000) } },
-      $set: {
-        providerRefundId: refund.id,
-        ...(lockMatches ? { refundLockToken: '', refundLockAt: null, refundLockAmount: 0, refundLockReceipt: '' } : {})
-      }
-    };
-    update.$inc = {};
-    if (status === 'processed') update.$inc.refundedAmount = amount;
-    if (reservedAmount > 0) update.$inc.refundReservedAmount = -reservedAmount;
-    if (Object.keys(update.$inc).length === 0) delete update.$inc;
-    await PaymentTransaction.updateOne({ _id: transaction._id, 'refundHistory.refundId': { $ne: refund.id } }, update);
-  }
-  transaction = await PaymentTransaction.findById(transaction._id);
-  const captured = Number(transaction.capturedAmount || transaction.amount);
-  const hasPending = transaction.refundHistory.some((entry) => entry.status === 'pending');
-  transaction.refundStatus = transaction.refundedAmount >= captured
-    ? 'full'
-    : (transaction.refundedAmount > 0 ? 'partial' : (hasPending ? 'pending' : 'failed'));
-  if (transaction.refundStatus === 'full') transaction.status = 'refunded';
-  transaction.providerRefundId = refund.id || transaction.providerRefundId;
-  await transaction.save();
+  const requestedStatus = eventType === 'refund.failed' ? 'failed' : 'processed';
+  const transition = await transitionRefundTransaction({ transactionId: initialTransaction._id, refund, status: requestedStatus, amount });
+  const { transaction, transitioned, effectiveStatus } = transition;
   const previousState = snapshotState(membership);
   const fundingDate = transaction.paidAt || transaction.createdAt;
   const newerFundingExists = Boolean(await PaymentTransaction.exists({
@@ -1612,7 +1753,8 @@ const applyRefundEvent = async ({ eventId, eventType, providerCreatedAt, refund 
     status: 'completed',
     $or: [{ paidAt: { $gt: fundingDate } }, { paidAt: null, createdAt: { $gt: transaction.createdAt } }]
   }));
-  if (transaction.refundStatus === 'full' && !newerFundingExists) {
+  const ownsCurrentEntitlement = transactionOwnsCurrentProviderEntitlement(membership, transaction);
+  if (transaction.refundStatus === 'full' && !newerFundingExists && ownsCurrentEntitlement) {
     const now = providerCreatedAt || new Date();
     if (membership.razorpay?.subscriptionId && !TERMINAL_PROVIDER_STATUSES.has(membership.subscriptionStatus)) {
       await provider.cancelSubscription(membership.razorpay.subscriptionId, false);
@@ -1628,11 +1770,11 @@ const applyRefundEvent = async ({ eventId, eventType, providerCreatedAt, refund 
     });
     await projectEntitlement(membership);
   }
-  await appendEvent({ membership, action: 'refund', source: 'webhook', actor: systemActor('provider:razorpay'), previousState, amount, timestamp: providerCreatedAt, dedupeKey: `webhook:${eventId}:refund`, razorpay: { ...membership.razorpay, refundId: refund.id }, metadata: { status } });
-  if (!existingEntry || existingEntry.status !== status) {
+  await appendEvent({ membership, action: 'refund', source: 'webhook', actor: systemActor('provider:razorpay'), previousState, amount, timestamp: providerCreatedAt, dedupeKey: `webhook:${eventId}:refund`, razorpay: { ...membership.razorpay, refundId: refund.id }, metadata: { status: effectiveStatus, requestedStatus, transitioned, ownsCurrentEntitlement } });
+  if (transitioned && effectiveStatus === requestedStatus) {
     await notifyLifecycle(membership, {
-      title: status === 'processed' ? 'Premium refund processed' : 'Premium refund failed',
-      message: status === 'processed' ? `Your ₹${amount.toFixed(2)} refund has been processed.` : 'Your premium refund could not be processed. Please contact support.',
+      title: effectiveStatus === 'processed' ? 'Premium refund processed' : 'Premium refund failed',
+      message: effectiveStatus === 'processed' ? `Your ₹${amount.toFixed(2)} refund has been processed.` : 'Your premium refund could not be processed. Please contact support.',
       action: 'refund'
     });
   }
@@ -1704,7 +1846,8 @@ const reconcileStaleRefundLocks = async (limit = 50) => {
               reason: safeString(match.notes?.reason, 1000)
             }
           },
-          $set: { refundStatus: 'pending', providerRefundId: match.id, refundLockToken: '', refundLockAt: null, refundLockAmount: 0, refundLockReceipt: '' }
+          $set: { refundStatus: 'pending', providerRefundId: match.id, refundLockToken: '', refundLockAt: null, refundLockAmount: 0, refundLockReceipt: '' },
+          $inc: { refundStateVersion: 1 }
         }
       );
     }
@@ -1765,10 +1908,12 @@ const reconcileMembership = async (membershipId, { actor = systemActor('system:r
     const periodEnd = fromUnix(providerResult.current_end) || membership.expiresAt;
     const status = safeString(providerResult.status, 40).toLowerCase();
     const mapped = providerStatusToMembership(status, periodEnd);
-    if (!['removed', 'refunded'].includes(membership.membershipStatus)) {
+    const preserveTerminalState = shouldPreserveTerminalReconciliationState(membership, status);
+    if (!['removed', 'refunded'].includes(membership.membershipStatus) && !preserveTerminalState) {
       const cancelAtCycleEnd = providerBoolean(providerResult.cancel_at_cycle_end, membership.cancelAtCycleEnd);
       const terminal = TERMINAL_PROVIDER_STATUSES.has(status);
       const providerEndedAt = fromUnix(providerResult.ended_at) || (terminal ? new Date() : null);
+      const preserveImmediateCancellationEnd = shouldPreserveImmediateCancellationEnd(membership);
       await safeMembershipUpdate(membership, {
         ...(pendingActivated ? {
           planKey: effectivePlanKey,
@@ -1782,26 +1927,33 @@ const reconcileMembership = async (membershipId, { actor = systemActor('system:r
         membershipStatus: mapped || membership.membershipStatus,
         subscriptionStatus: status || membership.subscriptionStatus,
         autoRenew: terminal ? false : !cancelAtCycleEnd,
-        cancelAtCycleEnd,
-        cancelledAt: status === 'cancelled' ? (providerEndedAt || membership.cancelledAt) : membership.cancelledAt,
-        endedAt: terminal ? providerEndedAt : membership.endedAt,
+        cancelAtCycleEnd: preserveImmediateCancellationEnd ? false : cancelAtCycleEnd,
+        cancelledAt: preserveImmediateCancellationEnd ? membership.cancelledAt : (status === 'cancelled' ? (providerEndedAt || membership.cancelledAt) : membership.cancelledAt),
+        endedAt: preserveImmediateCancellationEnd ? membership.endedAt : (terminal ? providerEndedAt : membership.endedAt),
         currentPeriodStart: fromUnix(providerResult.current_start) || membership.currentPeriodStart,
-        currentPeriodEnd: periodEnd,
-        expiresAt: periodEnd,
+        currentPeriodEnd: preserveImmediateCancellationEnd ? membership.currentPeriodEnd : periodEnd,
+        expiresAt: preserveImmediateCancellationEnd ? membership.expiresAt : periodEnd,
         providerSnapshot: provider.sanitizeProviderSnapshot(providerResult),
         'reconciliation.lastCheckedAt': new Date(),
         'reconciliation.error': ''
       });
+    } else if (preserveTerminalState) {
+      membership.providerSnapshot = provider.sanitizeProviderSnapshot(providerResult);
+      membership.reconciliation.lastCheckedAt = new Date();
+      membership.reconciliation.error = 'Provider state is still non-terminal; local terminal access was preserved';
+      await membership.save();
     }
   } else {
     membership.reconciliation.lastCheckedAt = new Date();
     membership.reconciliation.error = '';
     await membership.save();
   }
-  const entitled = await projectEntitlement(membership);
   await reconcilePendingRefunds(50, membership._id).catch(() => null);
-  await appendEvent({ membership, action: 'synchronization', source: 'system', actor, previousState, metadata: { entitled, providerChecked: Boolean(providerResult) } });
-  return membership;
+  const reconciledMembership = await PremiumMembership.findById(membership._id);
+  if (!reconciledMembership) throw fail('Membership not found', 404, 'MEMBERSHIP_NOT_FOUND');
+  const entitled = await projectEntitlement(reconciledMembership);
+  await appendEvent({ membership: reconciledMembership, action: 'synchronization', source: 'system', actor, previousState, metadata: { entitled, providerChecked: Boolean(providerResult) } });
+  return reconciledMembership;
 };
 
 const processLifecycleBatch = async ({ limit = 200, refreshProvider = false } = {}) => {
@@ -1978,7 +2130,11 @@ const getDashboard = async () => {
   const in7Days = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
   const in30Days = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
   const revenuePipeline = (since) => [
-    { $match: { type: 'subscription', status: { $in: ['completed', 'refunded'] }, ...(since ? { createdAt: { $gte: since } } : {}) } },
+    { $match: {
+      type: 'subscription',
+      status: { $in: ['completed', 'refunded'] },
+      ...(since ? { $or: [{ paidAt: { $gte: since } }, { paidAt: null, createdAt: { $gte: since } }] } : {})
+    } },
     { $group: {
       _id: null,
       captured: { $sum: { $cond: [{ $gt: ['$capturedAmount', 0] }, '$capturedAmount', '$amount'] } },
@@ -2065,9 +2221,41 @@ const getMembershipDetails = async (membershipId) => {
     ...serializeMembership(membership),
     devices,
     reports: { total: reportTotal, pending: reportPending, resolved: Math.max(0, reportTotal - reportPending), latestAt: latestReport?.createdAt || null },
-    loginHistory: { available: false, reason: 'Login history is not retained by the current authentication data model.' }
+    loginHistory: {
+      available: true,
+      retentionDays: Math.floor(UserLoginEvent.RETENTION_SECONDS / (24 * 60 * 60)),
+      endpoint: `/api/admin/premium-memberships/${String(membership._id)}/login-history`
+    }
   };
 };
+
+const serializePaymentTransaction = (payment) => ({
+  id: String(payment._id),
+  type: payment.type,
+  amount: payment.amount,
+  currency: payment.currency,
+  status: payment.status,
+  description: payment.description,
+  provider: payment.provider,
+  providerCustomerId: payment.providerCustomerId,
+  providerSubscriptionId: payment.providerSubscriptionId,
+  providerPaymentId: payment.providerPaymentId || payment.paymentId,
+  providerOrderId: payment.providerOrderId || payment.orderId,
+  providerInvoiceId: payment.providerInvoiceId,
+  providerRefundId: payment.providerRefundId,
+  platform: payment.platform,
+  paymentMethod: payment.paymentMethod,
+  gstAmount: payment.gstAmount,
+  discountAmount: payment.discountAmount,
+  couponCode: payment.couponCode,
+  invoiceUrl: /^https:\/\//i.test(payment.invoiceUrl || '') ? payment.invoiceUrl : '',
+  capturedAmount: payment.status === 'failed' ? 0 : (payment.capturedAmount > 0 ? payment.capturedAmount : payment.amount),
+  refundedAmount: payment.refundedAmount,
+  refundStatus: payment.refundStatus,
+  refundHistory: (payment.refundHistory || []).map((refund) => ({ refundId: refund.refundId, amount: refund.amount, status: refund.status, reservedAmount: refund.reservedAmount || 0, reason: refund.reason, createdAt: refund.createdAt })),
+  paidAt: payment.paidAt,
+  createdAt: payment.createdAt
+});
 
 const listPayments = async (membershipId, { page = 1, limit = 25 } = {}) => {
   if (!isObjectId(String(membershipId))) throw fail('Membership not found', 404, 'MEMBERSHIP_NOT_FOUND');
@@ -2085,33 +2273,7 @@ const listPayments = async (membershipId, { page = 1, limit = 25 } = {}) => {
     PaymentTransaction.find(paymentFilter).sort({ paidAt: -1, createdAt: -1 }).skip((currentPage - 1) * pageSize).limit(pageSize).lean(),
     PaymentTransaction.countDocuments(paymentFilter)
   ]);
-  const serialized = payments.map((payment) => ({
-    id: String(payment._id),
-    type: payment.type,
-    amount: payment.amount,
-    currency: payment.currency,
-    status: payment.status,
-    description: payment.description,
-    provider: payment.provider,
-    providerCustomerId: payment.providerCustomerId,
-    providerSubscriptionId: payment.providerSubscriptionId,
-    providerPaymentId: payment.providerPaymentId || payment.paymentId,
-    providerOrderId: payment.providerOrderId || payment.orderId,
-    providerInvoiceId: payment.providerInvoiceId,
-    providerRefundId: payment.providerRefundId,
-    platform: payment.platform,
-    paymentMethod: payment.paymentMethod,
-    gstAmount: payment.gstAmount,
-    discountAmount: payment.discountAmount,
-    couponCode: payment.couponCode,
-    invoiceUrl: /^https:\/\//i.test(payment.invoiceUrl || '') ? payment.invoiceUrl : '',
-    capturedAmount: payment.status === 'failed' ? 0 : (payment.capturedAmount > 0 ? payment.capturedAmount : payment.amount),
-    refundedAmount: payment.refundedAmount,
-    refundStatus: payment.refundStatus,
-    refundHistory: (payment.refundHistory || []).map((refund) => ({ refundId: refund.refundId, amount: refund.amount, status: refund.status, reservedAmount: refund.reservedAmount || 0, reason: refund.reason, createdAt: refund.createdAt })),
-    paidAt: payment.paidAt,
-    createdAt: payment.createdAt
-  }));
+  const serialized = payments.map(serializePaymentTransaction);
   return { payments: serialized, pagination: { page: currentPage, limit: pageSize, total, pages: Math.ceil(total / pageSize) } };
 };
 
@@ -2136,6 +2298,7 @@ module.exports = {
   deriveExpiry,
   validateMembershipDates,
   serializeMembership,
+  transactionOwnsCurrentProviderEntitlement,
   appendEvent,
   claimMutation,
   completeMutation,
@@ -2154,6 +2317,7 @@ module.exports = {
   resumeMembership,
   setAutoRenew,
   refundMembershipPayment,
+  transitionRefundTransaction,
   processWebhookPayload,
   reconcileStaleRefundLocks,
   reconcilePendingRefunds,
@@ -2165,9 +2329,12 @@ module.exports = {
   listMemberships,
   getDashboard,
   getMembershipDetails,
+  serializePaymentTransaction,
   listPayments,
   listTimeline,
   notifyLifecycle,
   providerStatusToMembership,
+  shouldPreserveTerminalReconciliationState,
+  shouldPreserveImmediateCancellationEnd,
   providerBoolean
 };

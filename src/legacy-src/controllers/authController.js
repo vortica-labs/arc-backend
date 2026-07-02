@@ -7,6 +7,7 @@ const { sendOTPEmail } = require('../utils/email');
 const log = require('../utils/logger');
 const { invalidateUserCache } = require('../middleware/auth');
 const { validateOnboardingProfile } = require('../utils/onboardingValidation');
+const { recordSuccessfulLogin } = require('../utils/userLoginAudit');
 
 const INVALID_LOGIN_MESSAGE = 'Invalid email or password.';
 
@@ -540,6 +541,8 @@ const login = async (req, res) => {
     // Remove password from response
     const userResponse = user.toObject();
     delete userResponse.password;
+
+    void recordSuccessfulLogin({ user, authMethod: 'password', request: req });
 
     // Log successful login
     if (process.env.NODE_ENV === 'development') { console.log(`Login successful - User: ${user.username}, Mobile: ${isMobile}, Origin: ${origin}`);
@@ -1136,6 +1139,7 @@ const verifyOtpAndLogin = async (req, res) => {
     const refreshToken = generateRefreshToken({ id: user._id });
     const userResponse = user.toObject();
     delete userResponse.password;
+    void recordSuccessfulLogin({ user, authMethod: 'otp', request: req });
     res.status(200).json({
       success: true,
       message: 'Login successful',
@@ -1263,6 +1267,8 @@ const googleTokenLogin = async (req, res) => {
 
     const userResponse = user.toObject();
     delete userResponse.password;
+
+    void recordSuccessfulLogin({ user, authMethod: 'google_token', request: req });
 
     return res.json({
       success: true,
@@ -1449,6 +1455,8 @@ const appleMobileLogin = async (req, res) => {
     const refreshToken = generateRefreshToken({ id: user._id });
     const userResponse = user.toObject();
     delete userResponse.password;
+
+    void recordSuccessfulLogin({ user, authMethod: 'apple_mobile', request: req });
 
     return res.json({
       success: true,

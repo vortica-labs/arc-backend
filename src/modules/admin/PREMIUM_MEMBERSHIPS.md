@@ -33,7 +33,8 @@ Configure Razorpay to send these events to
 - `subscription.authenticated`, `subscription.activated`,
   `subscription.charged`, `subscription.pending`, `subscription.halted`,
   `subscription.paused`, `subscription.resumed`, `subscription.cancelled`,
-  `subscription.completed`, and `subscription.expired`
+  `subscription.completed`, `subscription.expired`, and
+  `subscription.updated`
 - `refund.processed` and `refund.failed`
 
 The webhook secret must be different from `RAZORPAY_KEY_SECRET`. Delivery uses
@@ -90,3 +91,15 @@ mutations require `premium:manage`, `premium:cancel`, or `premium:refund` and an
 `Idempotency-Key`. Durable admin audit intent/outcome rows and immutable premium
 events are written for lifecycle changes. Hardcoded admins use a deterministic
 `hardcoded:<username>` actor key because they do not have a MongoDB ObjectId.
+
+`GET /api/admin/premium-memberships/:id/login-history` returns paginated,
+allowlisted successful sign-in events for the member. Password, OTP, Google,
+and Apple sign-ins are recorded fail-open after authentication succeeds. These
+append-only records retain only bounded device, platform, IP, and user-agent
+metadata and expire after 180 days. Run the explicit premium index migration
+to create and verify the retention index before enabling this view.
+
+Refund state transitions use a versioned, classic-update compare-and-swap flow
+so processed events dominate delayed failure events without relying on MongoDB
+update pipelines. Historical provider generations may update their own payment
+ledger, but cannot revoke a newer manual or differently bound entitlement.

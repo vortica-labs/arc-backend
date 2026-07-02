@@ -72,6 +72,7 @@ const paymentTransactionSchema = new mongoose.Schema({
   capturedAmount: { type: Number, min: 0, default: 0 },
   refundedAmount: { type: Number, min: 0, default: 0 },
   refundReservedAmount: { type: Number, min: 0, default: 0 },
+  refundStateVersion: { type: Number, min: 0, default: 0 },
   refundLockToken: { type: String, default: '' },
   refundLockAt: { type: Date, default: null },
   refundLockAmount: { type: Number, min: 0, default: 0 },

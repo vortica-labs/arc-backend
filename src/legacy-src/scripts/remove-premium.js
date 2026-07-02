@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const User = require('../models/User');
+const premiumMembershipService = require('../services/premiumMembershipService');
 require('dotenv').config();
 
 /**
@@ -48,41 +49,33 @@ const removePremium = async () => {
     console.log(`   Current Premium Status: ${wasPremium ? '✅ Premium' : '❌ Not Premium'}`);
     console.log(`   Current Membership Tier: ${currentTier}`);
 
-    if (!wasPremium && currentTier === 'free') {
+    let canonical = await premiumMembershipService.currentForUser(user._id);
+    if (!canonical && !wasPremium && currentTier === 'free') {
       console.log('\n⚠️  User is already not premium. No changes needed.');
       await mongoose.disconnect();
       process.exit(0);
     }
 
-    // Remove premium status
-    user.isPremium = false;
-    
-    // Reset membership tier to free
-    if (!user.membership) {
-      user.membership = {
-        tier: 'free',
-        validUntil: null,
-        credits: 0
-      };
-    } else {
-      user.membership.tier = 'free';
-      user.membership.validUntil = null;
-    }
-
-    await user.save();
+    canonical = canonical || await premiumMembershipService.ensureCanonicalForUser(user._id);
+    await premiumMembershipService.removeMembership({
+      membershipId: canonical._id,
+      reason: 'Removed by the canonical premium removal script',
+      actor: premiumMembershipService.systemActor('script:remove-premium')
+    });
+    const projectedUser = await User.findById(user._id).select('isPremium membership').lean();
 
     console.log('\n✅ Premium status removed successfully!');
     console.log(`   Username: ${user.username}`);
     console.log(`   Premium Status: ❌ Not Premium`);
-    console.log(`   Membership Tier: ${user.membership.tier}`);
+    console.log(`   Membership Tier: ${projectedUser?.membership?.tier || 'free'}`);
 
   } catch (error) {
+    process.exitCode = 1;
     console.error('❌ Error removing premium:', error.message);
     console.error('\nFull error:', error);
   } finally {
     await mongoose.disconnect();
     console.log('\n👋 Database connection closed');
-    process.exit(0);
   }
 };
 

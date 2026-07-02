@@ -1,6 +1,6 @@
 import path from "path";
 import type { RequestHandler } from "express";
-import { backendConfigPath, backendControllerPath, backendMiddlewarePath } from "../legacy/legacy.paths";
+import { backendConfigPath, backendControllerPath, backendMiddlewarePath, backendRootPath } from "../legacy/legacy.paths";
 
 type LegacyAuthController = {
   register: RequestHandler;
@@ -44,6 +44,14 @@ type PassportModule = {
   authenticate: (...args: unknown[]) => RequestHandler;
 };
 
+type LoginAuditModule = {
+  recordSuccessfulLogin: (input: {
+    user: unknown;
+    authMethod: "google_passport";
+    request: unknown;
+  }) => Promise<boolean>;
+};
+
 const loadModule = <T>(modulePath: string): T => {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   return require(modulePath) as T;
@@ -56,6 +64,7 @@ export const { progressiveLoginLimiter, progressiveOtpLoginLimiter } = loadModul
 export const { protect, protectAllowIncomplete } = loadModule<ProtectMiddleware>(path.join(backendMiddlewarePath, "auth.js"));
 export const { uploadSingle } = loadModule<UploadMiddleware>(path.join(backendMiddlewarePath, "upload.js"));
 export const passport = loadModule<PassportModule>("passport");
+export const { recordSuccessfulLogin } = loadModule<LoginAuditModule>(path.join(backendRootPath, "utils", "userLoginAudit.js"));
 
 // Ensure strategy is initialized once for auth routes.
 loadModule(path.join(backendConfigPath, "passport.js"));

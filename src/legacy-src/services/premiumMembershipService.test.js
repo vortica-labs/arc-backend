@@ -83,6 +83,17 @@ test('provider terminal states cannot preserve or reactivate access', () => {
   assert.strictEqual(service.providerBoolean(0, true), false);
 });
 
+test('immediate escalation reuses an existing provider cancellation request', () => {
+  const source = fs.readFileSync(__filename.replace(/\.test\.js$/, '.js'), 'utf8');
+  const cancellation = source.slice(source.indexOf('const cancelMembership ='), source.indexOf('const removeMembership ='));
+  assert(cancellation.includes('providerCancellationAlreadyScheduled'));
+  assert(cancellation.includes("mode === 'immediate' && providerCancellationAlreadyScheduled"));
+  assert.strictEqual(service.shouldPreserveTerminalReconciliationState({ membershipStatus: 'cancelled', subscriptionStatus: 'cancelled' }, 'active'), true);
+  assert.strictEqual(service.shouldPreserveTerminalReconciliationState({ membershipStatus: 'cancelled', subscriptionStatus: 'cancelled' }, 'cancelled'), false);
+  assert.strictEqual(service.shouldPreserveTerminalReconciliationState({ membershipStatus: 'active', subscriptionStatus: 'active' }, 'active'), false);
+  assert.strictEqual(service.shouldPreserveImmediateCancellationEnd({ membershipStatus: 'cancelled', subscriptionStatus: 'cancelled', cancelAtCycleEnd: false, endedAt: new Date() }), true);
+});
+
 test('canonical schemas declare one-current, provider, payment, and mutation uniqueness', () => {
   const membershipIndexes = PremiumMembership.schema.indexes();
   const current = membershipIndexes.find(([key, options]) => key.user === 1 && Object.keys(key).length === 1 && options.unique);
@@ -153,10 +164,16 @@ test('refund flow reserves balance, reconciles stale/pending work, and protects 
   assert(refund.includes('refundReservedAmount'));
   assert(refund.includes('refundLockReceipt'));
   assert(refund.includes('newerFundingExists'));
-  assert(refund.includes('processed && fullRefundRequested'));
+  assert(refund.includes('processed && fullRefund'));
+  assert(refund.includes('transitionRefundTransaction'));
+  assert(refund.includes('transactionOwnsCurrentProviderEntitlement'));
+  assert(!refund.includes('racedEntry'));
   assert(source.includes('const reconcileStaleRefundLocks ='));
   assert(source.includes('const reconcilePendingRefunds ='));
   assert(source.includes('fetchPaymentRefunds'));
+  const subscriptionWebhook = source.slice(source.indexOf('const applySubscriptionEvent ='), source.indexOf('const recomputeRefundSummary ='));
+  assert(subscriptionWebhook.includes("membership.source !== 'razorpay_subscription'"));
+  assert(subscriptionWebhook.includes('membership.razorpay?.subscriptionId !== subscription.id'));
 });
 
 test('entitlement projection does not mint credits during reconciliation', () => {
@@ -173,13 +190,43 @@ test('list, dashboard, detail and payment serializers are allowlisted for admin 
   for (const key of ['totalPremiumUsers', 'activePremiumUsers', 'expiredPremiumUsers', 'cancelledSubscriptions', 'premiumPurchasedToday', 'lifetimePremiumRevenue']) {
     assert(source.includes(key));
   }
+  const dashboard = source.slice(source.indexOf('const getDashboard ='), source.indexOf('const getMembershipDetails ='));
+  assert(dashboard.includes("{ paidAt: { $gte: since } }"), 'revenue windows must use payment time rather than processing time');
   const serializer = source.slice(source.indexOf('const serializeMembership ='), source.indexOf('const snapshotState ='));
   assert(!serializer.includes('providerSnapshot:'));
   assert(!serializer.includes('metadata:'));
-  const payments = source.slice(source.indexOf('const listPayments ='), source.indexOf('const listTimeline ='));
-  assert(!payments.includes('refundLockToken'));
-  assert(!payments.includes('refundLockReceipt'));
-  assert(source.includes("loginHistory: { available: false"));
+  const paymentSerializer = source.slice(source.indexOf('const serializePaymentTransaction ='), source.indexOf('const listPayments ='));
+  assert(!paymentSerializer.includes('refundLockToken'));
+  assert(!paymentSerializer.includes('refundLockReceipt'));
+  assert(!paymentSerializer.includes('refundStateVersion'));
+  assert(!paymentSerializer.includes('metadata:'));
+  const serializedPayment = service.serializePaymentTransaction({
+    _id: new mongoose.Types.ObjectId(),
+    amount: 99,
+    currency: 'INR',
+    status: 'completed',
+    refundHistory: [],
+    refundLockToken: 'internal-token',
+    refundLockReceipt: 'internal-receipt',
+    refundStateVersion: 12,
+    metadata: { secret: true },
+    user: new mongoose.Types.ObjectId(),
+  });
+  for (const forbidden of ['refundLockToken', 'refundLockReceipt', 'refundStateVersion', 'metadata', 'user']) {
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(serializedPayment, forbidden), false);
+  }
+  const controller = fs.readFileSync(path.resolve(__dirname, '..', 'controllers', 'premiumMembershipController.js'), 'utf8');
+  assert(controller.includes('service.serializePaymentTransaction(value.transaction)'));
+  assert(!controller.includes('{ ...value, membership:'));
+  const listing = source.slice(source.indexOf('const listMemberships ='), source.indexOf('const getDashboard ='));
+  assert(listing.includes('PaymentTransaction.find'));
+  for (const identifier of ['paymentId', 'orderId', 'providerPaymentId', 'providerOrderId', 'providerSubscriptionId', 'providerRefundId']) {
+    assert(listing.includes(`{ ${identifier}: pattern }`));
+  }
+  assert(listing.includes(".select('user membership')"));
+  assert(source.includes('loginHistory: {'));
+  assert(source.includes('available: true'));
+  assert(source.includes('/login-history`'));
 });
 
 test('lifecycle worker avoids expiring auto-renew subscriptions and uses provider claims', () => {
@@ -201,6 +248,17 @@ test('signed payment events recover captured checkout and record failures withou
   assert(source.includes("reason: 'non_premium_payment'"));
 });
 
+test('recurring checkout preflights provider configuration and refund reconciliation precedes projection', () => {
+  const source = fs.readFileSync(__filename.replace(/\.test\.js$/, '.js'), 'utf8');
+  const recurring = source.slice(source.indexOf('const createRecurringSubscription ='), source.indexOf('const verifyRecurringSubscription ='));
+  assert(recurring.indexOf('provider.getConfiguredPlanId') < recurring.indexOf('upsertCurrentMembership'));
+  assert(recurring.indexOf('provider.getClient()') < recurring.indexOf('upsertCurrentMembership'));
+
+  const reconciliation = source.slice(source.indexOf('const reconcileMembership ='), source.indexOf('const processLifecycleBatch ='));
+  assert(reconciliation.indexOf('reconcilePendingRefunds') < reconciliation.indexOf('projectEntitlement'));
+  assert(reconciliation.includes('PremiumMembership.findById(membership._id)'));
+});
+
 test('production scripts cover explicit indexes, dry-run migration, and lifecycle startup', () => {
   const root = path.resolve(__dirname, '..', '..', '..');
   const packageJson = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
@@ -211,6 +269,21 @@ test('production scripts cover explicit indexes, dry-run migration, and lifecycl
   const server = fs.readFileSync(path.join(root, 'src', 'server.ts'), 'utf8');
   assert(server.includes('startPremiumMembershipCron'));
   assert(server.includes('stopPremiumMembershipCron'));
+});
+
+test('operator premium scripts delegate entitlement changes to the canonical service', () => {
+  const root = path.resolve(__dirname, '..', '..', '..');
+  for (const relative of [
+    'src/legacy-src/scripts/assign-premium.js',
+    'src/legacy-src/scripts/remove-premium.js',
+    'src/legacy-src/scripts/seed-premium-user.js',
+  ]) {
+    const script = fs.readFileSync(path.join(root, relative), 'utf8');
+    assert(script.includes("require('../services/premiumMembershipService')"));
+    assert(!script.includes('user.isPremium = true'));
+    assert(!script.includes('user.isPremium = false'));
+    assert(!script.includes("user.membership.tier = 'free'"));
+  }
 });
 
 console.log(`Premium membership backend contracts passed (${passed})`);

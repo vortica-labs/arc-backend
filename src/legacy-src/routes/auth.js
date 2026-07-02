@@ -4,6 +4,7 @@ const { protect, protectAllowIncomplete } = require('../middleware/auth');
 const { uploadSingle } = require('../middleware/upload');
 const passport = require('passport');
 const rateLimit = require('express-rate-limit');
+const { recordSuccessfulLogin } = require('../utils/userLoginAudit');
 const {
   progressiveLoginLimiter,
   progressiveOtpLoginLimiter
@@ -168,7 +169,8 @@ router.get('/google/callback',
   async (req, res) => {
     try {
       const { token, user } = req.user;
-      
+      void recordSuccessfulLogin({ user, authMethod: 'google_passport', request: req });
+
       // Redirect to frontend with token in URL hash
       const redirectUrl = `${process.env.CLIENT_URL}/login#token=${encodeURIComponent(token)}`;
       return res.redirect(redirectUrl);
