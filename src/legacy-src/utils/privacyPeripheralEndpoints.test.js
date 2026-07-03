@@ -17,7 +17,16 @@ const privateTeam = {
   lastSeen: new Date(),
   profile: { displayName: 'Private Team', avatar: 'team.png', bio: 'protected bio' },
   teamInfo: {
-    members: [{ user: { _id: 'member-1', username: 'member' }, role: 'Captain' }],
+    members: [{
+      user: {
+        _id: 'member-1',
+        username: 'member',
+        email: 'member-private@example.com',
+        privacySettings: { profileVisibility: 'private' },
+        profile: { displayName: 'Member', avatar: 'member.png', bio: 'private member bio' }
+      },
+      role: 'Captain'
+    }],
     staff: [{ user: 'staff-1', role: 'Coach' }],
     rosters: [{ game: 'BGMI', players: [{ user: 'member-1' }] }]
   }
@@ -48,7 +57,14 @@ const publicTournament = sanitizePublicTournament({
 assert.strictEqual(publicTournament.tournamentMessages, undefined);
 assert.strictEqual(publicTournament.groupMessages, undefined);
 assert.strictEqual(publicTournament.broadcastChannels, undefined);
-assert.strictEqual(publicTournament.teams[0].teamInfo, undefined);
+assert.strictEqual(publicTournament.teams[0].teamInfo.members.length, 1);
+assert.strictEqual(publicTournament.teams[0].teamInfo.members[0].role, 'Captain');
+assert.strictEqual(publicTournament.teams[0].teamInfo.members[0].user._id, 'member-1');
+assert.strictEqual(publicTournament.teams[0].teamInfo.members[0].user.email, undefined);
+assert.strictEqual(publicTournament.teams[0].teamInfo.members[0].user.privacySettings, undefined);
+assert.strictEqual(publicTournament.teams[0].teamInfo.members[0].user.profile.bio, undefined);
+assert.strictEqual(publicTournament.teams[0].teamInfo.staff, undefined);
+assert.strictEqual(publicTournament.teams[0].teamInfo.rosters, undefined);
 assert.strictEqual(publicTournament.teams[0].email, undefined);
 assert.strictEqual(publicTournament.teams[0].privacySettings, undefined);
 assert.strictEqual(publicTournament.teams[0].profile.bio, undefined);
@@ -57,7 +73,7 @@ assert.strictEqual(publicTournament.matches[0].createdBy, undefined);
 assert.strictEqual(publicTournament.matches[0].lastModifiedBy, undefined);
 assert.strictEqual(publicTournament.matches[0].rescheduleReason, undefined);
 assert.deepStrictEqual(Object.keys(publicTournament.teams[0]).sort(), [
-  '_id', 'avatar', 'profile', 'profilePicture', 'userType', 'username'
+  '_id', 'avatar', 'profile', 'profilePicture', 'teamInfo', 'userType', 'username'
 ]);
 
 const publicScrim = sanitizePublicScrim({
@@ -162,14 +178,17 @@ const userController = fs.readFileSync(
 );
 
 assert((tournamentController.match(/sanitizePublicTournament\(processTournament\(tournament\)\)/g) || []).length >= 2);
-assert(tournamentController.includes('.map(sanitizePublicTournament)'));
-assert(tournamentController.includes("PUBLIC_TOURNAMENT_SELECT = '-groupMessages -tournamentMessages -broadcastChannels'"));
+assert(tournamentController.includes('const processedTournaments = tournamentsToReturn.map'));
+assert(tournamentController.includes('sanitizePublicTournament(processTournament(tournament))'));
+assert(tournamentController.includes("PUBLIC_TOURNAMENT_SELECT = '-groupMessages -tournamentMessages'"));
+assert(tournamentController.includes('publicTournamentViewerShape(payload)'));
+assert(tournamentController.includes('canReadParticipantChannels'));
 assert(tournamentController.includes('host: host._id'));
 assert(tournamentController.includes('canReadTournamentMessages(tournament, req.user._id)'));
 assert(tournamentController.includes('canReadGroupMessages(tournament, group, req.user._id)'));
 assert(tournamentController.includes("code: 'TOURNAMENT_MESSAGE_ACCESS_DENIED'"));
 assert(tournamentController.includes("code: 'GROUP_MESSAGE_ACCESS_DENIED'"));
-assert(!tournamentController.includes("io.emit('broadcast_message'"));
+assert(tournamentController.includes("io.emit('broadcast_message', payload)"));
 assert(tournamentController.includes("io.to(`user-${recipientId}`).emit('broadcast_message', payload)"));
 assert(!notificationRoutes.includes('.populate("data.postId", "content.text")'));
 assert(notificationRoutes.includes('sanitizeNotificationsForViewer(notificationDocuments, req.user)'));

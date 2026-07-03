@@ -37,6 +37,11 @@ assert(user.includes("followStatus: 'pending'"));
 assert(user.includes('privacyAccess: privacyRelationship.access') || user.includes('...privacyRelationship.access'));
 assert(user.includes('req.body.profileVisibility !== undefined\n        ? { profileVisibility: req.body.profileVisibility }'));
 assert(user.includes('req.body.allowMessageFrom !== undefined\n        ? { allowMessageFrom: req.body.allowMessageFrom }'));
+assert(user.includes("const isGuest = !req.user || req.user.userType === 'guest'"));
+assert(user.includes('const requestingUserId = isGuest'));
+assert(user.includes('const pendingFollowRequest = !isGuest && !isSelf'));
+assert(user.includes('if (!isGuest && req.user) {'));
+assert((user.match(/viewer: isGuestViewer \? null : req\.user/g) || []).length >= 2);
 
 for (const endpoint of [
   '/follow-requests/incoming',

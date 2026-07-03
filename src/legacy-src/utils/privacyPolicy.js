@@ -14,7 +14,15 @@ const PRIVACY_DEFAULTS = Object.freeze({
 
 const idString = (value) => {
   if (value === undefined || value === null) return '';
-  if (value && typeof value === 'object' && value._id) return idString(value._id);
+  // Mongoose ObjectId exposes a convenience `_id` getter that returns the
+  // ObjectId itself. Following it recursively overflows the stack on every
+  // hydrated/lean Mongo identity used by profile, post, and message policy.
+  if (value && typeof value === 'object' && typeof value.toHexString === 'function') {
+    return value.toHexString();
+  }
+  if (value && typeof value === 'object' && value._id && value._id !== value) {
+    return idString(value._id);
+  }
   return String(value);
 };
 

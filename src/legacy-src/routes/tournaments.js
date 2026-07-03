@@ -5,8 +5,9 @@ const {
   getTournaments, 
   getTournament, 
   getTournamentByName,
-  updateTournament, 
-  joinTournament, 
+  updateTournament,
+  joinTournament,
+  joinDuoTournament,
   leaveTournament,
   leaveTournamentAsTeam, 
   autoAssignGroups, 
@@ -72,6 +73,9 @@ router.route('/:id')
 
 // Tournament participation
 router.post('/:id/join', protect, joinTournament);
+// Keep the canonical Web contract while reusing the hardened Duo-team
+// creation/registration implementation.
+router.post('/:id/join-duo', protect, joinDuoTournament);
 router.post('/:id/leave', protect, leaveTournament);
 router.post('/:id/leave-team', protect, leaveTournamentAsTeam);
 

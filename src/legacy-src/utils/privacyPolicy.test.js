@@ -1,16 +1,29 @@
 const assert = require('assert');
+const mongoose = require('mongoose');
 const User = require('../models/User');
+const Follow = require('../models/Follow');
 const FollowRequest = require('../models/FollowRequest');
 const {
+  idString,
   normalizePrivacySettings,
   canonicalToLegacyAliases,
   buildPrivacyAccess,
+  resolvePrivacyAccess,
   filterPostsForViewer,
   minimalProfile,
   privacySettingsResponse
 } = require('./privacyPolicy');
 const { formatUserDTO } = require('./dto');
 const { publishPrivacySettingsUpdate, removePresenceSubscription } = require('./presencePrivacy');
+
+const objectId = new mongoose.Types.ObjectId('507f1f77bcf86cd799439011');
+assert.strictEqual(idString(objectId), '507f1f77bcf86cd799439011');
+assert.strictEqual(idString({ _id: objectId }), '507f1f77bcf86cd799439011');
+assert.strictEqual(idString(new User({
+  _id: objectId,
+  username: 'identity_contract',
+  userType: 'player'
+})), '507f1f77bcf86cd799439011');
 
 assert.deepStrictEqual(normalizePrivacySettings({}), {
   profileVisibility: 'public',
@@ -248,6 +261,35 @@ assert.deepStrictEqual(
 );
 
 (async () => {
+  const originalIsFollowing = Follow.isFollowing;
+  const originalFindById = User.findById;
+  let guestRelationshipLookupAttempted = false;
+  Follow.isFollowing = async () => {
+    guestRelationshipLookupAttempted = true;
+    throw new Error('guest must not query Follow');
+  };
+  User.findById = () => {
+    guestRelationshipLookupAttempted = true;
+    throw new Error('guest must not query User relationships');
+  };
+  try {
+    const guestAccess = await resolvePrivacyAccess({
+      viewer: { _id: 'guest_00000000-0000-4000-8000-000000000000', userType: 'guest' },
+      targetUser: {
+        _id: objectId,
+        isActive: true,
+        blockedUsers: [],
+        privacySettings: { profileVisibility: 'public' }
+      }
+    });
+    assert.strictEqual(guestAccess.access.canViewProfile, true);
+    assert.strictEqual(guestAccess.access.canViewPosts, true);
+    assert.strictEqual(guestRelationshipLookupAttempted, false);
+  } finally {
+    Follow.isFollowing = originalIsFollowing;
+    User.findById = originalFindById;
+  }
+
   const author = {
     _id: '507f1f77bcf86cd799439011',
     username: 'author',
