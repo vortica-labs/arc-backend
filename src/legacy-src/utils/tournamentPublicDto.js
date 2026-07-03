@@ -29,6 +29,32 @@ const minimalTournamentUser = (value) => {
   };
 };
 
+const minimalTournamentTeam = (value) => {
+  const safe = minimalTournamentUser(value);
+  if (!safe || typeof safe !== 'object' || !value || typeof value !== 'object') return safe;
+  const source = toPlainObject(value);
+  const members = Array.isArray(source?.teamInfo?.members)
+    ? source.teamInfo.members
+        .map((member) => {
+          const memberUser = minimalTournamentUser(member?.user);
+          if (!memberUser) return null;
+          return {
+            user: memberUser,
+            ...(member?.role ? { role: String(member.role) } : {})
+          };
+        })
+        .filter(Boolean)
+    : [];
+
+  // Clients use this minimal roster to determine whether the authenticated
+  // player participates through a team. Never expose rosters, staff,
+  // requirements, invitations, contact data, or other team profile internals.
+  return {
+    ...safe,
+    teamInfo: { members }
+  };
+};
+
 const sanitizeMatch = (match = {}) => {
   const safe = { ...match };
   for (const key of ['team1', 'team2', 'winner']) {
@@ -62,7 +88,7 @@ const sanitizePublicTournament = (value) => {
     ? safe.participants.map(minimalTournamentUser).filter(Boolean)
     : [];
   safe.teams = Array.isArray(safe.teams)
-    ? safe.teams.map(minimalTournamentUser).filter(Boolean)
+    ? safe.teams.map(minimalTournamentTeam).filter(Boolean)
     : [];
   safe.groups = Array.isArray(safe.groups)
     ? safe.groups.map((group) => {
@@ -86,10 +112,21 @@ const sanitizePublicTournament = (value) => {
       }))
     : [];
 
+  // Mongoose materializes an empty nested finalResult object by default. The
+  // Web source flow treats presence as "generated", so omit only the empty
+  // placeholder and retain real published standings.
+  if (safe.finalResult
+    && !safe.finalResult.generatedAt
+    && (!Array.isArray(safe.finalResult.standings) || safe.finalResult.standings.length === 0)) {
+    delete safe.finalResult;
+  }
+
   // Chat data has dedicated authenticated, membership-authorized endpoints.
   delete safe.tournamentMessages;
   delete safe.groupMessages;
   delete safe.broadcastChannels;
+  delete safe.bannerPublicId;
+  delete safe.duoRegistrationMembers;
 
   return safe;
 };
@@ -112,6 +149,7 @@ const sanitizePublicScrim = (value) => {
 
 module.exports = {
   minimalTournamentUser,
+  minimalTournamentTeam,
   sanitizePublicTournament,
   sanitizePublicScrim
 };

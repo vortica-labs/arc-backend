@@ -172,6 +172,14 @@ const tournamentSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'
   }],
+  // Server-owned uniqueness markers for generated Duo registrations. Keeping
+  // both player IDs on the tournament lets one atomic update prevent two
+  // concurrent requests from registering the same player in separate teams.
+  duoRegistrationMembers: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    select: false
+  }],
   groups: [{
     name: String,
     round: {
@@ -192,6 +200,19 @@ const tournamentSchema = new mongoose.Schema({
     type: String,
     default: null
   },
+  bannerPublicId: {
+    type: String,
+    default: null,
+    select: false
+  },
+  broadcastChannels: [{
+    name: String,
+    type: { type: String, default: 'Text Messages' },
+    description: String,
+    groupId: String,
+    round: { type: Number, default: 1 },
+    channelId: { type: mongoose.Schema.Types.ObjectId, ref: 'Message', default: null }
+  }],
   rules: [{
     type: String
   }],
@@ -379,7 +400,11 @@ const tournamentSchema = new mongoose.Schema({
     }],
     submittedAt: {
       type: Date,
-      default: Date.now
+      default: null
+    },
+    isSubmitted: {
+      type: Boolean,
+      default: false
     }
   }],
   
@@ -411,9 +436,21 @@ const tournamentSchema = new mongoose.Schema({
       type: Number,
       required: true
     },
+    roundName: {
+      type: String,
+      trim: true
+    },
     teamsPerGroup: {
       type: Number,
       required: true
+    },
+    totalSlots: {
+      type: Number,
+      min: 1
+    },
+    numberOfGroups: {
+      type: Number,
+      min: 1
     },
     qualificationCriteria: {
       type: Number,

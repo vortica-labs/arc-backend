@@ -18,6 +18,7 @@ router.route("/:id")
   .delete(protect, tournamentController.deleteTournament);
 
 router.post("/:id/join", protect, tournamentController.joinTournament);
+router.post("/:id/join-duo", protect, tournamentController.joinDuoTournament);
 router.post("/:id/leave", protect, tournamentController.leaveTournament);
 router.post("/:id/leave-team", protect, tournamentController.leaveTournamentAsTeam);
 router.post("/:id/assign-groups", protect, tournamentController.autoAssignGroups);

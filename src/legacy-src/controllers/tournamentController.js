@@ -10,16 +10,50 @@ const crypto = require('crypto');
 const log = require('../utils/logger');
 const { normalizeQuerySearch, buildPrefixRegex } = require('../utils/searchQuery');
 const { getRedisClient } = require('../utils/redisCache');
+const { uploadImage, deleteFile } = require('../utils/cloudinary');
 const {
   minimalTournamentUser,
   sanitizePublicTournament
 } = require('../utils/tournamentPublicDto');
 
+const TOURNAMENT_UPLOAD_DIR = path.resolve(process.cwd(), 'uploads', 'tournaments');
+
+const localTournamentBannerPath = (banner) => {
+  if (!banner || /^https?:\/\//i.test(String(banner))) return null;
+  const raw = String(banner).replace(/\\/g, '/');
+  const filename = path.basename(raw);
+  const allowedStoredValues = new Set([filename, `/uploads/tournaments/${filename}`]);
+  if (!filename || !allowedStoredValues.has(raw)) return null;
+  const resolved = path.resolve(TOURNAMENT_UPLOAD_DIR, filename);
+  return resolved.startsWith(`${TOURNAMENT_UPLOAD_DIR}${path.sep}`) ? resolved : null;
+};
+
 const uniqueNotificationRecipients = (values = []) =>
   Array.from(new Set(values.map((value) => String(value?._id || value)).filter(Boolean)));
 
+const expandTournamentRecipientIds = async (values = []) => {
+  const recipientIds = uniqueNotificationRecipients(values);
+  if (recipientIds.length === 0) return [];
+  try {
+    const registeredTeams = await User.find({
+      _id: { $in: recipientIds },
+      userType: 'team',
+      isActive: true
+    }).select('teamInfo.members.user').lean();
+    return uniqueNotificationRecipients([
+      ...recipientIds,
+      ...registeredTeams.flatMap((team) => (
+        (team.teamInfo?.members || []).map((member) => member.user)
+      ))
+    ]);
+  } catch (error) {
+    log.error('Failed to expand tournament team recipients', { error: String(error) });
+    return recipientIds;
+  }
+};
+
 const notifyTournamentRecipients = async ({ tournament, recipients, sender, title, message, eventType, revision, extraData = {} }) => {
-  const recipientIds = uniqueNotificationRecipients(recipients);
+  const recipientIds = await expandTournamentRecipientIds(recipients);
   if (recipientIds.length === 0) return [];
   const dedupeKey = `tournament:${tournament._id}:${eventType}:${String(revision || tournament.updatedAt || '').slice(0, 80)}`;
   const results = await Promise.allSettled(recipientIds.map((recipient) => createAndEmitNotification({
@@ -52,20 +86,10 @@ const notifyTournamentRecipients = async ({ tournament, recipients, sender, titl
   return results;
 };
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = 'uploads/tournaments';
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, 'banner-' + uniqueSuffix + path.extname(file.originalname));
-  }
-});
+// Keep multipart data in memory. Tournament banners are persisted to S3 only
+// after authorization and business validation have succeeded, so ECS tasks do
+// not depend on ephemeral/writable container storage.
+const storage = multer.memoryStorage();
 
 const upload = multer({
   storage: storage,
@@ -130,27 +154,49 @@ const canEditTournament = (tournament) => {
   return daysSinceEnd <= 5;
 };
 
-// Helper function to auto-mark tournaments as Completed when endDate passes
+// Reads must never mutate lifecycle state. Completion is a transactional host
+// command performed by generateFinalResult so standings, history, realtime,
+// notifications, and the active-host lock change together.
 const checkAndMarkCompletedTournaments = async (tournament) => {
-  if (!tournament) return tournament;
-  
-  const now = new Date();
-  const endDate = tournament.tournamentEndDate ? new Date(tournament.tournamentEndDate) : new Date(tournament.endDate);
-  
-  // If tournament has ended and is not already completed or cancelled
-  if (now >= endDate && tournament.status !== 'Completed' && tournament.status !== 'Cancelled') {
-    await Tournament.updateOne(
-      { _id: tournament._id }, 
-      { $set: { status: 'Completed' } }
-    );
-    tournament.status = 'Completed';
-    await releaseHostActiveTournament(tournament.host, tournament._id);
-  }
-  
   return tournament;
 };
 
 const idString = (value) => String(value?._id || value || '');
+const isTournamentCode = (value) => /^TRN-[A-Z0-9]+-[A-Z0-9]{8}$/i.test(String(value || '').trim());
+
+const removeParticipantFromCompetitionState = (tournament, participantId) => {
+  const removedId = idString(participantId);
+  tournament.groups = (tournament.groups || []).map((group) => {
+    group.participants = (group.participants || []).filter((value) => idString(value) !== removedId);
+    return group;
+  });
+  tournament.matches = (tournament.matches || []).filter((match) => (
+    idString(match.team1) !== removedId && idString(match.team2) !== removedId
+  ));
+  tournament.groupResults = (tournament.groupResults || []).map((result) => {
+    result.teams = (result.teams || []).filter((team) => idString(team.teamId) !== removedId);
+    return result;
+  });
+  tournament.qualifications = (tournament.qualifications || []).map((qualification) => {
+    qualification.qualifiedTeams = (qualification.qualifiedTeams || [])
+      .filter((value) => idString(value) !== removedId);
+    qualification.totalQualified = qualification.qualifiedTeams.length;
+    return qualification;
+  });
+  if (tournament.finalResult?.standings) {
+    tournament.finalResult.standings = tournament.finalResult.standings
+      .filter((standing) => idString(standing.teamId) !== removedId);
+  }
+  if (tournament.finalResult?.specialPrizeWinners) {
+    tournament.finalResult.specialPrizeWinners = tournament.finalResult.specialPrizeWinners
+      .filter((winner) => idString(winner.winnerId) !== removedId);
+  }
+  tournament.markModified('groups');
+  tournament.markModified('matches');
+  tournament.markModified('groupResults');
+  tournament.markModified('qualifications');
+  tournament.markModified('finalResult');
+};
 
 const isDirectTournamentParticipant = (tournament, userId) => {
   const expected = idString(userId);
@@ -167,19 +213,17 @@ const hasActiveMembershipInTeams = async (teamIds, userId) => {
     _id: { $in: ids },
     userType: 'team',
     isActive: true,
-    $or: [
-      { 'teamInfo.members': { $elemMatch: { user: userId } } },
-      {
-        'teamInfo.rosters': {
-          $elemMatch: {
-            isActive: { $ne: false },
-            players: { $elemMatch: { user: userId, isActive: { $ne: false }, leftAt: null } }
-          }
-        }
-      },
-      { 'teamInfo.staff': { $elemMatch: { user: userId, isActive: { $ne: false }, leftAt: null } } }
-    ]
+    'teamInfo.members': { $elemMatch: { user: userId } }
   }));
+};
+
+const getActiveTeamIdsForUser = async (userId) => {
+  if (!userId) return [];
+  return User.find({
+    userType: 'team',
+    isActive: true,
+    'teamInfo.members': { $elemMatch: { user: userId } }
+  }).distinct('_id');
 };
 
 const canReadTournamentMessages = async (tournament, userId) => (
@@ -203,11 +247,279 @@ const sanitizeTournamentMessages = (messages = []) => messages.map((message) => 
 });
 
 const ACTIVE_TOURNAMENT_STATUSES = ['Upcoming', 'Registration Open', 'Ongoing'];
-const PUBLIC_TOURNAMENT_SELECT = '-groupMessages -tournamentMessages -broadcastChannels';
+const MAX_GENERATED_MATCHES_PER_ROUND = 512;
+const PUBLIC_TOURNAMENT_SELECT = '-groupMessages -tournamentMessages';
+const PUBLIC_TEAM_POPULATE = {
+  path: 'teams',
+  select: 'username userType profile.displayName profile.avatar'
+};
+const AUTHORIZED_TEAM_POPULATE = {
+  path: 'teams',
+  select: 'username userType profile.displayName profile.avatar teamInfo.members.user teamInfo.members.role',
+  populate: {
+    path: 'teamInfo.members.user',
+    select: 'username userType profile.displayName profile.avatar'
+  }
+};
+
+const isTournamentHost = (tournament, userId) => (
+  Boolean(tournament && userId) && idString(tournament.host) === idString(userId)
+);
+
+const publicBroadcastChannel = (channel) => ({
+  name: String(channel?.name || ''),
+  type: String(channel?.type || 'Text Messages'),
+  description: String(channel?.description || ''),
+  round: Number(channel?.round || 1),
+  groupId: idString(channel?.groupId)
+});
+
+const publicTournamentViewerShape = (safeTournament) => {
+  if (!safeTournament) return safeTournament;
+  const publicShape = { ...safeTournament, groups: [], matches: [] };
+  delete publicShape.broadcastChannels;
+  return publicShape;
+};
+
+const withViewerTournamentContext = (safeTournament, sourceTournament, userId, activeTeamIds = []) => {
+  if (!safeTournament) return safeTournament;
+  if (!userId) return publicTournamentViewerShape(safeTournament);
+  const viewerId = idString(userId);
+  const activeTeamSet = new Set((activeTeamIds || []).map(idString));
+  const registeredTeam = (sourceTournament?.teams || []).find((team) => {
+    const teamId = idString(team);
+    return teamId === viewerId || activeTeamSet.has(teamId);
+  });
+  const isHost = idString(sourceTournament?.host) === viewerId;
+  const isDirect = (sourceTournament?.participants || [])
+    .some((participant) => idString(participant) === viewerId);
+  const registeredTeamId = registeredTeam ? idString(registeredTeam) : null;
+  const teams = (safeTournament.teams || []).map((team) => {
+    const teamId = idString(team);
+    if (!registeredTeamId || teamId !== registeredTeamId || !activeTeamSet.has(teamId)) return team;
+    return { ...team, teamInfo: { members: [{ user: viewerId }] } };
+  });
+  const viewerCompetitionIds = new Set([isDirect ? viewerId : null, registeredTeamId].filter(Boolean));
+  const viewerGroupKeys = new Set();
+  const viewerGroupNames = new Set();
+  (sourceTournament?.groups || []).forEach((group) => {
+    const belongsToViewer = (group?.participants || [])
+      .some((participant) => viewerCompetitionIds.has(idString(participant)));
+    if (!belongsToViewer) return;
+    viewerGroupKeys.add(idString(group?._id));
+    viewerGroupKeys.add(String(group?.name || ''));
+    viewerGroupNames.add(String(group?.name || '').toLowerCase());
+  });
+  const canReadParticipantChannels = Boolean(isHost || isDirect || registeredTeam);
+  const broadcastChannels = canReadParticipantChannels
+    ? (sourceTournament?.broadcastChannels || [])
+      .filter((channel) => (
+        isHost
+        || !channel?.groupId
+        || viewerGroupKeys.has(idString(channel.groupId))
+        || viewerGroupKeys.has(String(channel.groupId || ''))
+        || Array.from(viewerGroupNames).some((groupName) => (
+          groupName && String(channel?.name || '').toLowerCase().includes(groupName)
+        ))
+      ))
+      .map(publicBroadcastChannel)
+    : undefined;
+  return {
+    ...(canReadParticipantChannels ? safeTournament : publicTournamentViewerShape(safeTournament)),
+    teams,
+    ...(broadcastChannels ? { broadcastChannels } : {}),
+    viewerParticipation: Boolean(isDirect || registeredTeam),
+    viewerRole: isHost ? 'host' : registeredTeam ? 'team-member' : isDirect ? 'participant' : null,
+    viewerRegisteredTeamId: registeredTeamId,
+    viewerCanWithdraw: Boolean(isDirect || registeredTeam)
+  };
+};
+
+const getSocketIo = (req) => req?.app?.get?.('io') || global._arcSocketIO || null;
+
+const loadPublicTournament = async (tournamentId) => Tournament.findById(tournamentId)
+  .select(PUBLIC_TOURNAMENT_SELECT)
+  .populate('host', 'username profile.displayName profile.avatar')
+  .populate('participants', 'username profile.displayName profile.avatar')
+  .populate(PUBLIC_TEAM_POPULATE)
+  .populate('groups.participants', 'username profile.displayName profile.avatar')
+  .populate('matches.team1', 'username profile.displayName profile.avatar')
+  .populate('matches.team2', 'username profile.displayName profile.avatar')
+  .populate('matches.winner', 'username profile.displayName profile.avatar')
+  .populate('winners.team', 'username profile.displayName profile.avatar');
+
+const emitTournamentUpdated = async (req, tournamentId) => {
+  const io = getSocketIo(req);
+  if (!io || !tournamentId) return null;
+  try {
+    const tournament = await loadPublicTournament(tournamentId);
+    if (!tournament) return null;
+    const payload = sanitizePublicTournament(processTournament(tournament));
+    io.emit('tournament_updated', publicTournamentViewerShape(payload));
+    // Public updates never expose team rosters. Send a second, personalized
+    // payload only to registered team members so the untouched Web client can
+    // preserve its own participation marker after replacing list state.
+    const teamIds = (tournament.teams || []).map(idString).filter(Boolean);
+    const recipientTeams = new Map();
+    const addRecipient = (recipientId, teamId = null) => {
+      const normalizedRecipient = idString(recipientId);
+      if (!normalizedRecipient) return;
+      const values = recipientTeams.get(normalizedRecipient) || [];
+      if (teamId && !values.some((value) => idString(value) === idString(teamId))) values.push(teamId);
+      recipientTeams.set(normalizedRecipient, values);
+    };
+    addRecipient(tournament.host);
+    (tournament.participants || []).forEach((participant) => addRecipient(participant));
+    teamIds.forEach((teamId) => addRecipient(teamId, teamId));
+    if (teamIds.length > 0) {
+      const membershipTeams = await User.find({ _id: { $in: teamIds }, userType: 'team', isActive: true })
+        .select('teamInfo.members.user')
+        .lean();
+      membershipTeams.forEach((team) => {
+        (team.teamInfo?.members || []).forEach((member) => {
+          addRecipient(member.user, team._id);
+        });
+      });
+    }
+    recipientTeams.forEach((activeTeamIds, memberId) => {
+      io.to(`user-${memberId}`).emit(
+        'tournament_updated',
+        withViewerTournamentContext(payload, tournament, memberId, activeTeamIds)
+      );
+    });
+    return payload;
+  } catch (error) {
+    // Realtime refresh is supplementary. A socket outage must never turn a
+    // successfully persisted tournament command into an HTTP failure.
+    log.error('Tournament realtime update failed', {
+      tournamentId: idString(tournamentId),
+      error: String(error)
+    });
+    return null;
+  }
+};
+
+const emitTournamentBroadcast = (req, tournament, type, message, recipientIds = null) => {
+  const io = getSocketIo(req);
+  if (!io || !tournament) return;
+  const payload = {
+    id: `${idString(tournament._id)}:${type}:${Date.now()}`,
+    tournamentId: tournament._id,
+    message,
+    timestamp: new Date(),
+    type
+  };
+  if (Array.isArray(recipientIds)) {
+    return expandTournamentRecipientIds(recipientIds).then((expandedRecipientIds) => {
+      expandedRecipientIds.forEach((recipientId) => {
+        io.to(`user-${recipientId}`).emit('broadcast_message', payload);
+      });
+    }).catch((error) => {
+      log.error('Tournament broadcast recipient expansion failed', { error: String(error) });
+    });
+    return;
+  }
+  // Registration announcements are public competition updates and are also
+  // sent to every active account through the durable notification producer.
+  io.emit('broadcast_message', payload);
+};
 
 const normalizePrizePoolType = (value) => (
   value === 'no_prize' ? 'without_prize' : (value || 'without_prize')
 );
+
+// Canonical Web game/mode/format matrix. The API enforces the same
+// combinations so neither client can invent a tournament the Web form would
+// reject.
+const TOURNAMENT_GAME_CONFIGS = {
+  BGMI: {
+    'Battle Royale': new Set(['Solo', 'Squad']),
+    Deathmatch: new Set(['Solo', 'Squad'])
+  },
+  'Free Fire': {
+    'Battle Royale': new Set(['Solo', 'Squad']),
+    Deathmatch: new Set(['Solo', 'Squad'])
+  },
+  'Call of Duty Mobile': {
+    'Battle Royale': new Set(['Solo', 'Squad']),
+    Deathmatch: new Set(['5v5'])
+  },
+  Valorant: {
+    '5v5': new Set(['5v5'])
+  }
+};
+
+const validateTournamentGameConfiguration = (game, mode, format) => {
+  const modes = TOURNAMENT_GAME_CONFIGS[game];
+  if (!modes) return 'Invalid tournament game';
+  if (!mode || !modes[mode]) return `Invalid mode for ${game}`;
+  if (!format || !modes[mode].has(format)) return `Invalid format for ${game} ${mode}`;
+  return null;
+};
+
+const normalizeAndValidatePrizes = ({ type, pool, distribution = [], special = [] }) => {
+  if (type !== 'with_prize') return { distribution: [], special: [] };
+  if (!Array.isArray(distribution) || !Array.isArray(special)) {
+    return { error: 'Prize distribution must be an array' };
+  }
+  const normalizedDistribution = distribution.map((prize) => ({
+    rank: Number(prize.rank),
+    label: String(prize.label || ''),
+    amount: Number(prize.amount || 0),
+    percentage: Number(prize.percentage || 0)
+  }));
+  const normalizedSpecial = special.map((prize) => ({
+    category: String(prize.category || '').trim(),
+    amount: Number(prize.amount || 0),
+    ...(prize.winnerId ? { winnerId: prize.winnerId } : {}),
+    ...(prize.winnerName ? { winnerName: String(prize.winnerName) } : {})
+  }));
+  const ranks = normalizedDistribution.map((prize) => prize.rank);
+  const categories = normalizedSpecial.map((prize) => prize.category.toLowerCase());
+  const amounts = [...normalizedDistribution, ...normalizedSpecial].map((prize) => prize.amount);
+  const percentages = normalizedDistribution.map((prize) => prize.percentage);
+  if (ranks.some((rank) => !Number.isInteger(rank) || rank < 1)
+    || new Set(ranks).size !== ranks.length
+    || categories.some((category) => !category)
+    || new Set(categories).size !== categories.length
+    || amounts.some((amount) => !Number.isFinite(amount) || amount < 0)
+    || percentages.some((percentage) => !Number.isFinite(percentage) || percentage < 0 || percentage > 100)
+    || percentages.reduce((sum, percentage) => sum + percentage, 0) > 100
+    || amounts.reduce((sum, amount) => sum + amount, 0) > Number(pool || 0)) {
+    return { error: 'Invalid or over-budget prize distribution' };
+  }
+  return { distribution: normalizedDistribution, special: normalizedSpecial };
+};
+
+const submittedRoundCoverage = (tournament, round) => {
+  const roundNumber = Number(round);
+  const groups = (tournament.groups || []).filter(
+    (group) => Number(group.round || 1) === roundNumber && (group.participants || []).length > 0
+  );
+  const results = (tournament.groupResults || []).filter((result) => (
+    Number(result.round) === roundNumber
+    && (result.isSubmitted === true || (result.teams || []).every((team) => Number(team.rank) > 0))
+  ));
+  const complete = groups.length > 0 && groups.every((group) => {
+    const result = results.find((candidate) => (
+      String(candidate.groupName) === String(group.name)
+      || String(candidate.groupId) === String(group.name)
+      || String(candidate.groupId) === idString(group._id)
+    ));
+    if (!result) return false;
+    const expected = new Set((group.participants || []).map(idString));
+    const actual = (result.teams || []).map((team) => idString(team.teamId));
+    return actual.length === expected.size
+      && new Set(actual).size === actual.length
+      && actual.every((teamId) => expected.has(teamId));
+  });
+  const qualifiedIds = complete
+    ? Array.from(new Set(results.flatMap((result) => (
+        (result.teams || []).filter((team) => team.qualified).map((team) => idString(team.teamId))
+      ))))
+    : [];
+  return { complete, groups, results, qualifiedIds };
+};
 
 const getFreshHostPermissions = async (hostId) => {
   const host = await User.findById(hostId).select('isVerifiedHost').lean();
@@ -472,14 +784,14 @@ const propagateStatusChange = async (tournamentId, newStatus) => {
 
 // Create new tournament
 const createTournament = async (req, res) => {
+  let createLock = null;
+  let reservedTournamentId = null;
+  let tournamentSaved = false;
+  let newBannerPublicId = null;
   try {
-    upload(req, res, async (err) => {
-      if (err) {
-        return res.status(400).json({
-          success: false,
-          message: err.message
-        });
-      }
+    await new Promise((resolve, reject) => {
+      upload(req, res, (uploadError) => uploadError ? reject(uploadError) : resolve());
+    });
 
       // Debug: Log the request body
       if (process.env.NODE_ENV === 'development') { console.log('Request body:', req.body);}
@@ -540,12 +852,17 @@ const createTournament = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid tournament game' });
     }
 
-    if (mode && !validModes.includes(mode)) {
+    if (!mode || !validModes.includes(mode)) {
       return res.status(400).json({ success: false, message: 'Invalid tournament mode' });
     }
 
     if (!validFormats.includes(format)) {
       return res.status(400).json({ success: false, message: 'Invalid tournament format' });
+    }
+
+    const gameConfigurationError = validateTournamentGameConfiguration(game, mode, format);
+    if (gameConfigurationError) {
+      return res.status(400).json({ success: false, message: gameConfigurationError });
     }
 
     if (Number.isNaN(parsedTotalSlots) || parsedTotalSlots < 4 || parsedTotalSlots > 128) {
@@ -562,6 +879,14 @@ const createTournament = async (req, res) => {
 
     if (Number.isNaN(parsedNumberOfGroups) || parsedNumberOfGroups < 1) {
       return res.status(400).json({ success: false, message: 'At least one group is required' });
+    }
+
+    const expectedNumberOfGroups = Math.ceil(parsedTotalSlots / parsedTeamsPerGroup);
+    if (parsedNumberOfGroups !== expectedNumberOfGroups) {
+      return res.status(400).json({
+        success: false,
+        message: `Number of groups must be ${expectedNumberOfGroups} for this slot configuration`
+      });
     }
 
     if (Number.isNaN(totalRounds) || totalRounds < 1 || totalRounds > 10) {
@@ -622,7 +947,7 @@ const createTournament = async (req, res) => {
       });
     }
 
-    const createLock = hostPermissions.isVerifiedHost
+    createLock = hostPermissions.isVerifiedHost
       ? null
       : await acquireHostTournamentCreateLock(hostId);
     if (createLock === false) {
@@ -665,6 +990,22 @@ const createTournament = async (req, res) => {
       });
     }
 
+    const prizeConfig = normalizeAndValidatePrizes({
+      type: normalizedPrizePoolType,
+      pool: parsedPrizePool,
+      distribution: prizeDistribution || [],
+      special: specialPrizes || []
+    });
+    if (prizeConfig.error) {
+      await releaseHostTournamentCreateLock(createLock);
+      return res.status(400).json({ success: false, message: prizeConfig.error });
+    }
+
+    const bannerUpload = req.file
+      ? await uploadImage(req.file, 'gaming-social/tournaments', { width: 1600, height: 900 })
+      : null;
+    newBannerPublicId = bannerUpload?.publicId || null;
+
     // Create tournament
     const tournamentData = {
       name,
@@ -688,10 +1029,11 @@ const createTournament = async (req, res) => {
       totalRounds: totalRounds,
       prizePoolType: normalizedPrizePoolType,
       prizePoolCurrency: prizePoolCurrency || 'INR',
-      prizeDistribution: prizeDistribution || [],
-      specialPrizes: specialPrizes || [],
+      prizeDistribution: prizeConfig.distribution,
+      specialPrizes: prizeConfig.special,
       host: hostId,
-      banner: req.file ? req.file.filename : null,
+      banner: bannerUpload?.url || null,
+      bannerPublicId: newBannerPublicId,
       rules: rules ? rules.split(',').map(rule => rule.trim()) : [],
       status: 'Upcoming'
     };
@@ -702,6 +1044,10 @@ const createTournament = async (req, res) => {
       const reservation = await reserveHostActiveTournament(hostId, tournament._id);
       if (!reservation.ok) {
         await releaseHostTournamentCreateLock(createLock);
+        if (newBannerPublicId) {
+          await deleteFile(newBannerPublicId).catch(() => {});
+          newBannerPublicId = null;
+        }
         return res.status(409).json({
           success: false,
           message: 'You already have an active tournament. Complete or cancel it before creating another one.',
@@ -711,6 +1057,7 @@ const createTournament = async (req, res) => {
         });
       }
       activeTournamentReserved = true;
+      reservedTournamentId = tournament._id;
     }
     
     // Calculate number of groups based on totalSlots and teamsPerGroup
@@ -730,6 +1077,7 @@ const createTournament = async (req, res) => {
     }
     if (process.env.NODE_ENV === 'development') { console.log('Created Round 1 groups:', groups);
     }
+    tournament.groups = groups;
     // Create broadcast channels only for Round 1
     const broadcastChannels = [];
     for (let i = 0; i < calculatedGroups; i++) {
@@ -739,17 +1087,17 @@ const createTournament = async (req, res) => {
         type: 'Text Messages',
         description: `Broadcast channel for Group ${String.fromCharCode(65 + i)} in Round 1`,
         round: 1,
-        groupId: `round_1_group_${i + 1}`,
+        groupId: tournament.groups[i]._id,
         channelId: null
       });
     }
     if (process.env.NODE_ENV === 'development') { console.log('Created Round 1 broadcast channels:', broadcastChannels);
     }
     // Update tournament with groups and broadcast channels
-    tournament.groups = groups;
     tournament.broadcastChannels = broadcastChannels;
     try {
       await tournament.save();
+      tournamentSaved = true;
     } catch (saveError) {
       if (activeTournamentReserved) {
         await releaseHostActiveTournament(hostId, tournament._id);
@@ -773,9 +1121,23 @@ const createTournament = async (req, res) => {
         tournament: processedTournament
       }
     });
-    });
   } catch (error) {
     log.error('Tournament creation error:', { error: String(error) });
+
+    if (!tournamentSaved && reservedTournamentId && req.user?._id) {
+      await releaseHostActiveTournament(req.user._id, reservedTournamentId).catch(() => {});
+    }
+    await releaseHostTournamentCreateLock(createLock).catch(() => {});
+
+    if (!tournamentSaved && newBannerPublicId) {
+      await deleteFile(newBannerPublicId).catch((cleanupError) => {
+        log.warn('[createTournament] Failed to remove unsuccessful S3 upload', { error: String(cleanupError) });
+      });
+    }
+
+    if (error instanceof multer.MulterError || error?.message === 'Only image files are allowed') {
+      return res.status(400).json({ success: false, message: error.message });
+    }
     
     // Handle validation errors specifically
     if (error.name === 'ValidationError') {
@@ -798,14 +1160,18 @@ const createTournament = async (req, res) => {
 // Get all tournaments
 const getTournaments = async (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 100; // Increased default limit to show more tournaments
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    // Mobile intentionally requests 200 records for its summary counts. Keep
+    // that supported while preventing unbounded public aggregation requests.
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 100));
     const skip = (page - 1) * limit;
 
     const { status, game, format, filter } = req.query;
     const search = normalizeQuerySearch(
       req.query.search !== undefined ? req.query.search : req.query.q
     );
+    const viewerUserId = req.user?.userType === 'guest' ? null : (req.user?._id || req.user?.id);
+    const viewerTeamIds = viewerUserId ? await getActiveTeamIdsForUser(viewerUserId) : [];
 
     // Build filter object
     const queryFilter = {};
@@ -825,7 +1191,7 @@ const getTournaments = async (req, res) => {
       queryFilter.status = 'Completed';
     } else if (filter === 'hosted') {
       // Filter tournaments hosted by the authenticated user
-      const userId = req.user?._id || req.user?.id;
+      const userId = viewerUserId;
       if (userId) {
         queryFilter.host = userId;
       } else {
@@ -833,11 +1199,11 @@ const getTournaments = async (req, res) => {
       }
     } else if (filter === 'participating') {
       // Filter tournaments where user is participating
-      const userId = req.user?._id || req.user?.id;
+      const userId = viewerUserId;
       if (userId) {
         queryFilter.$or = [
           { participants: userId },
-          { teams: userId }
+          { teams: { $in: [userId, ...viewerTeamIds] } }
         ];
       } else {
         queryFilter._id = { $exists: false };
@@ -876,6 +1242,10 @@ const getTournaments = async (req, res) => {
         $or: [
           { name: { $regex: pattern, $options: 'i' } },
           { description: { $regex: pattern, $options: 'i' } },
+          { game: { $regex: pattern, $options: 'i' } },
+          { mode: { $regex: pattern, $options: 'i' } },
+          { format: { $regex: pattern, $options: 'i' } },
+          { tournamentCode: { $regex: pattern, $options: 'i' } },
         ],
       };
       // If $or already exists from filter, merge using $and
@@ -895,7 +1265,7 @@ const getTournaments = async (req, res) => {
       .select(PUBLIC_TOURNAMENT_SELECT)
       .populate('host', 'username profile.displayName profile.avatar')
       .populate('participants', 'username profile.displayName profile.avatar')
-      .populate('teams', 'username profile.displayName profile.avatar')
+      .populate(PUBLIC_TEAM_POPULATE)
       .sort(filter === 'recent' || filter === 'completed' ? { endDate: -1 } : { startDate: -1 }) // Sort by end date for completed, start date for others
       .skip(skip)
       .limit(limit);
@@ -907,21 +1277,6 @@ const getTournaments = async (req, res) => {
     
     for (let tournament of tournaments) {
       const beforeStatus = tournament.status;
-      
-      // Check if registration deadline has passed but status is still "Registration Open"
-      if (tournament.status === 'Registration Open' && new Date(tournament.registrationDeadline) < now) {
-        // Registration deadline passed, but tournament hasn't started yet
-        // Keep it as "Registration Open" for now, but we'll filter it out
-        // Actually, let's mark it as "Upcoming" if start date hasn't arrived
-        if (new Date(tournament.startDate) > now) {
-          await Tournament.updateOne(
-            { _id: tournament._id }, 
-            { $set: { status: 'Upcoming' } }
-          );
-          tournament.status = 'Upcoming';
-          tournamentsToUpdate.push(tournament._id);
-        }
-      }
       
       // Check if tournament should be marked as Completed
       await checkAndMarkCompletedTournaments(tournament);
@@ -942,7 +1297,7 @@ const getTournaments = async (req, res) => {
         .select(PUBLIC_TOURNAMENT_SELECT)
         .populate('host', 'username profile.displayName profile.avatar')
         .populate('participants', 'username profile.displayName profile.avatar')
-        .populate('teams', 'username profile.displayName profile.avatar')
+        .populate(PUBLIC_TEAM_POPULATE)
         .sort(filter === 'recent' || filter === 'completed' ? { endDate: -1 } : { startDate: -1 })
         .skip(skip)
         .limit(limit);
@@ -966,9 +1321,10 @@ const getTournaments = async (req, res) => {
     const total = await Tournament.countDocuments(queryFilter);
 
     // Process tournaments to convert banner filenames to URLs
-    const processedTournaments = tournamentsToReturn
-      .map(processTournament)
-      .map(sanitizePublicTournament);
+    const processedTournaments = tournamentsToReturn.map((tournament) => {
+      const safeTournament = sanitizePublicTournament(processTournament(tournament));
+      return withViewerTournamentContext(safeTournament, tournament, viewerUserId, viewerTeamIds);
+    });
 
     res.status(200).json({
       success: true,
@@ -1012,7 +1368,7 @@ const getTournament = async (req, res) => {
         .select(PUBLIC_TOURNAMENT_SELECT)
         .populate('host', 'username profile.displayName profile.avatar')
         .populate('participants', 'username profile.displayName profile.avatar')
-        .populate('teams', 'username userType profile.displayName profile.avatar')
+        .populate(PUBLIC_TEAM_POPULATE)
         .populate('groups.participants', 'username profile.displayName profile.avatar')
         .populate('matches.team1', 'username profile.displayName profile.avatar')
         .populate('matches.team2', 'username profile.displayName profile.avatar')
@@ -1021,13 +1377,13 @@ const getTournament = async (req, res) => {
     } else {
       // Regular route - can be either code or ID
       // Check if it's a code format: TRN-XXX-XXXXXXXX (contains dashes)
-      if (id && (id.includes('-') || id.length > 20)) {
+      if (isTournamentCode(id)) {
         // Looks like a tournament code (format: TRN-BGM-A1B2C3D4)
         tournament = await Tournament.findOne({ tournamentCode: id.toUpperCase() })
           .select(PUBLIC_TOURNAMENT_SELECT)
           .populate('host', 'username profile.displayName profile.avatar')
           .populate('participants', 'username profile.displayName profile.avatar')
-          .populate('teams', 'username userType profile.displayName profile.avatar')
+          .populate(PUBLIC_TEAM_POPULATE)
           .populate('groups.participants', 'username profile.displayName profile.avatar')
           .populate('matches.team1', 'username profile.displayName profile.avatar')
           .populate('matches.team2', 'username profile.displayName profile.avatar')
@@ -1041,7 +1397,7 @@ const getTournament = async (req, res) => {
           .select(PUBLIC_TOURNAMENT_SELECT)
           .populate('host', 'username profile.displayName profile.avatar')
           .populate('participants', 'username profile.displayName profile.avatar')
-          .populate('teams', 'username userType profile.displayName profile.avatar')
+          .populate(PUBLIC_TEAM_POPULATE)
           .populate('groups.participants', 'username profile.displayName profile.avatar')
           .populate('matches.team1', 'username profile.displayName profile.avatar')
           .populate('matches.team2', 'username profile.displayName profile.avatar')
@@ -1065,7 +1421,7 @@ const getTournament = async (req, res) => {
       .select(PUBLIC_TOURNAMENT_SELECT)
       .populate('host', 'username profile.displayName profile.avatar')
       .populate('participants', 'username profile.displayName profile.avatar')
-      .populate('teams', 'username userType profile.displayName profile.avatar')
+      .populate(PUBLIC_TEAM_POPULATE)
       .populate('groups.participants', 'username profile.displayName profile.avatar')
       .populate('matches.team1', 'username profile.displayName profile.avatar')
       .populate('matches.team2', 'username profile.displayName profile.avatar')
@@ -1101,8 +1457,17 @@ const getTournament = async (req, res) => {
       );
     }
 
-    // Process tournament to convert banner filename to URL
-    const processedTournament = sanitizePublicTournament(processTournament(tournament));
+    // Process tournament to convert banner filename to URL and attach only
+    // viewer-specific participation facts. Roster/staff membership remains
+    // private and is evaluated server-side.
+    const viewerUserId = req.user?.userType === 'guest' ? null : (req.user?._id || req.user?.id);
+    const viewerTeamIds = viewerUserId ? await getActiveTeamIdsForUser(viewerUserId) : [];
+    const processedTournament = withViewerTournamentContext(
+      sanitizePublicTournament(processTournament(tournament)),
+      tournament,
+      viewerUserId,
+      viewerTeamIds
+    );
 
     res.status(200).json({
       success: true,
@@ -1148,7 +1513,7 @@ const getTournamentByName = async (req, res) => {
       .select(PUBLIC_TOURNAMENT_SELECT)
       .populate('host', 'username profile.displayName profile.avatar')
       .populate('participants', 'username profile.displayName profile.avatar')
-      .populate('teams', 'username userType profile.displayName profile.avatar')
+      .populate(PUBLIC_TEAM_POPULATE)
       .populate('groups.participants', 'username profile.displayName profile.avatar')
       .populate('matches.team1', 'username profile.displayName profile.avatar')
       .populate('matches.team2', 'username profile.displayName profile.avatar')
@@ -1168,8 +1533,15 @@ const getTournamentByName = async (req, res) => {
       });
     }
 
-    // Process tournament to convert banner filename to URL
-    const processedTournament = sanitizePublicTournament(processTournament(tournament));
+    // Process tournament to convert banner filename to URL.
+    const viewerUserId = req.user?.userType === 'guest' ? null : (req.user?._id || req.user?.id);
+    const viewerTeamIds = viewerUserId ? await getActiveTeamIdsForUser(viewerUserId) : [];
+    const processedTournament = withViewerTournamentContext(
+      sanitizePublicTournament(processTournament(tournament)),
+      tournament,
+      viewerUserId,
+      viewerTeamIds
+    );
 
     res.status(200).json({
       success: true,
@@ -1199,8 +1571,9 @@ const updateTournament = async (req, res) => {
         });
       }
 
+      let newBannerPublicId = null;
       try {
-        let tournament = await Tournament.findById(req.params.id);
+        let tournament = await Tournament.findById(req.params.id).select('+bannerPublicId');
 
         if (!tournament) {
           return res.status(404).json({
@@ -1221,7 +1594,7 @@ const updateTournament = async (req, res) => {
         await checkAndMarkCompletedTournaments(tournament);
         
         // Refresh tournament from DB to get updated status
-        tournament = await Tournament.findById(req.params.id);
+        tournament = await Tournament.findById(req.params.id).select('+bannerPublicId');
 
         // Check if tournament can be edited (within 5 days of end if completed)
         if (!canEditTournament(tournament)) {
@@ -1237,7 +1610,7 @@ const updateTournament = async (req, res) => {
           'registrationStartDate', 'registrationEndDate', 'tournamentStartDate', 'tournamentEndDate',
           'startDate', 'endDate', 'registrationDeadline', 'location', 'timezone',
           'prizePool', 'prizePoolCurrency', 'totalSlots', 'teamsPerGroup',
-          'numberOfGroups', 'totalRounds', 'prizePoolType', 'prizeDistribution', 'specialPrizes', 'rules', 'banner'
+          'numberOfGroups', 'totalRounds', 'prizePoolType', 'prizeDistribution', 'specialPrizes', 'rules'
         ];
         const updateData = {};
         allowedUpdateFields.forEach(field => {
@@ -1246,26 +1619,19 @@ const updateTournament = async (req, res) => {
           }
         });
         
-        // If a new banner file is uploaded, update the banner field
-        if (req.file) {
-          // Delete old banner file if it exists
-          if (tournament.banner) {
-            const oldBannerPath = path.join('uploads/tournaments', tournament.banner);
-            if (fs.existsSync(oldBannerPath)) {
-              fs.unlinkSync(oldBannerPath);
-            }
-          }
-          updateData.banner = req.file.filename;
-        }
+        // The body can never select a server-side object key or URL.
+        const oldBannerPath = req.file ? localTournamentBannerPath(tournament.banner) : null;
+        const oldBannerPublicId = tournament.bannerPublicId || null;
 
         // Handle rules if it's a string (comma-separated)
-        if (updateData.rules && typeof updateData.rules === 'string') {
+        if (updateData.rules !== undefined && typeof updateData.rules === 'string') {
           updateData.rules = updateData.rules.split(',').map(rule => rule.trim()).filter(rule => rule);
         }
 
         const validGames = ['BGMI', 'Valorant', 'Free Fire', 'Call of Duty Mobile'];
         const validModes = ['Battle Royale', 'Deathmatch', '5v5', 'Solo'];
         const validFormats = ['Solo', 'Duo', 'Squad', '5v5'];
+        const validStatuses = ['Upcoming', 'Registration Open', 'Ongoing', 'Completed', 'Cancelled'];
         if (updateData.name !== undefined && String(updateData.name).trim().length < 3) {
           return res.status(400).json({ success: false, message: 'Tournament name must be at least 3 characters' });
         }
@@ -1280,6 +1646,45 @@ const updateTournament = async (req, res) => {
         }
         if (updateData.format !== undefined && !validFormats.includes(updateData.format)) {
           return res.status(400).json({ success: false, message: 'Invalid tournament format' });
+        }
+        const nextGame = updateData.game ?? tournament.game;
+        const nextMode = updateData.mode ?? tournament.mode;
+        const rawNextFormat = updateData.format ?? tournament.format;
+        const nextFormat = rawNextFormat === 'Squadh' ? 'Squad' : rawNextFormat;
+        const gameConfigurationError = validateTournamentGameConfiguration(nextGame, nextMode, nextFormat);
+        if (gameConfigurationError) {
+          return res.status(400).json({ success: false, message: gameConfigurationError });
+        }
+        if (updateData.status !== undefined && !validStatuses.includes(updateData.status)) {
+          return res.status(400).json({ success: false, message: 'Invalid tournament status' });
+        }
+        const allowedStatusTransitions = {
+          Upcoming: new Set(['Upcoming', 'Registration Open', 'Cancelled']),
+          'Registration Open': new Set(['Registration Open', 'Ongoing', 'Cancelled']),
+          Ongoing: new Set(['Ongoing', 'Completed', 'Cancelled']),
+          Completed: new Set(['Completed']),
+          Cancelled: new Set(['Cancelled'])
+        };
+        if (updateData.status !== undefined
+          && !allowedStatusTransitions[tournament.status]?.has(updateData.status)) {
+          return res.status(409).json({
+            success: false,
+            message: `Tournament status cannot change from ${tournament.status} to ${updateData.status}`
+          });
+        }
+        if (updateData.status === 'Completed' && !tournament.finalResult?.generatedAt) {
+          return res.status(409).json({
+            success: false,
+            message: 'Generate complete final standings before marking the tournament Completed'
+          });
+        }
+        if (['Completed', 'Cancelled'].includes(tournament.status)
+          && updateData.status !== undefined
+          && updateData.status !== tournament.status) {
+          return res.status(409).json({
+            success: false,
+            message: `A ${tournament.status.toLowerCase()} tournament cannot be reopened`
+          });
         }
         const nextTotalSlots = updateData.totalSlots !== undefined ? parseInt(updateData.totalSlots) : tournament.totalSlots;
         const nextTeamsPerGroup = updateData.teamsPerGroup !== undefined ? parseInt(updateData.teamsPerGroup) : tournament.teamsPerGroup;
@@ -1337,6 +1742,43 @@ const updateTournament = async (req, res) => {
         if (nextTourEnd <= nextTourStart) {
           return res.status(400).json({ success: false, message: 'Tournament end date must be after start date' });
         }
+
+        // Canonical and legacy date fields are still consumed by different
+        // Web/Mobile views. Persist them atomically so one edit cannot leave
+        // sorting, registration, and schedule generation on stale dates.
+        updateData.registrationStartDate = nextRegStart;
+        updateData.registrationEndDate = nextRegEnd;
+        updateData.registrationDeadline = nextRegEnd;
+        updateData.tournamentStartDate = nextTourStart;
+        updateData.startDate = nextTourStart;
+        updateData.tournamentEndDate = nextTourEnd;
+        updateData.endDate = nextTourEnd;
+
+        const hasCompetitionState = (tournament.participants || []).length > 0
+          || (tournament.teams || []).length > 0
+          || (tournament.matches || []).length > 0
+          || (tournament.groupResults || []).length > 0;
+        if (hasCompetitionState) {
+          const protectedStructure = {
+            game: tournament.game,
+            mode: tournament.mode,
+            format: tournament.format,
+            totalSlots: tournament.totalSlots,
+            teamsPerGroup: tournament.teamsPerGroup,
+            numberOfGroups: tournament.numberOfGroups,
+            totalRounds: tournament.totalRounds,
+            prizePoolType: tournament.prizePoolType
+          };
+          const changedProtectedField = Object.entries(protectedStructure).find(([field, current]) => (
+            req.body[field] !== undefined && String(req.body[field]) !== String(current ?? '')
+          ));
+          if (changedProtectedField) {
+            return res.status(409).json({
+              success: false,
+              message: `${changedProtectedField[0]} cannot change after registration activity begins`
+            });
+          }
+        }
         updateData.totalSlots = nextTotalSlots;
         updateData.teamsPerGroup = nextTeamsPerGroup;
         updateData.numberOfGroups = nextNumberOfGroups;
@@ -1344,9 +1786,41 @@ const updateTournament = async (req, res) => {
         updateData.prizePool = nextPrizePoolType === 'with_prize'
           ? nextPrizePool
           : 0;
-        if (nextPrizePoolType !== 'with_prize') {
-          updateData.prizeDistribution = [];
-          updateData.specialPrizes = [];
+        const prizeConfig = normalizeAndValidatePrizes({
+          type: nextPrizePoolType,
+          pool: updateData.prizePool,
+          distribution: updateData.prizeDistribution ?? tournament.prizeDistribution ?? [],
+          special: updateData.specialPrizes ?? tournament.specialPrizes ?? []
+        });
+        if (tournament.finalResult?.generatedAt) {
+          const immutableAfterPublication = [
+            'prizePool', 'prizePoolCurrency', 'prizePoolType', 'prizeDistribution', 'specialPrizes'
+          ];
+          const changedPublishedField = immutableAfterPublication.find(
+            (field) => req.body[field] !== undefined
+          );
+          if (changedPublishedField) {
+            return res.status(409).json({
+              success: false,
+              message: `${changedPublishedField} cannot change after final results are published`
+            });
+          }
+        }
+        if (prizeConfig.error) {
+          return res.status(400).json({ success: false, message: prizeConfig.error });
+        }
+        updateData.prizeDistribution = prizeConfig.distribution;
+        updateData.specialPrizes = prizeConfig.special;
+
+        if (req.file) {
+          const bannerUpload = await uploadImage(
+            req.file,
+            'gaming-social/tournaments',
+            { width: 1600, height: 900 }
+          );
+          updateData.banner = bannerUpload.url;
+          updateData.bannerPublicId = bannerUpload.publicId;
+          newBannerPublicId = bannerUpload.publicId;
         }
 
         // Capture original values before update for history propagation
@@ -1360,6 +1834,35 @@ const updateTournament = async (req, res) => {
           updateData,
           { new: true, runValidators: true }
         ).populate('host', 'username profile.displayName profile.avatar');
+
+        if (!updatedTournament) {
+          throw new Error('Tournament disappeared while it was being updated');
+        }
+
+        if (newBannerPublicId && oldBannerPublicId && oldBannerPublicId !== newBannerPublicId) {
+          await deleteFile(oldBannerPublicId).catch((bannerCleanupError) => {
+            log.warn('[updateTournament] Failed to remove previous S3 banner', {
+              error: String(bannerCleanupError),
+              tournamentId: String(tournament._id)
+            });
+          });
+        }
+        // From this point the new object is the committed live banner and must
+        // not be removed by compensation for a later, unrelated side effect.
+        newBannerPublicId = null;
+
+        // Delete the previous local banner only after the database update has
+        // succeeded, and only when it resolves inside the fixed upload root.
+        if (oldBannerPath && fs.existsSync(oldBannerPath)) {
+          try {
+            fs.unlinkSync(oldBannerPath);
+          } catch (bannerCleanupError) {
+            log.warn('[updateTournament] Failed to remove previous banner', {
+              error: String(bannerCleanupError),
+              tournamentId: String(tournament._id)
+            });
+          }
+        }
 
         if (!ACTIVE_TOURNAMENT_STATUSES.includes(updatedTournament.status)) {
           await releaseHostActiveTournament(tournament.host, tournament._id);
@@ -1392,6 +1895,59 @@ const updateTournament = async (req, res) => {
         // Process tournament to convert banner filename to URL
         const processedTournament = processTournament(updatedTournament);
 
+        await emitTournamentUpdated(req, updatedTournament._id);
+
+        if (originalStatus !== updatedTournament.status && updatedTournament.status === 'Registration Open') {
+          emitTournamentBroadcast(
+            req,
+            updatedTournament,
+            'registration_opened',
+            `Registration opened for "${updatedTournament.name}"! Join now to participate.`
+          );
+        } else if (originalStatus !== updatedTournament.status && updatedTournament.status === 'Ongoing') {
+          emitTournamentBroadcast(
+            req,
+            updatedTournament,
+            'tournament_started',
+            `Tournament "${updatedTournament.name}" has started! Good luck to all participants.`,
+            [updatedTournament.host, ...(updatedTournament.participants || []), ...(updatedTournament.teams || [])]
+          );
+          await notifyTournamentRecipients({
+            tournament: updatedTournament,
+            recipients: [...(updatedTournament.participants || []), ...(updatedTournament.teams || [])],
+            sender: req.user._id,
+            title: `Tournament Started: ${updatedTournament.name}`,
+            message: 'The tournament has started. Check your round, group, and schedule.',
+            eventType: 'tournament_started',
+            revision: updatedTournament.updatedAt
+          });
+        } else if (originalStatus !== updatedTournament.status && updatedTournament.status === 'Completed') {
+          emitTournamentBroadcast(
+            req,
+            updatedTournament,
+            'tournament_completed',
+            `Tournament "${updatedTournament.name}" has ended. Results are available.`,
+            [updatedTournament.host, ...(updatedTournament.participants || []), ...(updatedTournament.teams || [])]
+          );
+        } else if (originalStatus !== updatedTournament.status && updatedTournament.status === 'Cancelled') {
+          emitTournamentBroadcast(
+            req,
+            updatedTournament,
+            'tournament_cancelled',
+            `Tournament "${updatedTournament.name}" has been cancelled.`,
+            [updatedTournament.host, ...(updatedTournament.participants || []), ...(updatedTournament.teams || [])]
+          );
+          await notifyTournamentRecipients({
+            tournament: updatedTournament,
+            recipients: [...(updatedTournament.participants || []), ...(updatedTournament.teams || [])],
+            sender: req.user._id,
+            title: `Tournament Cancelled: ${updatedTournament.name}`,
+            message: 'This tournament has been cancelled by the host.',
+            eventType: 'tournament_cancelled',
+            revision: updatedTournament.updatedAt
+          });
+        }
+
         res.status(200).json({
           success: true,
           message: 'Tournament updated successfully',
@@ -1401,6 +1957,14 @@ const updateTournament = async (req, res) => {
         });
 
       } catch (error) {
+        if (newBannerPublicId) {
+          await deleteFile(newBannerPublicId).catch((cleanupError) => {
+            log.warn('[updateTournament] Failed to compensate unsuccessful S3 upload', {
+              error: String(cleanupError),
+              tournamentId: String(req.params.id)
+            });
+          });
+        }
         res.status(500).json({
           success: false,
           message: 'Failed to update tournament',
@@ -1428,7 +1992,7 @@ const joinTournament = async (req, res) => {
     });
 
     const id = req.params.id;
-    const tournament = (id && (id.includes('-') || id.length > 20))
+    const tournament = isTournamentCode(id)
       ? await Tournament.findOne({ tournamentCode: id.toUpperCase() })
       : await Tournament.findById(id);
 
@@ -1455,8 +2019,9 @@ const joinTournament = async (req, res) => {
       });
     }
 
-    // Check if registration deadline has passed
-    if (new Date() > tournament.registrationDeadline) {
+    // Check canonical and legacy deadline fields consistently.
+    const registrationDeadline = new Date(tournament.registrationEndDate || tournament.registrationDeadline || 0);
+    if (Number.isNaN(registrationDeadline.getTime()) || new Date() > registrationDeadline) {
       return res.status(400).json({
         success: false,
         message: 'Registration deadline has passed'
@@ -1464,6 +2029,13 @@ const joinTournament = async (req, res) => {
     }
 
     const userId = req.user._id;
+
+    if (idString(tournament.host) === idString(userId)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Tournament hosts cannot register as participants'
+      });
+    }
 
     // Check if user is already registered
     const isAlreadyRegistered = tournament.participants.some(p => p.toString() === userId.toString()) || 
@@ -1485,28 +2057,74 @@ const joinTournament = async (req, res) => {
       });
     }
 
-    // Add user to tournament based on their type and tournament format
-    if (req.user.userType === 'team') {
-      // Teams can join all tournament formats
-      tournament.teams.push(userId);
-    } else {
-      // Players can only join Solo and Duo tournaments
-      if (tournament.format === 'Solo' || tournament.format === 'Duo') {
-        tournament.participants.push(userId);
-      } else {
-        return res.status(400).json({
-          success: false,
-          message: 'Players can only join Solo and Duo tournaments. For Squad tournaments, please join as a team.'
-        });
-      }
+    if (tournament.format === 'Duo') {
+      return res.status(400).json({
+        success: false,
+        message: 'Create a Duo team with one of your followers to join this tournament'
+      });
     }
 
-    await tournament.save();
+    let registrationField;
+    if (tournament.format === 'Solo') {
+      if (req.user.userType === 'team') {
+        return res.status(400).json({
+          success: false,
+          message: 'Solo tournaments must be joined from an individual player account.'
+        });
+      }
+      registrationField = 'participants';
+    } else if (req.user.userType === 'team') {
+      registrationField = 'teams';
+    } else {
+      return res.status(400).json({
+        success: false,
+        message: 'Players can only join Solo tournaments directly. Team formats must be joined as a team.'
+      });
+    }
+
+    // Reserve the slot and registration atomically. A read/push/save sequence
+    // can oversubscribe the final slot or acknowledge a lost concurrent write.
+    const now = new Date();
+    const registeredTournament = await Tournament.findOneAndUpdate(
+      {
+        _id: tournament._id,
+        status: 'Registration Open',
+        host: { $ne: userId },
+        participants: { $ne: userId },
+        teams: { $ne: userId },
+        $and: [
+          {
+            $or: [
+              { registrationEndDate: { $gte: now } },
+              { registrationEndDate: null, registrationDeadline: { $gte: now } }
+            ]
+          },
+          {
+            $expr: {
+              $lt: [
+                { $add: [{ $size: { $ifNull: ['$participants', []] } }, { $size: { $ifNull: ['$teams', []] } }] },
+                '$totalSlots'
+              ]
+            }
+          }
+        ]
+      },
+      { $addToSet: { [registrationField]: userId } },
+      { new: true }
+    );
+    if (!registeredTournament) {
+      return res.status(409).json({
+        success: false,
+        message: 'Registration changed or the tournament became full. Refresh and try again.'
+      });
+    }
+
+    await emitTournamentUpdated(req, registeredTournament._id);
 
     // Create history entries for team members (non-blocking)
     if (req.user.userType === 'team') {
       try {
-        await createHistoryEntriesForTeam(tournament, req.user);
+        await createHistoryEntriesForTeam(registeredTournament, req.user);
       } catch (historyErr) {
         log.error('[joinTournament] Failed to create history entries:', { error: String(historyErr) });
         await removeHistoryEntriesForTeam(tournament._id, req.user._id);
@@ -1524,6 +2142,11 @@ const joinTournament = async (req, res) => {
         tournamentId: tournament._id,
         customData: { action: 'tournament_join' }
       }
+    }).catch((notificationError) => {
+      log.error('[joinTournament] Host notification failed after registration commit', {
+        error: String(notificationError),
+        tournamentId: String(tournament._id)
+      });
     });
 
     res.status(200).json({
@@ -1540,6 +2163,21 @@ const joinTournament = async (req, res) => {
   }
 };
 
+// Canonical Duo registration contract used by the Web and Mobile clients.
+// Delegate to the hardened team creation service so all callers share one
+// follower, capacity, duplicate, and host-role implementation.
+const joinDuoTournament = async (req, res) => {
+  const { teamName, teammateId } = req.body || {};
+  req.body = {
+    username: teamName,
+    teamType: 'duo',
+    members: teammateId ? [teammateId] : [],
+    tournamentId: req.params.id
+  };
+  const { createTeam } = require('./userController');
+  return createTeam(req, res);
+};
+
 // Leave tournament
 const leaveTournament = async (req, res) => {
   try {
@@ -1549,6 +2187,19 @@ const leaveTournament = async (req, res) => {
       return res.status(404).json({
         success: false,
         message: 'Tournament not found'
+      });
+    }
+
+    const withdrawalDeadline = new Date(
+      tournament.registrationEndDate || tournament.registrationDeadline || 0
+    );
+    if (tournament.status !== 'Registration Open'
+      || Number.isNaN(withdrawalDeadline.getTime())
+      || Date.now() > withdrawalDeadline.getTime()) {
+      return res.status(409).json({
+        success: false,
+        code: 'TOURNAMENT_WITHDRAWAL_CLOSED',
+        message: 'Tournament withdrawal is only available while registration is open'
       });
     }
 
@@ -1572,8 +2223,22 @@ const leaveTournament = async (req, res) => {
     if (isTeamParticipant) {
       tournament.teams = tournament.teams.filter(id => id.toString() !== userId.toString());
     }
+    removeParticipantFromCompetitionState(tournament, userId);
 
     await tournament.save();
+
+    if (isTeamParticipant) {
+      const registeredTeam = await User.findById(userId).select('teamInfo.members.user').lean();
+      const memberIds = (registeredTeam?.teamInfo?.members || []).map((member) => member.user);
+      if (memberIds.length > 0) {
+        await Tournament.updateOne(
+          { _id: tournament._id },
+          { $pull: { duoRegistrationMembers: { $in: memberIds } } }
+        );
+      }
+    }
+
+    await emitTournamentUpdated(req, tournament._id);
 
     if (isTeamParticipant) {
       try {
@@ -1622,6 +2287,19 @@ const leaveTournamentAsTeam = async (req, res) => {
       });
     }
 
+    const withdrawalDeadline = new Date(
+      tournament.registrationEndDate || tournament.registrationDeadline || 0
+    );
+    if (tournament.status !== 'Registration Open'
+      || Number.isNaN(withdrawalDeadline.getTime())
+      || Date.now() > withdrawalDeadline.getTime()) {
+      return res.status(409).json({
+        success: false,
+        code: 'TOURNAMENT_WITHDRAWAL_CLOSED',
+        message: 'Tournament withdrawal is only available while registration is open'
+      });
+    }
+
     const { teamId } = req.body;
     const userId = req.user._id;
 
@@ -1642,9 +2320,9 @@ const leaveTournamentAsTeam = async (req, res) => {
     }
 
     // Check if user is a member of this team
-    const isTeamMember = team.teamInfo?.members?.some(member => 
-      (typeof member.user === 'string' ? member.user : member.user._id).toString() === userId.toString()
-    );
+    const isTeamMember = team.teamInfo?.members?.some((member) => (
+      idString(member?.user) === idString(userId)
+    ));
 
     if (!isTeamMember) {
       return res.status(400).json({
@@ -1654,7 +2332,9 @@ const leaveTournamentAsTeam = async (req, res) => {
     }
 
     // Check if team is registered for this tournament
-    const isTeamRegistered = tournament.teams.includes(teamId);
+    const isTeamRegistered = tournament.teams.some((registeredTeamId) => (
+      idString(registeredTeamId) === idString(teamId)
+    ));
     if (!isTeamRegistered) {
       return res.status(400).json({
         success: false,
@@ -1664,22 +2344,19 @@ const leaveTournamentAsTeam = async (req, res) => {
 
     // Remove team from tournament
     tournament.teams = tournament.teams.filter(id => id.toString() !== teamId.toString());
-
-    // Remove team from all members' joinedTeams
-    if (team.teamInfo?.members) {
-      for (const member of team.teamInfo.members) {
-        const memberUserId = typeof member.user === 'string' ? member.user : member.user._id;
-        const memberUser = await User.findById(memberUserId);
-        if (memberUser) {
-          memberUser.playerInfo.joinedTeams = memberUser.playerInfo.joinedTeams.filter(
-            joinedTeamId => joinedTeamId.toString() !== teamId.toString()
-          );
-          await memberUser.save();
-        }
-      }
-    }
+    removeParticipantFromCompetitionState(tournament, teamId);
 
     await tournament.save();
+
+    const teamMemberIds = (team.teamInfo?.members || []).map((member) => member.user);
+    if (teamMemberIds.length > 0) {
+      await Tournament.updateOne(
+        { _id: tournament._id },
+        { $pull: { duoRegistrationMembers: { $in: teamMemberIds } } }
+      );
+    }
+
+    await emitTournamentUpdated(req, tournament._id);
 
     // Remove history entries for team members (non-blocking)
     try {
@@ -1735,6 +2412,15 @@ const autoAssignGroups = async (req, res) => {
       });
     }
 
+    if (!['Upcoming', 'Registration Open'].includes(tournament.status)
+      || (tournament.matches || []).length > 0
+      || (tournament.groupResults || []).some((result) => result.isSubmitted === true)) {
+      return res.status(409).json({
+        success: false,
+        message: 'Round 1 groups cannot be reassigned after competition activity begins'
+      });
+    }
+
     // For duo tournaments, only consider teams (not individual participants)
     // For solo tournaments, consider both individual participants and teams
     let allParticipants;
@@ -1751,8 +2437,14 @@ const autoAssignGroups = async (req, res) => {
       });
     }
 
-    // Get existing groups or create new ones
-    let groups = tournament.groups || [];
+    // Group assignment configures Round 1 only. Historical/later-round groups
+    // must never be erased when a host rebalances initial registrations.
+    const laterRoundGroups = (tournament.groups || []).filter(
+      (group) => Number(group.round || 1) !== 1
+    );
+    let groups = (tournament.groups || []).filter(
+      (group) => Number(group.round || 1) === 1
+    );
     
     // If no groups exist, create them based on teamsPerGroup
     if (groups.length === 0) {
@@ -1766,7 +2458,15 @@ const autoAssignGroups = async (req, res) => {
         });
       }
     }
-    
+
+    const roundOneCapacity = groups.length * Number(tournament.teamsPerGroup || 0);
+    if (roundOneCapacity < allParticipants.length) {
+      return res.status(409).json({
+        success: false,
+        message: 'Round 1 groups do not have enough capacity for all registered participants'
+      });
+    }
+
     // Clear existing participants from all groups
     groups.forEach(group => {
       group.participants = [];
@@ -1793,10 +2493,12 @@ const autoAssignGroups = async (req, res) => {
       currentGroupParticipants++;
     }
 
-    tournament.groups = groups;
+    tournament.groups = [...laterRoundGroups, ...groups];
     
     // Automatically create broadcast channels for each group
-    tournament.broadcastChannels = [];
+    tournament.broadcastChannels = (tournament.broadcastChannels || []).filter(
+      (channel) => Number(channel.round || 1) !== 1
+    );
     for (let i = 0; i < groups.length; i++) {
       const group = groups[i];
       const channelName = `Round ${group.round || 1} - ${group.name}`;
@@ -1812,8 +2514,19 @@ const autoAssignGroups = async (req, res) => {
 
       tournament.broadcastChannels.push(broadcastChannel);
     }
-    
+
     await tournament.save();
+    if (wasTeamEntry) {
+      const removedTeam = await User.findById(participantId).select('teamInfo.members.user').lean();
+      const memberIds = (removedTeam?.teamInfo?.members || []).map((member) => member.user);
+      if (memberIds.length > 0) {
+        await Tournament.updateOne(
+          { _id: tournament._id },
+          { $pull: { duoRegistrationMembers: { $in: memberIds } } }
+        );
+      }
+    }
+    await emitTournamentUpdated(req, tournament._id);
 
     // Send notifications to all participants about group assignment and broadcast channels
     // For duo tournaments, only notify teams (not individual participants)
@@ -1824,7 +2537,7 @@ const autoAssignGroups = async (req, res) => {
     } else {
       allTournamentParticipants = [...tournament.participants, ...tournament.teams];
     }
-    allTournamentParticipants = uniqueNotificationRecipients(allTournamentParticipants);
+    allTournamentParticipants = await expandTournamentRecipientIds(allTournamentParticipants);
     const notificationPromises = allTournamentParticipants.map(async (participantId) => {
       return createAndEmitNotification({
         recipient: participantId,
@@ -1839,7 +2552,7 @@ const autoAssignGroups = async (req, res) => {
       });
     });
 
-    await Promise.all(notificationPromises);
+    await Promise.allSettled(notificationPromises);
 
     res.status(200).json({
       success: true,
@@ -1872,12 +2585,17 @@ const sendTournamentMessage = async (req, res) => {
       });
     }
 
-    // Check if user is the host
+    // Authorize the tournament host.
     if (tournament.host.toString() !== req.user._id.toString()) {
       return res.status(403).json({
         success: false,
         message: 'Only tournament host can send messages'
       });
+    }
+
+    const normalizedMessage = String(message || '').trim();
+    if (!normalizedMessage || normalizedMessage.length > 1000) {
+      return res.status(400).json({ success: false, message: 'Message must be between 1 and 1000 characters' });
     }
 
     // Initialize tournamentMessages array if it doesn't exist
@@ -1888,16 +2606,24 @@ const sendTournamentMessage = async (req, res) => {
     // Add message to tournament messages
     const newMessage = {
       sender: req.user._id,
-      message,
+      message: normalizedMessage,
       type,
       timestamp: new Date()
     };
 
     tournament.tournamentMessages.push(newMessage);
     await tournament.save();
+    emitTournamentBroadcast(
+      req,
+      tournament,
+      'tournament_message',
+      normalizedMessage,
+      [tournament.host, ...tournament.participants, ...tournament.teams]
+    );
+    await emitTournamentUpdated(req, tournament._id);
 
     // Send notifications to all participants
-    const allParticipants = uniqueNotificationRecipients([...tournament.participants, ...tournament.teams]);
+    const allParticipants = await expandTournamentRecipientIds([...tournament.participants, ...tournament.teams]);
     
     const notificationPromises = allParticipants.map(async (participantId) => {
       return createAndEmitNotification({
@@ -1905,7 +2631,7 @@ const sendTournamentMessage = async (req, res) => {
         sender: req.user._id,
         type: 'tournament',
         title: `Tournament Update: ${tournament.name}`,
-        message: message,
+        message: normalizedMessage,
         data: {
           tournamentId: tournament._id,
           customData: { action: 'tournament_message' }
@@ -1913,7 +2639,7 @@ const sendTournamentMessage = async (req, res) => {
       });
     });
 
-    await Promise.all(notificationPromises);
+    await Promise.allSettled(notificationPromises);
 
     res.status(200).json({
       success: true,
@@ -1951,6 +2677,23 @@ const sendGroupMessage = async (req, res) => {
       });
     }
 
+    const normalizedMessage = String(message || '').trim();
+    if (!normalizedMessage || normalizedMessage.length > 1000) {
+      return res.status(400).json({ success: false, message: 'Message must be between 1 and 1000 characters' });
+    }
+
+    const normalizedRound = parseInt(round, 10);
+    const group = (tournament.groups || []).find((candidate) => (
+      (idString(candidate._id) === String(groupId) || String(candidate.name) === String(groupId))
+      && Number(candidate.round || 1) === normalizedRound
+    ));
+    if (!group || !Number.isInteger(normalizedRound) || normalizedRound < 1) {
+      return res.status(400).json({
+        success: false,
+        message: 'Valid tournament group and round are required'
+      });
+    }
+
     // Initialize groupMessages array if it doesn't exist
     if (!tournament.groupMessages) {
       tournament.groupMessages = [];
@@ -1958,13 +2701,13 @@ const sendGroupMessage = async (req, res) => {
 
     // Find or create group message thread
     let groupMessageThread = tournament.groupMessages.find(
-      gm => gm.groupId === groupId && gm.round === round
+      gm => String(gm.groupId) === String(groupId) && gm.round === normalizedRound
     );
 
     if (!groupMessageThread) {
       groupMessageThread = {
         groupId,
-        round,
+        round: normalizedRound,
         messages: []
       };
       tournament.groupMessages.push(groupMessageThread);
@@ -1973,24 +2716,31 @@ const sendGroupMessage = async (req, res) => {
     // Add message to group thread
     const newMessage = {
       sender: req.user._id,
-      message,
+      message: normalizedMessage,
       type,
       timestamp: new Date()
     };
 
     groupMessageThread.messages.push(newMessage);
     await tournament.save();
+    emitTournamentBroadcast(
+      req,
+      tournament,
+      'group_message',
+      normalizedMessage,
+      [tournament.host, ...(group.participants || [])]
+    );
+    await emitTournamentUpdated(req, tournament._id);
 
     // Send notifications to group participants
-    const group = tournament.groups.find(g => g._id === groupId || g.name === groupId);
     if (group && group.participants) {
-      const notificationPromises = uniqueNotificationRecipients(group.participants).map(async (participantId) => {
+      const notificationPromises = (await expandTournamentRecipientIds(group.participants)).map(async (participantId) => {
         return createAndEmitNotification({
           recipient: participantId,
           sender: req.user._id,
           type: 'tournament',
           title: `Group Update: ${group.name}`,
-          message: message,
+          message: normalizedMessage,
           data: {
             tournamentId: tournament._id,
             groupId,
@@ -1999,7 +2749,7 @@ const sendGroupMessage = async (req, res) => {
         });
       });
 
-      await Promise.all(notificationPromises);
+      await Promise.allSettled(notificationPromises);
     }
 
     res.status(200).json({
@@ -2066,9 +2816,11 @@ const getGroupMessages = async (req, res) => {
       });
     }
 
+    const normalizedRound = Number.parseInt(round, 10);
     const group = (tournament.groups || []).find(
-      (candidate) => idString(candidate._id) === String(groupId)
-        || String(candidate.name) === String(groupId)
+      (candidate) => (idString(candidate._id) === String(groupId)
+        || String(candidate.name) === String(groupId))
+        && Number(candidate.round || 1) === normalizedRound
     );
     if (!group) {
       return res.status(404).json({ success: false, message: 'Tournament group not found' });
@@ -2082,7 +2834,7 @@ const getGroupMessages = async (req, res) => {
     }
 
     const groupMessageThread = tournament.groupMessages.find(
-      gm => String(gm.groupId) === String(groupId) && gm.round === parseInt(round, 10)
+      gm => String(gm.groupId) === String(groupId) && gm.round === normalizedRound
     );
 
     res.status(200).json({
@@ -2129,6 +2881,7 @@ const deleteTournamentMessage = async (req, res) => {
 
     tournament.tournamentMessages.splice(messageIndex, 1);
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
 
     res.status(200).json({
       success: true,
@@ -2177,6 +2930,7 @@ const deleteGroupMessage = async (req, res) => {
 
     groupThread.messages.splice(messageIndex, 1);
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
 
     res.status(200).json({
       success: true,
@@ -2196,7 +2950,7 @@ const deleteGroupMessage = async (req, res) => {
 // Delete tournament
 const deleteTournament = async (req, res) => {
   try {
-    const tournament = await Tournament.findById(req.params.id);
+    const tournament = await Tournament.findById(req.params.id).select('+bannerPublicId');
 
     if (!tournament) {
       return res.status(404).json({
@@ -2216,8 +2970,16 @@ const deleteTournament = async (req, res) => {
     // Host can delete any tournament regardless of status
     // No status restrictions for deletion
 
-    const recipients = uniqueNotificationRecipients([...tournament.participants, ...tournament.teams]);
+    const recipients = await expandTournamentRecipientIds([...tournament.participants, ...tournament.teams]);
     await Tournament.findByIdAndDelete(req.params.id);
+    if (tournament.bannerPublicId) {
+      await deleteFile(tournament.bannerPublicId).catch((bannerCleanupError) => {
+        log.warn('[deleteTournament] Failed to remove S3 banner', {
+          error: String(bannerCleanupError),
+          tournamentId: String(tournament._id)
+        });
+      });
+    }
     await notifyTournamentRecipients({
       tournament,
       recipients,
@@ -2272,6 +3034,14 @@ const cancelTournament = async (req, res) => {
     // Update tournament status to cancelled
     tournament.status = 'Cancelled';
     await tournament.save();
+    emitTournamentBroadcast(
+      req,
+      tournament,
+      'tournament_cancelled',
+      `Tournament "${tournament.name}" has been cancelled.`,
+      [tournament.host, ...tournament.participants, ...tournament.teams]
+    );
+    await emitTournamentUpdated(req, tournament._id);
     await releaseHostActiveTournament(tournament.host, tournament._id);
     await notifyTournamentRecipients({
       tournament,
@@ -2316,6 +3086,9 @@ const scheduleMatches = async (req, res) => {
         message: 'Only tournament host can schedule matches'
       });
     }
+    if (tournament.status !== 'Ongoing') {
+      return res.status(409).json({ success: false, message: 'Automatic match generation is available only after the tournament starts' });
+    }
 
     // Check if tournament has groups assigned
     if (!tournament.groups || tournament.groups.length === 0) {
@@ -2325,47 +3098,92 @@ const scheduleMatches = async (req, res) => {
       });
     }
 
-    // Clear existing matches
-    tournament.matches = [];
+    const scheduleRound = Math.max(1, Number(tournament.currentRound) || 1);
+    if ((tournament.matches || []).some((match) => Number(match.round || 1) === scheduleRound)) {
+      return res.status(409).json({
+        success: false,
+        message: `A schedule already exists for Round ${scheduleRound}. Delete it explicitly before generating another.`
+      });
+    }
+
+    const roundGroupsForSchedule = (tournament.groups || []).filter(
+      (group) => Number(group.round || 1) === scheduleRound
+    );
+    const groupedRoundParticipants = roundGroupsForSchedule.flatMap(
+      (group) => group.participants || []
+    );
+    const eliminationParticipants = scheduleRound > 1 && groupedRoundParticipants.length > 0
+      ? groupedRoundParticipants
+      : [...tournament.participants, ...tournament.teams];
+    const generatedMatchCount = tournament.format === 'Solo' || tournament.format === 'Duo'
+      ? Math.ceil(eliminationParticipants.length / 2)
+      : roundGroupsForSchedule.reduce((count, group) => {
+          const size = (group.participants || []).length;
+          return count + ((size * (size - 1)) / 2);
+        }, 0);
+    if (generatedMatchCount > MAX_GENERATED_MATCHES_PER_ROUND) {
+      return res.status(409).json({
+        success: false,
+        message: `Round ${scheduleRound} would create ${generatedMatchCount} matches. Reduce teams per group before generating the schedule.`
+      });
+    }
+
+    // Append the current round only. Earlier schedules are immutable history.
+    const initialMatchCount = (tournament.matches || []).length;
+    const configuredScheduleStart = new Date(tournament.tournamentStartDate || tournament.startDate);
+    if (Number.isNaN(configuredScheduleStart.getTime())) {
+      return res.status(400).json({ success: false, message: 'Tournament start date is invalid' });
+    }
+    const minimumScheduleStart = new Date(Date.now() + 5 * 60 * 1000);
+    const scheduleStart = configuredScheduleStart > minimumScheduleStart
+      ? configuredScheduleStart
+      : minimumScheduleStart;
+    const scheduleDate = scheduleStart.toISOString().slice(0, 10);
+    const scheduleTimeString = scheduleStart.toTimeString().split(' ')[0].slice(0, 5);
 
     // Generate matches based on tournament format
     if (tournament.format === 'Solo' || tournament.format === 'Duo') {
       // Single elimination bracket
-      const allParticipants = [...tournament.participants, ...tournament.teams];
-      const totalRounds = Math.ceil(Math.log2(allParticipants.length));
+      const allParticipants = eliminationParticipants;
+      if (allParticipants.length < 2) {
+        return res.status(409).json({ success: false, message: 'At least two participants are required to create matches' });
+      }
       
       // Create first round matches
       for (let i = 0; i < allParticipants.length; i += 2) {
-        if (i + 1 < allParticipants.length) {
-          tournament.matches.push({
-            round: 1,
-            team1: allParticipants[i],
-            team2: allParticipants[i + 1],
-            status: 'Scheduled',
-            scheduledTime: new Date(tournament.startDate),
-            createdBy: req.user._id,
-            lastModifiedBy: req.user._id
-          });
-        }
+        const hasOpponent = i + 1 < allParticipants.length;
+        tournament.matches.push({
+          round: scheduleRound,
+          team1: allParticipants[i],
+          team2: hasOpponent ? allParticipants[i + 1] : null,
+          winner: hasOpponent ? null : allParticipants[i],
+          status: hasOpponent ? 'Scheduled' : 'Completed',
+          scheduledTime: scheduleStart,
+          scheduledDate: scheduleDate,
+          scheduledTimeString,
+          createdBy: req.user._id,
+          lastModifiedBy: req.user._id
+        });
       }
       
-      tournament.totalRounds = totalRounds;
     } else {
       // Group stage format
-      tournament.groups.forEach((group, groupIndex) => {
+      roundGroupsForSchedule.forEach((group) => {
         const participants = group.participants;
         
         // Create round-robin matches within each group
         for (let i = 0; i < participants.length; i++) {
           for (let j = i + 1; j < participants.length; j++) {
             tournament.matches.push({
-              round: 1,
+              round: scheduleRound,
               groupId: group._id || group.name,
               groupName: group.name,
               team1: participants[i],
               team2: participants[j],
               status: 'Scheduled',
-              scheduledTime: new Date(tournament.startDate),
+              scheduledTime: scheduleStart,
+              scheduledDate: scheduleDate,
+              scheduledTimeString,
               createdBy: req.user._id,
               lastModifiedBy: req.user._id
             });
@@ -2373,10 +3191,14 @@ const scheduleMatches = async (req, res) => {
         }
       });
       
-      tournament.totalRounds = 1; // Will be updated when knockout stage starts
+    }
+
+    if (tournament.matches.length === initialMatchCount) {
+      return res.status(409).json({ success: false, message: 'Current groups do not contain enough participants to create matches' });
     }
 
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
 
     res.status(200).json({
       success: true,
@@ -2416,12 +3238,35 @@ const createMatchSchedule = async (req, res) => {
         message: 'Only tournament host can create match schedules'
       });
     }
+    if (!['Upcoming', 'Registration Open', 'Ongoing'].includes(tournament.status)) {
+      return res.status(409).json({ success: false, message: 'Match schedules cannot be changed for a terminal tournament' });
+    }
 
     // Validate matches data
     if (!matches || !Array.isArray(matches) || matches.length === 0) {
       return res.status(400).json({
         success: false,
         message: 'Matches data is required'
+      });
+    }
+    if (matches.length > 100) {
+      return res.status(400).json({
+        success: false,
+        message: 'Create at most 100 scheduled matches per request'
+      });
+    }
+
+    const roundNumber = Number.parseInt(round, 10) || 1;
+    if (roundNumber < 1 || roundNumber > 10) {
+      return res.status(400).json({ success: false, message: 'Invalid tournament round' });
+    }
+    if (roundNumber !== Number(tournament.currentRound || 1)
+      || (tournament.groupResults || []).some(
+        (result) => Number(result.round || 1) === roundNumber && result.isSubmitted === true
+      )) {
+      return res.status(409).json({
+        success: false,
+        message: 'Only the current round can be scheduled before results are submitted'
       });
     }
 
@@ -2437,6 +3282,31 @@ const createMatchSchedule = async (req, res) => {
       });
     }
 
+    if (Number(group.round || 1) !== roundNumber) {
+      return res.status(400).json({
+        success: false,
+        message: 'Selected group does not belong to this round'
+      });
+    }
+
+    const invalidMatch = matches.find((matchData) => {
+      const scheduledTime = new Date(matchData?.scheduledTime);
+      const duration = Number.parseInt(
+        matchData?.matchDuration || tournament.scheduleConfig?.defaultMatchDuration || 30,
+        10
+      );
+      return Number.isNaN(scheduledTime.getTime())
+        || !Number.isInteger(duration)
+        || duration < 1
+        || duration > 1440;
+    });
+    if (invalidMatch) {
+      return res.status(400).json({
+        success: false,
+        message: 'Every match needs a valid date, time, and duration'
+      });
+    }
+
     // Create matches with detailed scheduling
     const newMatches = matches.map(matchData => {
       const scheduledTime = new Date(matchData.scheduledTime);
@@ -2444,7 +3314,7 @@ const createMatchSchedule = async (req, res) => {
       const scheduledTimeString = scheduledTime.toTimeString().split(' ')[0].substring(0, 5);
 
       return {
-        round: round || 1,
+        round: roundNumber,
         groupId: groupId,
         groupName: group.name,
         team1: matchData.team1 || null, // Optional for group matches
@@ -2453,7 +3323,10 @@ const createMatchSchedule = async (req, res) => {
         scheduledTime: scheduledTime,
         scheduledDate: scheduledDate,
         scheduledTimeString: scheduledTimeString,
-        matchDuration: matchData.matchDuration || tournament.scheduleConfig?.defaultMatchDuration || 30,
+        matchDuration: Number.parseInt(
+          matchData.matchDuration || tournament.scheduleConfig?.defaultMatchDuration || 30,
+          10
+        ),
         venue: matchData.venue || 'Online',
         description: matchData.description || '',
         createdBy: req.user._id,
@@ -2464,6 +3337,7 @@ const createMatchSchedule = async (req, res) => {
     // Add new matches to tournament
     tournament.matches.push(...newMatches);
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
 
     res.status(201).json({
       success: true,
@@ -2471,7 +3345,7 @@ const createMatchSchedule = async (req, res) => {
       data: {
         matches: newMatches,
         group: group.name,
-        round: round || 1
+        round: roundNumber
       }
     });
 
@@ -2505,6 +3379,9 @@ const updateMatchSchedule = async (req, res) => {
         message: 'Only tournament host can update match schedules'
       });
     }
+    if (!['Upcoming', 'Registration Open', 'Ongoing'].includes(tournament.status)) {
+      return res.status(409).json({ success: false, message: 'Match schedules cannot be changed for a terminal tournament' });
+    }
 
     const match = tournament.matches.id(matchId);
     if (!match) {
@@ -2513,28 +3390,52 @@ const updateMatchSchedule = async (req, res) => {
         message: 'Match not found'
       });
     }
+    if (match.status !== 'Scheduled') {
+      return res.status(409).json({
+        success: false,
+        message: 'Only scheduled matches can be rescheduled'
+      });
+    }
+    if (Number(match.round || 1) !== Number(tournament.currentRound || 1)
+      || (tournament.groupResults || []).some(
+        (result) => Number(result.round || 1) === Number(match.round || 1) && result.isSubmitted === true
+      )) {
+      return res.status(409).json({
+        success: false,
+        message: 'Historical or completed round schedules are read-only'
+      });
+    }
+
+    const parsedScheduledTime = scheduledTime ? new Date(scheduledTime) : null;
+    if (parsedScheduledTime && Number.isNaN(parsedScheduledTime.getTime())) {
+      return res.status(400).json({ success: false, message: 'Invalid match date or time' });
+    }
+    const parsedDuration = matchDuration !== undefined ? Number.parseInt(matchDuration, 10) : null;
+    if (parsedDuration !== null && (!Number.isInteger(parsedDuration) || parsedDuration < 1 || parsedDuration > 1440)) {
+      return res.status(400).json({ success: false, message: 'Match duration must be between 1 and 1440 minutes' });
+    }
 
     // Store original time if rescheduling
-    if (scheduledTime && new Date(scheduledTime).getTime() !== match.scheduledTime.getTime()) {
+    if (parsedScheduledTime && parsedScheduledTime.getTime() !== match.scheduledTime?.getTime()) {
       match.originalScheduledTime = match.scheduledTime;
       match.isRescheduled = true;
     }
 
     // Update match details
-    if (scheduledTime) {
-      const newScheduledTime = new Date(scheduledTime);
-      match.scheduledTime = newScheduledTime;
-      match.scheduledDate = newScheduledTime.toISOString().split('T')[0];
-      match.scheduledTimeString = newScheduledTime.toTimeString().split(' ')[0].substring(0, 5);
+    if (parsedScheduledTime) {
+      match.scheduledTime = parsedScheduledTime;
+      match.scheduledDate = parsedScheduledTime.toISOString().split('T')[0];
+      match.scheduledTimeString = parsedScheduledTime.toTimeString().split(' ')[0].substring(0, 5);
     }
 
     if (venue !== undefined) match.venue = venue;
     if (description !== undefined) match.description = description;
-    if (matchDuration !== undefined) match.matchDuration = matchDuration;
+    if (parsedDuration !== null) match.matchDuration = parsedDuration;
     
     match.lastModifiedBy = req.user._id;
 
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
 
     res.status(200).json({
       success: true,
@@ -2658,6 +3559,7 @@ const configureScheduleSettings = async (req, res) => {
     if (timezone) tournament.scheduleConfig.timezone = timezone;
 
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
 
     res.status(200).json({
       success: true,
@@ -2696,6 +3598,9 @@ const deleteMatchFromSchedule = async (req, res) => {
         message: 'Only tournament host can delete matches'
       });
     }
+    if (!['Upcoming', 'Registration Open', 'Ongoing'].includes(tournament.status)) {
+      return res.status(409).json({ success: false, message: 'Match schedules cannot be changed for a terminal tournament' });
+    }
 
     const match = tournament.matches.id(matchId);
     if (!match) {
@@ -2705,9 +3610,23 @@ const deleteMatchFromSchedule = async (req, res) => {
       });
     }
 
+    if (match.status !== 'Scheduled') {
+      return res.status(409).json({
+        success: false,
+        message: 'Started or completed matches cannot be deleted'
+      });
+    }
+    if (Number(match.round || 1) !== Number(tournament.currentRound || 1)) {
+      return res.status(409).json({
+        success: false,
+        message: 'Historical round schedules are read-only'
+      });
+    }
+
     // Remove match
     tournament.matches.pull(matchId);
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
 
     res.status(200).json({
       success: true,
@@ -2743,13 +3662,40 @@ const deleteRoundSchedule = async (req, res) => {
         message: 'Only the tournament host can delete round schedule'
       });
     }
+    if (!['Upcoming', 'Registration Open', 'Ongoing'].includes(tournament.status)) {
+      return res.status(409).json({ success: false, message: 'Match schedules cannot be changed for a terminal tournament' });
+    }
 
-    // Remove all matches for the specified round
+    const roundNumber = Number.parseInt(round, 10);
+    if (roundNumber !== Number(tournament.currentRound || 1)) {
+      return res.status(409).json({
+        success: false,
+        message: 'Historical round schedules are read-only'
+      });
+    }
+    const roundMatches = tournament.matches.filter(
+      (match) => Number(match.round || 1) === roundNumber
+    );
+    const hasHistoricalState = roundMatches.some((match) => match.status !== 'Scheduled')
+      || (tournament.groupResults || []).some(
+        (result) => Number(result.round || 1) === roundNumber && result.isSubmitted === true
+      );
+    if (hasHistoricalState) {
+      return res.status(409).json({
+        success: false,
+        message: 'A round schedule cannot be cleared after matches or results begin'
+      });
+    }
+
+    // Remove all still-scheduled matches for the specified round
     const initialCount = tournament.matches.length;
-    tournament.matches = tournament.matches.filter(match => match.round !== parseInt(round));
+    tournament.matches = tournament.matches.filter(
+      (match) => Number(match.round || 1) !== roundNumber
+    );
     const deletedCount = initialCount - tournament.matches.length;
-    
+
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
 
     res.status(200).json({
       success: true,
@@ -2801,6 +3747,16 @@ const updateMatchResult = async (req, res) => {
       });
     }
 
+    if (tournament.finalResult?.generatedAt) {
+      return res.status(409).json({
+        success: false,
+        message: 'Group results cannot change after final standings are published'
+      });
+    }
+    if (!['Ongoing', 'Completed'].includes(tournament.status)) {
+      return res.status(409).json({ success: false, message: 'Match results can only be recorded after the tournament starts' });
+    }
+
     const match = tournament.matches.id(matchId);
     if (!match) {
       return res.status(404).json({
@@ -2808,22 +3764,45 @@ const updateMatchResult = async (req, res) => {
         message: 'Match not found'
       });
     }
+    if (Number(match.round || 1) !== Number(tournament.currentRound || 1)) {
+      return res.status(409).json({
+        success: false,
+        message: 'Historical round match results are read-only'
+      });
+    }
+
+    const parsedTeam1Score = Number(team1Score);
+    const parsedTeam2Score = Number(team2Score);
+    if (!Number.isInteger(parsedTeam1Score) || parsedTeam1Score < 0
+      || !Number.isInteger(parsedTeam2Score) || parsedTeam2Score < 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Scores must be non-negative whole numbers'
+      });
+    }
+    if (parsedTeam1Score === parsedTeam2Score) {
+      return res.status(400).json({
+        success: false,
+        message: 'A completed elimination match must have a winner'
+      });
+    }
 
     // Update match result
     match.result = {
-      team1Score: parseInt(team1Score),
-      team2Score: parseInt(team2Score)
+      team1Score: parsedTeam1Score,
+      team2Score: parsedTeam2Score
     };
     
     // Determine winner
-    if (team1Score > team2Score) {
+    if (parsedTeam1Score > parsedTeam2Score) {
       match.winner = match.team1;
-    } else if (team2Score > team1Score) {
+    } else {
       match.winner = match.team2;
     }
     
     match.status = 'Completed';
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
 
     res.status(200).json({
       success: true,
@@ -2862,6 +3841,9 @@ const startMatch = async (req, res) => {
         message: 'Only tournament host can start matches'
       });
     }
+    if (tournament.status !== 'Ongoing') {
+      return res.status(409).json({ success: false, message: 'Matches can only start while the tournament is ongoing' });
+    }
 
     const match = tournament.matches.id(matchId);
     if (!match) {
@@ -2870,9 +3852,22 @@ const startMatch = async (req, res) => {
         message: 'Match not found'
       });
     }
+    if (match.status !== 'Scheduled') {
+      return res.status(409).json({ success: false, message: `A ${match.status} match cannot be started` });
+    }
+    if (Number(match.round || 1) !== Number(tournament.currentRound || 1)
+      || (tournament.groupResults || []).some(
+        (result) => Number(result.round || 1) === Number(match.round || 1) && result.isSubmitted === true
+      )) {
+      return res.status(409).json({
+        success: false,
+        message: 'Only a current-round match can be started before results are submitted'
+      });
+    }
 
     match.status = 'In Progress';
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
 
     res.status(200).json({
       success: true,
@@ -2896,7 +3891,7 @@ const getTournamentParticipants = async (req, res) => {
   try {
     const tournament = await Tournament.findById(req.params.id)
       .populate('participants', 'username profile.displayName profile.avatar')
-      .populate('teams', 'username profile.displayName profile.avatar')
+      .populate(AUTHORIZED_TEAM_POPULATE)
       .populate('groups.participants', 'username profile.displayName profile.avatar');
 
     if (!tournament) {
@@ -2907,6 +3902,13 @@ const getTournamentParticipants = async (req, res) => {
     }
 
     const safeTournament = sanitizePublicTournament(tournament);
+    const canViewRoster = await canReadTournamentMessages(tournament, req.user._id);
+    if (!canViewRoster) {
+      safeTournament.teams = (safeTournament.teams || []).map((team) => ({
+        ...team,
+        teamInfo: { members: [] }
+      }));
+    }
 
     res.status(200).json({
       success: true,
@@ -2947,6 +3949,23 @@ const removeParticipant = async (req, res) => {
         message: 'Only tournament host can remove participants'
       });
     }
+    if (!['Upcoming', 'Registration Open'].includes(tournament.status)) {
+      return res.status(409).json({
+        success: false,
+        message: 'Participants can only be removed before the tournament starts'
+      });
+    }
+
+    const isRegistered = [...(tournament.participants || []), ...(tournament.teams || [])]
+      .some((candidate) => idString(candidate) === idString(participantId));
+    if (!participantId || !isRegistered) {
+      return res.status(404).json({
+        success: false,
+        message: 'Registered participant not found'
+      });
+    }
+    const wasTeamEntry = (tournament.teams || [])
+      .some((candidate) => idString(candidate) === idString(participantId));
 
     // Remove from participants array
     tournament.participants = tournament.participants.filter(
@@ -2958,14 +3977,18 @@ const removeParticipant = async (req, res) => {
       id => id.toString() !== participantId
     );
 
-    // Remove from groups
-    tournament.groups.forEach(group => {
-      group.participants = group.participants.filter(
-        id => id.toString() !== participantId
-      );
-    });
+    removeParticipantFromCompetitionState(tournament, participantId);
 
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
+    if (wasTeamEntry) {
+      try {
+        await removeHistoryEntriesForTeam(tournament._id, participantId);
+      } catch (historyErr) {
+        log.error('[removeParticipant] Failed to remove team history entries:', { error: String(historyErr) });
+      }
+    }
+
     await notifyTournamentRecipients({
       tournament,
       recipients: [participantId],
@@ -3003,6 +4026,22 @@ const assignParticipantToGroup = async (req, res) => {
       });
     }
 
+    if (!isTournamentHost(tournament, req.user._id)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only tournament host can assign participants to groups'
+      });
+    }
+
+    const registeredParticipant = [...(tournament.participants || []), ...(tournament.teams || [])]
+      .some((candidate) => idString(candidate) === idString(participantId));
+    if (!registeredParticipant) {
+      return res.status(400).json({
+        success: false,
+        message: 'Participant is not registered for this tournament'
+      });
+    }
+
     let group;
     
     if (!groupId) {
@@ -3030,6 +4069,37 @@ const assignParticipantToGroup = async (req, res) => {
           message: 'Group not found'
         });
       }
+
+      if (round && Number(group.round || 1) !== Number(round)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Selected group does not belong to this round'
+        });
+      }
+    }
+
+    const targetRound = Number(group.round || round || 1);
+    const roundHasCompetitionState = (tournament.matches || []).some(
+      (match) => Number(match.round || 1) === targetRound
+    ) || (tournament.groupResults || []).some(
+      (result) => Number(result.round || 1) === targetRound && result.isSubmitted === true
+    );
+    if (roundHasCompetitionState
+      || (targetRound === 1 && !['Upcoming', 'Registration Open'].includes(tournament.status))) {
+      return res.status(409).json({
+        success: false,
+        message: 'Participants cannot move after round competition activity begins'
+      });
+    }
+    if (targetRound > 1) {
+      const previousCoverage = submittedRoundCoverage(tournament, targetRound - 1);
+      if (!previousCoverage.complete
+        || !previousCoverage.qualifiedIds.includes(idString(participantId))) {
+        return res.status(409).json({
+          success: false,
+          message: 'Only server-qualified participants can be assigned to a later round'
+        });
+      }
     }
 
     // Check if participant is already in this group
@@ -3041,15 +4111,30 @@ const assignParticipantToGroup = async (req, res) => {
       });
     }
 
-    // Remove participant from any other group first
+    const roundSetting = (tournament.roundSettings || []).find(
+      (setting) => Number(setting.round) === Number(group.round || round || 1)
+    );
+    const groupCapacity = Number(roundSetting?.teamsPerGroup || tournament.teamsPerGroup || 0);
+    if (groupCapacity > 0 && group.participants.length >= groupCapacity) {
+      return res.status(400).json({
+        success: false,
+        message: 'Selected group is full'
+      });
+    }
+
+    // Move within the target round only. Earlier rounds are immutable history
+    // and must retain their participant assignments.
     tournament.groups.forEach(g => {
-      g.participants = g.participants.filter(p => p.toString() !== participantId);
+      if (Number(g.round || 1) === targetRound) {
+        g.participants = g.participants.filter(p => p.toString() !== participantId);
+      }
     });
 
     // Add participant to the selected group
     group.participants.push(participantId);
 
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
     await notifyTournamentRecipients({
       tournament,
       recipients: [participantId],
@@ -3094,19 +4179,76 @@ const updateRoundSettings = async (req, res) => {
       });
     }
 
-    // Update tournament settings for Round 1
-    if (round === 1) {
-      tournament.teamsPerGroup = teamsPerGroup;
-      tournament.totalSlots = totalSlots;
-      tournament.numberOfGroups = numberOfGroups;
+    const roundNumber = Number.parseInt(round, 10);
+    const parsedTeamsPerGroup = Number.parseInt(teamsPerGroup, 10);
+    const parsedTotalSlots = Number.parseInt(totalSlots, 10);
+    const parsedNumberOfGroups = Number.parseInt(numberOfGroups, 10);
+    if (!Number.isInteger(roundNumber) || roundNumber < 1 || roundNumber > 10) {
+      return res.status(400).json({ success: false, message: 'Round must be between 1 and 10' });
+    }
+    const roundHasCompetitionState = (tournament.matches || []).some(
+      (match) => Number(match.round || 1) === roundNumber
+    ) || (tournament.groupResults || []).some(
+      (result) => Number(result.round) === roundNumber && result.isSubmitted === true
+    );
+    if (roundHasCompetitionState || (roundNumber === 1 && !['Upcoming', 'Registration Open'].includes(tournament.status))) {
+      return res.status(409).json({
+        success: false,
+        message: 'Round structure cannot change after competition activity begins'
+      });
+    }
+    if (!Number.isInteger(parsedTeamsPerGroup) || parsedTeamsPerGroup < 1 || parsedTeamsPerGroup > 100) {
+      return res.status(400).json({ success: false, message: 'Teams per group must be between 1 and 100' });
+    }
+    if (!Number.isInteger(parsedTotalSlots) || parsedTotalSlots < 1 || parsedTotalSlots > 128
+      || parsedTeamsPerGroup > parsedTotalSlots) {
+      return res.status(400).json({ success: false, message: 'Invalid round slot configuration' });
+    }
+    const expectedNumberOfGroups = Math.ceil(parsedTotalSlots / parsedTeamsPerGroup);
+    if (!Number.isInteger(parsedNumberOfGroups) || parsedNumberOfGroups !== expectedNumberOfGroups) {
+      return res.status(400).json({
+        success: false,
+        message: `Number of groups must be ${expectedNumberOfGroups} for this round`
+      });
+    }
+
+    let savedRoundSetting = (tournament.roundSettings || []).find(
+      (setting) => Number(setting.round) === roundNumber
+    );
+    const settingData = {
+      round: roundNumber,
+      roundName: String(roundName || `Round ${roundNumber}`).trim(),
+      teamsPerGroup: parsedTeamsPerGroup,
+      qualificationCriteria: savedRoundSetting?.qualificationCriteria || parsedTeamsPerGroup,
+      totalGroups: parsedNumberOfGroups,
+      totalTeams: parsedTotalSlots,
+      totalSlots: parsedTotalSlots,
+      numberOfGroups: parsedNumberOfGroups
+    };
+    if (savedRoundSetting) {
+      Object.assign(savedRoundSetting, settingData);
+    } else {
+      tournament.roundSettings.push(settingData);
+      savedRoundSetting = tournament.roundSettings[tournament.roundSettings.length - 1];
+    }
+
+    // Round 1 also controls the tournament's initial structure.
+    if (roundNumber === 1) {
+      tournament.teamsPerGroup = parsedTeamsPerGroup;
+      tournament.totalSlots = parsedTotalSlots;
+      tournament.numberOfGroups = parsedNumberOfGroups;
     }
 
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
 
     res.status(200).json({
       success: true,
       message: 'Round settings updated successfully',
-      tournament
+      data: {
+        roundSettings: savedRoundSetting,
+        tournament: sanitizePublicTournament(tournament)
+      }
     });
   } catch (error) {
     res.status(500).json({
@@ -3121,7 +4263,7 @@ const recreateGroups = async (req, res) => {
   try {
     const { teamsPerGroup, totalSlots } = req.body;
     const tournament = await Tournament.findById(req.params.id);
-    
+
     if (!tournament) {
       return res.status(404).json({
         success: false,
@@ -3129,7 +4271,7 @@ const recreateGroups = async (req, res) => {
       });
     }
 
-    // Check if user is the host
+    // Authorize the tournament host.
     if (tournament.host.toString() !== req.user._id.toString()) {
       return res.status(403).json({
         success: false,
@@ -3137,8 +4279,24 @@ const recreateGroups = async (req, res) => {
       });
     }
 
+    if (!['Upcoming', 'Registration Open'].includes(tournament.status)
+      || (tournament.matches || []).length > 0
+      || (tournament.groupResults || []).some((result) => result.isSubmitted === true)) {
+      return res.status(409).json({
+        success: false,
+        message: 'Round 1 groups cannot be recreated after competition activity begins'
+      });
+    }
+    const parsedTeamsPerGroup = Number.parseInt(teamsPerGroup, 10);
+    const parsedTotalSlots = Number.parseInt(totalSlots, 10);
+    if (!Number.isInteger(parsedTeamsPerGroup) || parsedTeamsPerGroup < 1 || parsedTeamsPerGroup > 100
+      || !Number.isInteger(parsedTotalSlots) || parsedTotalSlots < 1 || parsedTotalSlots > 128
+      || parsedTeamsPerGroup > parsedTotalSlots) {
+      return res.status(400).json({ success: false, message: 'Invalid group configuration' });
+    }
+
     // Calculate number of groups
-    const numberOfGroups = Math.ceil(totalSlots / teamsPerGroup);
+    const numberOfGroups = Math.ceil(parsedTotalSlots / parsedTeamsPerGroup);
     
     // Clear existing groups for Round 1
     tournament.groups = tournament.groups.filter(group => group.round !== 1);
@@ -3174,13 +4332,14 @@ const recreateGroups = async (req, res) => {
 
       tournament.broadcastChannels.push(broadcastChannel);
     }
-    
+
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
 
     res.status(200).json({
       success: true,
       message: 'Groups recreated successfully',
-      tournament
+      data: { tournament: sanitizePublicTournament(tournament) }
     });
   } catch (error) {
     res.status(500).json({
@@ -3230,6 +4389,13 @@ const submitGroupResults = async (req, res) => {
       });
     }
 
+    if (tournament.finalResult?.generatedAt) {
+      return res.status(409).json({
+        success: false,
+        message: 'Group results cannot change after final standings are published'
+      });
+    }
+
     // Validate teams data
     if (!teams || !Array.isArray(teams) || teams.length === 0) {
       if (process.env.NODE_ENV === 'development') { console.log('Invalid teams data:', teams);}
@@ -3239,12 +4405,61 @@ const submitGroupResults = async (req, res) => {
       });
     }
 
-    // Calculate total points and rank teams
-    const teamsWithPoints = teams.map(team => ({
-      ...team,
-      totalPoints: (team.finishPoints || 0) + (team.positionPoints || 0),
-      qualified: team.qualified || false // Preserve qualified status
-    }));
+    if (!['Ongoing', 'Completed'].includes(tournament.status)) {
+      return res.status(409).json({
+        success: false,
+        message: 'Results can only be submitted after the tournament starts'
+      });
+    }
+
+    const roundNumber = Number.parseInt(round, 10);
+    const targetGroup = (tournament.groups || []).find((group) => (
+      Number(group.round || 1) === roundNumber
+      && (idString(group._id) === idString(groupId) || String(group.name) === String(groupId))
+    ));
+    if (!Number.isInteger(roundNumber) || roundNumber < 1 || !targetGroup) {
+      return res.status(400).json({ success: false, message: 'Valid tournament round and group are required' });
+    }
+    if (roundNumber !== Number(tournament.currentRound || 1)) {
+      return res.status(409).json({
+        success: false,
+        message: 'Historical and future round results are read-only'
+      });
+    }
+
+    const registeredIds = new Set((targetGroup.participants || []).map(idString));
+    const submittedIds = teams.map((team) => idString(team.teamId));
+    if (submittedIds.length !== registeredIds.size
+      || new Set(submittedIds).size !== submittedIds.length
+      || submittedIds.some((teamId) => !registeredIds.has(teamId))) {
+      return res.status(400).json({
+        success: false,
+        message: 'Results must contain every group participant exactly once'
+      });
+    }
+
+    // Calculate total points from validated numeric inputs. Do not persist
+    // arbitrary client fields into embedded result documents.
+    const teamsWithPoints = [];
+    for (const team of teams) {
+      const wins = Number(team.wins || 0);
+      const finishPoints = Number(team.finishPoints || 0);
+      const positionPoints = Number(team.positionPoints || 0);
+      if (![wins, finishPoints, positionPoints].every(Number.isFinite)
+        || [wins, finishPoints, positionPoints].some((value) => value < 0)) {
+        return res.status(400).json({ success: false, message: 'Result values must be non-negative numbers' });
+      }
+      teamsWithPoints.push({
+        teamId: team.teamId,
+        teamName: String(team.teamName || 'Participant'),
+        teamLogo: team.teamLogo || null,
+        wins,
+        finishPoints,
+        positionPoints,
+        totalPoints: finishPoints + positionPoints,
+        qualified: Boolean(team.qualified)
+      });
+    }
 
     // Sort by total points (descending) and assign ranks
     teamsWithPoints.sort((a, b) => b.totalPoints - a.totalPoints);
@@ -3262,7 +4477,7 @@ const submitGroupResults = async (req, res) => {
 
     // Find existing group results or create new
     let groupResults = tournament.groupResults.find(
-      gr => gr.round === round && gr.groupId === groupId
+      gr => Number(gr.round) === roundNumber && String(gr.groupId) === String(groupId)
     );
 
     if (groupResults) {
@@ -3270,26 +4485,29 @@ const submitGroupResults = async (req, res) => {
       if (process.env.NODE_ENV === 'development') { console.log('Updating existing group results');}
       groupResults.teams = teamsWithPoints;
       groupResults.submittedAt = new Date();
+      groupResults.isSubmitted = true;
     } else {
       // Create new group results
       if (process.env.NODE_ENV === 'development') { console.log('Creating new group results');}
       tournament.groupResults.push({
-        round,
+        round: roundNumber,
         groupId,
         groupName,
         teams: teamsWithPoints,
-        submittedAt: new Date()
+        submittedAt: new Date(),
+        isSubmitted: true
       });
     }
 
     if (process.env.NODE_ENV === 'development') { console.log('Saving tournament with groupResults length:', tournament.groupResults.length);}
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
     if (process.env.NODE_ENV === 'development') { console.log('Tournament saved successfully');
 }
     // Send notifications to group participants about results
     const group = tournament.groups.find(g => g._id === groupId || g.name === groupId);
     if (group && group.participants && group.participants.length > 0) {
-      const notificationPromises = uniqueNotificationRecipients(group.participants).map(async (participantId) => {
+      const notificationPromises = (await expandTournamentRecipientIds(group.participants)).map(async (participantId) => {
         return createAndEmitNotification({
           recipient: participantId,
           sender: req.user._id,
@@ -3305,7 +4523,7 @@ const submitGroupResults = async (req, res) => {
         });
       });
 
-      await Promise.all(notificationPromises);
+      await Promise.allSettled(notificationPromises);
     }
 
     res.status(200).json({
@@ -3342,7 +4560,34 @@ const getRoundResults = async (req, res) => {
       });
     }
 
-    const roundResults = tournament.groupResults.filter(gr => gr.round === parseInt(round));
+    const roundNumber = Number.parseInt(round, 10);
+    const resultTeamDto = (team) => {
+      const source = typeof team?.toObject === 'function' ? team.toObject() : (team || {});
+      return {
+        teamId: source.teamId && typeof source.teamId === 'object'
+          ? minimalTournamentUser(source.teamId)
+          : source.teamId,
+        teamName: String(source.teamName || ''),
+        teamLogo: source.teamLogo || '',
+        wins: Number(source.wins) || 0,
+        finishPoints: Number(source.finishPoints) || 0,
+        positionPoints: Number(source.positionPoints) || 0,
+        totalPoints: Number(source.totalPoints) || 0,
+        rank: Number(source.rank) || 0,
+        qualified: source.qualified === true
+      };
+    };
+    const roundResults = tournament.groupResults
+      .filter((groupResult) => Number(groupResult.round) === roundNumber)
+      .map((groupResult) => ({
+        round: Number(groupResult.round),
+        groupId: String(groupResult.groupId || ''),
+        groupName: String(groupResult.groupName || ''),
+        submittedAt: groupResult.submittedAt,
+        isSubmitted: groupResult.isSubmitted === true
+          || (groupResult.teams || []).every((team) => Number(team.rank) > 0),
+        teams: (groupResult.teams || []).map(resultTeamDto)
+      }));
 
     // Calculate overall standings
     const allTeams = [];
@@ -3367,7 +4612,7 @@ const getRoundResults = async (req, res) => {
       data: {
         roundResults,
         overallStandings: allTeams,
-        round: parseInt(round)
+        round: roundNumber
       }
     });
 
@@ -3436,7 +4681,7 @@ const broadcastSchedule = async (req, res) => {
         const groupId = group._id || group.name;
         
         let groupMessageThread = tournament.groupMessages.find(
-          gm => gm.groupId === groupId && gm.round === parseInt(round)
+          gm => String(gm.groupId) === String(groupId) && gm.round === parseInt(round, 10)
         );
 
         if (!groupMessageThread) {
@@ -3457,7 +4702,7 @@ const broadcastSchedule = async (req, res) => {
 
         // Send notifications to group participants
         if (group.participants && group.participants.length > 0) {
-          const notificationPromises = uniqueNotificationRecipients(group.participants).map(async (participantId) => {
+          const notificationPromises = (await expandTournamentRecipientIds(group.participants)).map(async (participantId) => {
         return createAndEmitNotification({
           recipient: participantId,
           sender: req.user._id,
@@ -3473,7 +4718,7 @@ const broadcastSchedule = async (req, res) => {
         });
           });
 
-          await Promise.all(notificationPromises);
+          await Promise.allSettled(notificationPromises);
         }
 
         broadcastCount++;
@@ -3481,6 +4726,15 @@ const broadcastSchedule = async (req, res) => {
     }
 
     await tournament.save();
+    const scheduleRecipients = roundGroups.flatMap((group) => group.participants || []);
+    emitTournamentBroadcast(
+      req,
+      tournament,
+      'schedule_updated',
+      `Round ${round} schedule has been updated.`,
+      [tournament.host, ...scheduleRecipients]
+    );
+    await emitTournamentUpdated(req, tournament._id);
 
     res.status(200).json({
       success: true,
@@ -3527,21 +4781,37 @@ const qualifyTeams = async (req, res) => {
       });
     }
 
+    const roundNumber = Number.parseInt(round, 10);
+    const parsedCriteria = Number.parseInt(qualificationCriteria, 10);
+    if (!Number.isInteger(roundNumber) || roundNumber < 1 || roundNumber > Number(tournament.currentRound || 1)
+      || !Number.isInteger(parsedCriteria) || parsedCriteria < 1 || parsedCriteria > 128) {
+      return res.status(400).json({ success: false, message: 'Invalid qualification round or criteria' });
+    }
+    const coverage = submittedRoundCoverage(tournament, roundNumber);
+    const eligibleIds = new Set(coverage.qualifiedIds);
+    const requestedIds = qualifiedTeams.map(idString);
+    if (!coverage.complete || eligibleIds.size === 0
+      || requestedIds.length !== eligibleIds.size
+      || new Set(requestedIds).size !== requestedIds.length
+      || requestedIds.some((teamId) => !eligibleIds.has(teamId))) {
+      return res.status(400).json({ success: false, message: 'Qualified teams must match the submitted round results' });
+    }
+
     // Find existing qualification or create new
-    let qualification = tournament.qualifications.find(q => q.round === round);
+    let qualification = tournament.qualifications.find(q => Number(q.round) === roundNumber);
 
     if (qualification) {
       // Update existing qualification
       qualification.qualifiedTeams = qualifiedTeams;
-      qualification.qualificationCriteria = qualificationCriteria || 8;
+      qualification.qualificationCriteria = parsedCriteria;
       qualification.totalQualified = qualifiedTeams.length;
       qualification.qualifiedAt = new Date();
     } else {
       // Create new qualification
       tournament.qualifications.push({
-        round,
+        round: roundNumber,
         qualifiedTeams,
-        qualificationCriteria: qualificationCriteria || 8,
+        qualificationCriteria: parsedCriteria,
         totalQualified: qualifiedTeams.length,
         qualifiedAt: new Date()
       });
@@ -3552,7 +4822,7 @@ const qualifyTeams = async (req, res) => {
     }
     let teamsUpdated = 0;
     tournament.groupResults.forEach(groupResult => {
-      if (groupResult.round === parseInt(round)) {
+      if (Number(groupResult.round) === roundNumber) {
         if (process.env.NODE_ENV === 'development') { console.log(`Processing group ${groupResult.groupName} for round ${round}`);}
         groupResult.teams.forEach(team => {
           const wasQualified = team.qualified;
@@ -3575,6 +4845,7 @@ const qualifyTeams = async (req, res) => {
     if (process.env.NODE_ENV === 'development') { console.log(`Total teams updated: ${teamsUpdated}`);
 }
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
 
     await notifyTournamentRecipients({
       tournament,
@@ -3625,24 +4896,55 @@ const createNextRoundGroups = async (req, res) => {
       });
     }
 
-    // Get qualified teams from current round
-    const qualification = tournament.qualifications.find(q => q.round === currentRound);
-    if (!qualification) {
-      return res.status(400).json({
+    const currentRoundNumber = Number.parseInt(currentRound, 10);
+    const nextRoundNumber = Number.parseInt(nextRound, 10);
+    const parsedTeamsPerGroup = Number.parseInt(teamsPerGroup, 10);
+    const configuredRounds = Math.max(1, Number(tournament.totalRounds) || 1);
+    if (!Number.isInteger(currentRoundNumber)
+      || !Number.isInteger(nextRoundNumber)
+      || nextRoundNumber !== currentRoundNumber + 1
+      || nextRoundNumber > configuredRounds
+      || currentRoundNumber !== Number(tournament.currentRound || 1)
+      || !Number.isInteger(parsedTeamsPerGroup)
+      || parsedTeamsPerGroup < 1
+      || parsedTeamsPerGroup > 100) {
+      return res.status(409).json({
         success: false,
-        message: 'No qualified teams found for current round'
+        message: 'Tournament cannot advance beyond its configured round lifecycle'
       });
     }
+    if ((tournament.groups || []).some((group) => Number(group.round) === nextRoundNumber)) {
+      return res.status(409).json({ success: false, message: 'Next round has already been created' });
+    }
 
-    const qualifiedTeams = qualification.qualifiedTeams;
-    const totalGroups = Math.ceil(qualifiedTeams.length / teamsPerGroup);
+    // Derive advancement from complete, submitted server results. Untouched
+    // Web advances directly and does not call the optional /qualify endpoint.
+    const coverage = submittedRoundCoverage(tournament, currentRoundNumber);
+    if (!coverage.complete || coverage.qualifiedIds.length === 0) {
+      return res.status(409).json({
+        success: false,
+        message: 'Every current-round group must submit results before advancement'
+      });
+    }
+    const qualifiedTeams = coverage.qualifiedIds;
+    const qualificationData = {
+      round: currentRoundNumber,
+      qualifiedTeams,
+      totalQualified: qualifiedTeams.length,
+      qualifiedAt: new Date()
+    };
+    const qualification = (tournament.qualifications || [])
+      .find((candidate) => Number(candidate.round) === currentRoundNumber);
+    if (qualification) Object.assign(qualification, qualificationData);
+    else tournament.qualifications.push(qualificationData);
+    const totalGroups = Math.ceil(qualifiedTeams.length / parsedTeamsPerGroup);
 
     // Create groups for next round
     const newGroups = [];
     for (let i = 0; i < totalGroups; i++) {
       newGroups.push({
         name: `Group ${String.fromCharCode(65 + i)}`,
-        round: nextRound,
+        round: nextRoundNumber,
         groupLetter: String.fromCharCode(65 + i),
         participants: [],
         broadcastChannelId: null
@@ -3664,40 +4966,41 @@ const createNextRoundGroups = async (req, res) => {
 
     // Create broadcast channels for new groups
     newGroups.forEach((group, index) => {
-      const channelName = `Round ${nextRound} - ${group.name}`;
+      const channelName = `Round ${nextRoundNumber} - ${group.name}`;
       const broadcastChannel = {
         name: channelName,
         type: 'Text Messages',
-        description: `Broadcast channel for ${group.name} in Round ${nextRound}`,
+        description: `Broadcast channel for ${group.name} in Round ${nextRoundNumber}`,
         groupId: group._id || `group_${index + 1}`,
-        round: nextRound,
+        round: nextRoundNumber,
         channelId: null
       };
       tournament.broadcastChannels.push(broadcastChannel);
     });
 
     // Update tournament current round
-    tournament.currentRound = nextRound;
+    tournament.currentRound = nextRoundNumber;
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
 
     // Send notifications to all qualified participants about new round and broadcast channels
-    const allQualifiedParticipants = uniqueNotificationRecipients(qualifiedTeams);
+    const allQualifiedParticipants = await expandTournamentRecipientIds(qualifiedTeams);
     const notificationPromises = allQualifiedParticipants.map(async (participantId) => {
       return createAndEmitNotification({
         recipient: participantId,
         sender: req.user._id,
         type: 'tournament',
         title: `New Round Started: ${tournament.name}`,
-        message: `Round ${nextRound} has started! Check your new group and broadcast channels.`,
+        message: `Round ${nextRoundNumber} has started! Check your new group and broadcast channels.`,
         data: {
           tournamentId: tournament._id,
-          round: nextRound,
+          round: nextRoundNumber,
           customData: { action: 'new_round_started' }
         }
       });
     });
 
-    await Promise.all(notificationPromises);
+    await Promise.allSettled(notificationPromises);
 
     res.status(200).json({
       success: true,
@@ -3770,31 +5073,46 @@ const saveQualificationSettings = async (req, res) => {
       });
     }
 
+    const roundNumber = Number.parseInt(round, 10);
+    const qualifiedPerGroup = Number.parseInt(teamsPerGroup, 10);
+    const nextGroupSize = Number.parseInt(nextRoundTeamsPerGroup, 10);
+    if (!Number.isInteger(roundNumber) || roundNumber < 1 || roundNumber > Number(tournament.totalRounds || 1)
+      || !Number.isInteger(qualifiedPerGroup) || qualifiedPerGroup < 1 || qualifiedPerGroup > 128
+      || !Number.isInteger(nextGroupSize) || nextGroupSize < 1 || nextGroupSize > 128) {
+      return res.status(400).json({ success: false, message: 'Invalid qualification settings' });
+    }
+
     // Find existing round settings or create new
-    let roundSetting = tournament.roundSettings.find(rs => rs.round === round);
+    let roundSetting = tournament.roundSettings.find(rs => Number(rs.round) === roundNumber);
 
     if (roundSetting) {
       // Update existing settings
-      roundSetting.teamsPerGroup = teamsPerGroup;
-      roundSetting.qualificationCriteria = teamsPerGroup;
+      roundSetting.qualificationCriteria = qualifiedPerGroup;
     } else {
       // Create new round settings
+      const roundGroups = tournament.groups.filter(g => Number(g.round) === roundNumber);
+      const structuralGroupSize = Math.max(
+        1,
+        ...roundGroups.map(group => Number(group.participants?.length || 0)),
+        Number(tournament.teamsPerGroup || 1)
+      );
       tournament.roundSettings.push({
-        round,
-        teamsPerGroup,
-        qualificationCriteria: teamsPerGroup,
-        totalGroups: tournament.groups.filter(g => g.round === round).length,
-        totalTeams: tournament.groups.filter(g => g.round === round).reduce((sum, g) => sum + g.participants.length, 0)
+        round: roundNumber,
+        teamsPerGroup: structuralGroupSize,
+        qualificationCriteria: qualifiedPerGroup,
+        totalGroups: roundGroups.length,
+        totalTeams: roundGroups.reduce((sum, g) => sum + g.participants.length, 0)
       });
     }
 
     // Store next round settings in tournament metadata
     tournament.qualificationSettings = {
-      teamsPerGroup,
-      nextRoundTeamsPerGroup
+      teamsPerGroup: qualifiedPerGroup,
+      nextRoundTeamsPerGroup: nextGroupSize
     };
 
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
 
     res.status(200).json({
       success: true,
@@ -3849,7 +5167,7 @@ const getQualificationSettings = async (req, res) => {
 // Create Round 2 with qualified teams
 const createRound2 = async (req, res) => {
   try {
-    const { tournamentId } = req.params;
+    const tournamentId = req.params.id || req.params.tournamentId;
     const { groups, round } = req.body;
 
     const tournament = await Tournament.findById(tournamentId);
@@ -3860,25 +5178,62 @@ const createRound2 = async (req, res) => {
       });
     }
 
+    if (!isTournamentHost(tournament, req.user._id)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only tournament host can create tournament rounds'
+      });
+    }
+
+    const roundNumber = Number.parseInt(round, 10);
+    if (!Array.isArray(groups) || groups.length === 0 || !Number.isInteger(roundNumber) || roundNumber < 2) {
+      return res.status(400).json({
+        success: false,
+        message: 'Valid groups and round are required'
+      });
+    }
+
+    if (roundNumber !== Number(tournament.currentRound || 1) + 1
+      || roundNumber > Number(tournament.totalRounds || 1)
+      || (tournament.groups || []).some((group) => Number(group.round) === roundNumber)
+      || (tournament.matches || []).some((match) => Number(match.round) === roundNumber)) {
+      return res.status(409).json({ success: false, message: 'This round cannot be created or overwritten' });
+    }
+    const coverage = submittedRoundCoverage(tournament, roundNumber - 1);
+    const qualifiedIds = new Set(coverage.qualifiedIds);
+    const assignedIds = groups.flatMap((group) => (
+      (group.participants || []).map((participant) => idString(participant?.teamId || participant))
+    ));
+    if (!coverage.complete || qualifiedIds.size === 0
+      || assignedIds.length !== qualifiedIds.size
+      || new Set(assignedIds).size !== assignedIds.length
+      || assignedIds.some((teamId) => !qualifiedIds.has(teamId))) {
+      return res.status(409).json({
+        success: false,
+        message: 'Round groups must contain every server-qualified team exactly once'
+      });
+    }
+
     // Clear existing groups for this round before creating new ones
-    tournament.groups = tournament.groups.filter(group => group.round !== round);
+    tournament.groups = tournament.groups.filter(group => Number(group.round) !== roundNumber);
     
     // Clear existing group results for this round
     if (tournament.groupResults) {
-      tournament.groupResults = tournament.groupResults.filter(result => result.round !== round);
+      tournament.groupResults = tournament.groupResults.filter(result => Number(result.round) !== roundNumber);
     }
 
     // Add new groups to the tournament
     const newGroups = groups.map(group => ({
       name: group.name,
-      round: round,
-      participants: group.participants
+      round: roundNumber,
+      participants: group.participants.map((participant) => participant?.teamId || participant)
     }));
 
     tournament.groups.push(...newGroups);
-    tournament.currentRound = round;
+    tournament.currentRound = roundNumber;
 
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
 
     res.json({
       success: true,
@@ -3949,34 +5304,78 @@ const autoAssignRound2 = async (req, res) => {
       });
     }
 
+    if (!isTournamentHost(tournament, req.user._id)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only tournament host can auto-assign tournament rounds'
+      });
+    }
+
+    const roundNumber = Number.parseInt(round, 10);
+    const configuredRounds = Math.max(1, Number(tournament.totalRounds) || 1);
+    if (!Number.isInteger(roundNumber)
+      || roundNumber !== Number(tournament.currentRound || 1) + 1
+      || roundNumber > configuredRounds) {
+      return res.status(409).json({
+        success: false,
+        message: 'Tournament cannot advance beyond its configured round lifecycle'
+      });
+    }
+    if (qualifiedTeams.length === 0) {
+      return res.status(400).json({ success: false, message: 'Qualified teams are required' });
+    }
+    const previousCoverage = submittedRoundCoverage(tournament, roundNumber - 1);
+    const serverQualifiedIds = new Set(previousCoverage.qualifiedIds);
+    const qualifiedIdSet = new Set(qualifiedTeams.map((team) => idString(team?.teamId || team)));
+    if (!previousCoverage.complete
+      || serverQualifiedIds.size === 0
+      || qualifiedIdSet.size !== serverQualifiedIds.size
+      || Array.from(qualifiedIdSet).some((teamId) => !serverQualifiedIds.has(teamId))) {
+      return res.status(409).json({
+        success: false,
+        message: 'Every current-round group must submit results before advancement'
+      });
+    }
+    const assignedIds = groups.flatMap((group) => (group.participants || []).map(
+      (participant) => idString(participant?.teamId || participant)
+    ));
+    if (assignedIds.length !== qualifiedIdSet.size
+      || new Set(assignedIds).size !== assignedIds.length
+      || assignedIds.some((teamId) => !qualifiedIdSet.has(teamId))) {
+      return res.status(400).json({
+        success: false,
+        message: 'Round groups must contain every qualified team exactly once'
+      });
+    }
+
     if (process.env.NODE_ENV === 'development') { console.log('Auto assign Round 2 - Tournament found:', tournament.name);
 }
     // Clear existing Round 2 groups before creating new ones
-    tournament.groups = tournament.groups.filter(group => group.round !== round);
+    tournament.groups = tournament.groups.filter(group => Number(group.round) !== roundNumber);
     
     // Clear existing Round 2 group results
     if (tournament.groupResults) {
-      tournament.groupResults = tournament.groupResults.filter(result => result.round !== round);
+      tournament.groupResults = tournament.groupResults.filter(result => Number(result.round) !== roundNumber);
     }
 
     // Add new groups to the tournament
     const newGroups = groups.map(group => ({
       name: group.name,
-      round: round,
+      round: roundNumber,
       participants: group.participants.map(participant => participant.teamId) // Extract teamId only
     }));
 
     tournament.groups.push(...newGroups);
-    tournament.currentRound = round;
+    tournament.currentRound = roundNumber;
 
     // Create broadcast message for Round 2
     if (process.env.NODE_ENV === 'development') { console.log('Auto assign Round 2 - Creating broadcast message');}
     const broadcastMessage = {
       type: 'round_start',
-      title: `Round ${round} Started!`,
-      message: `Round ${round} has begun with ${groups.length} groups. ${qualifiedTeams.length} qualified teams are competing!`,
+      title: `Round ${roundNumber} Started!`,
+      message: `Round ${roundNumber} has begun with ${groups.length} groups. ${qualifiedTeams.length} qualified teams are competing!`,
       timestamp: new Date(),
-      round: round
+      round: roundNumber
     };
 
     // Add broadcast to tournament
@@ -3990,7 +5389,7 @@ const autoAssignRound2 = async (req, res) => {
     const groupResults = groups.map(group => ({
       groupId: group.name,
       groupName: group.name,
-      round: round,
+      round: roundNumber,
       teams: group.participants.map(participant => ({
         teamId: participant.teamId,
         teamName: participant.teamName,
@@ -4000,7 +5399,9 @@ const autoAssignRound2 = async (req, res) => {
         totalPoints: 0,
         rank: 0,
         qualified: false
-      }))
+      })),
+      submittedAt: null,
+      isSubmitted: false
     }));
 
     // Add group results to tournament
@@ -4011,6 +5412,14 @@ const autoAssignRound2 = async (req, res) => {
 
     if (process.env.NODE_ENV === 'development') { console.log('Auto assign Round 2 - Saving tournament');}
     await tournament.save();
+    emitTournamentBroadcast(
+      req,
+      tournament,
+      'round_started',
+      broadcastMessage.message,
+      [tournament.host, ...qualifiedTeams]
+    );
+    await emitTournamentUpdated(req, tournament._id);
     if (process.env.NODE_ENV === 'development') { console.log('Auto assign Round 2 - Tournament saved successfully');
 }
     res.json({
@@ -4058,20 +5467,37 @@ const openRegistration = async (req, res) => {
         message: 'Only the host can open registration'
       });
     }
+
+    if (tournament.status !== 'Upcoming') {
+      return res.status(409).json({
+        success: false,
+        message: tournament.status === 'Registration Open'
+          ? 'Tournament registration is already open'
+          : `Registration cannot be opened while tournament status is ${tournament.status}`
+      });
+    }
     
     // Update tournament status to Registration Open
     // Also update registrationStartDate to now so it moves out of "Upcoming Registration"
     tournament.status = 'Registration Open';
     const now = new Date();
     tournament.registrationStartDate = now;
-    // If registrationEndDate is in the past or not set, extend it
-    if (!tournament.registrationEndDate || new Date(tournament.registrationEndDate) <= now) {
-      // Default: keep registration open for 24 hours from now if no end date set
-      if (!tournament.registrationEndDate) {
-        tournament.registrationEndDate = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-      }
+    // Keep canonical and legacy deadline fields synchronized. Reopening with
+    // a stale deadline otherwise succeeds but every join is rejected.
+    let registrationEnd = new Date(tournament.registrationEndDate || tournament.registrationDeadline || 0);
+    if (Number.isNaN(registrationEnd.getTime()) || registrationEnd <= now) {
+      registrationEnd = new Date(now.getTime() + 24 * 60 * 60 * 1000);
     }
+    tournament.registrationEndDate = registrationEnd;
+    tournament.registrationDeadline = registrationEnd;
     await tournament.save();
+    emitTournamentBroadcast(
+      req,
+      tournament,
+      'registration_opened',
+      `Registration opened for "${tournament.name}"! Join now to participate.`
+    );
+    await emitTournamentUpdated(req, tournament._id);
     
     // Fan out through the durable, preference-aware bulk producer. A stable
     // key deduplicates both Notification rows and push attempts if a queue job
@@ -4139,31 +5565,39 @@ const startTournament = async (req, res) => {
         message: 'Only the host can start tournament'
       });
     }
+
+    if (tournament.status === 'Ongoing') {
+      return res.status(200).json({ success: true, message: 'Tournament is already ongoing' });
+    }
+    const now = new Date();
+    const registrationDeadline = new Date(
+      tournament.registrationEndDate || tournament.registrationDeadline || 0
+    );
+    const isClosedUpcoming = tournament.status === 'Upcoming'
+      && !Number.isNaN(registrationDeadline.getTime())
+      && registrationDeadline <= now;
+    if (tournament.status !== 'Registration Open' && !isClosedUpcoming) {
+      return res.status(409).json({
+        success: false,
+        message: `Tournament cannot start while status is ${tournament.status}`
+      });
+    }
     
     // Update tournament status to Ongoing
     tournament.status = 'Ongoing';
     await tournament.save();
     
-    // Get socket instance
-    const { getIO } = require('../server');
-    const io = getIO();
-    
     // Send notification to all participants
-    const participants = uniqueNotificationRecipients([...tournament.participants, ...tournament.teams]);
-    if (io) {
-      const socketRecipients = uniqueNotificationRecipients([tournament.host, ...participants]);
-      const payload = {
-        id: Date.now().toString(),
-        tournamentId: tournament._id,
-        message: `Tournament "${tournament.name}" has started! Good luck to all participants.`,
-        timestamp: new Date(),
-        type: 'tournament_started'
-      };
-      socketRecipients.forEach((recipientId) => {
-        io.to(`user-${recipientId}`).emit('broadcast_message', payload);
-      });
-    }
-    await Promise.all(participants.map(async (participantId) => {
+    const participants = await expandTournamentRecipientIds([...tournament.participants, ...tournament.teams]);
+    await emitTournamentBroadcast(
+      req,
+      tournament,
+      'tournament_started',
+      `Tournament "${tournament.name}" has started! Good luck to all participants.`,
+      [tournament.host, ...participants]
+    );
+    await emitTournamentUpdated(req, tournament._id);
+    await Promise.allSettled(participants.map(async (participantId) => {
       await createAndEmitNotification({
         recipient: participantId,
         sender: req.user._id,
@@ -4212,10 +5646,34 @@ const updatePrizeDistribution = async (req, res) => {
       return res.status(403).json({ success: false, message: 'Only host can update prize distribution' });
     }
 
-    if (prizeDistribution) tournament.prizeDistribution = prizeDistribution;
-    if (specialPrizes) tournament.specialPrizes = specialPrizes;
+    if (!['Ongoing', 'Completed'].includes(tournament.status)) {
+      return res.status(409).json({ success: false, message: 'Prizes can only be finalized after the tournament starts' });
+    }
+
+    if (tournament.finalResult?.generatedAt) {
+      return res.status(409).json({
+        success: false,
+        message: 'Prize distribution cannot change after final standings are published'
+      });
+    }
+
+    const nextDistribution = prizeDistribution === undefined ? tournament.prizeDistribution : prizeDistribution;
+    const nextSpecialPrizes = specialPrizes === undefined ? tournament.specialPrizes : specialPrizes;
+    const prizeConfig = normalizeAndValidatePrizes({
+      type: tournament.prizePoolType,
+      pool: tournament.prizePool,
+      distribution: nextDistribution,
+      special: nextSpecialPrizes
+    });
+    if (prizeConfig.error) {
+      return res.status(400).json({ success: false, message: prizeConfig.error });
+    }
+
+    tournament.prizeDistribution = prizeConfig.distribution;
+    tournament.specialPrizes = prizeConfig.special;
 
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
 
     res.status(200).json({
       success: true,
@@ -4242,6 +5700,51 @@ const generateFinalResult = async (req, res) => {
 
     if (tournament.host.toString() !== req.user._id.toString()) {
       return res.status(403).json({ success: false, message: 'Only host can generate final result' });
+    }
+
+    if (!['Ongoing', 'Completed'].includes(tournament.status)) {
+      return res.status(409).json({
+        success: false,
+        message: 'Final results can only be generated after the tournament starts'
+      });
+    }
+
+    const configuredFinalRound = Math.max(1, Number(tournament.totalRounds) || 1);
+    if (Number(tournament.currentRound || 1) !== configuredFinalRound) {
+      return res.status(409).json({
+        success: false,
+        message: `Final results can only be generated after Round ${configuredFinalRound}`
+      });
+    }
+    if (tournament.finalResult?.generatedAt) {
+      return res.status(409).json({ success: false, message: 'Final result has already been generated' });
+    }
+    const finalRoundGroups = (tournament.groups || []).filter(
+      (group) => Number(group.round || 1) === configuredFinalRound && (group.participants || []).length > 0
+    );
+    const finalRoundResults = (tournament.groupResults || []).filter(
+      (result) => Number(result.round) === configuredFinalRound
+        && (result.teams || []).length > 0
+        && (result.isSubmitted === true || (result.teams || []).every((team) => Number(team.rank) > 0))
+    );
+    const missingOrIncompleteGroup = finalRoundGroups.some((group) => {
+      const result = finalRoundResults.find((candidate) => (
+        String(candidate.groupName) === String(group.name)
+        || String(candidate.groupId) === String(group.name)
+        || String(candidate.groupId) === idString(group._id)
+      ));
+      if (!result) return true;
+      const expectedIds = new Set((group.participants || []).map(idString));
+      const resultIds = (result.teams || []).map((team) => idString(team.teamId));
+      return resultIds.length !== expectedIds.size
+        || new Set(resultIds).size !== resultIds.length
+        || resultIds.some((teamId) => !expectedIds.has(teamId));
+    });
+    if (finalRoundResults.length === 0 || missingOrIncompleteGroup) {
+      return res.status(409).json({
+        success: false,
+        message: 'Publish results for every final-round group before generating final standings'
+      });
     }
 
     // Combine all round group results to get overall standings
@@ -4293,6 +5796,7 @@ const generateFinalResult = async (req, res) => {
     }
 
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
     await releaseHostActiveTournament(tournament.host, tournament._id);
 
     // Propagate final results and status to player history (non-blocking)
@@ -4338,9 +5842,21 @@ const assignSpecialPrize = async (req, res) => {
       return res.status(403).json({ success: false, message: 'Only host can assign special prizes' });
     }
 
+    if (!['Ongoing', 'Completed'].includes(tournament.status)) {
+      return res.status(409).json({ success: false, message: 'Special prizes can only be assigned after the tournament starts' });
+    }
+
     const prizeIndex = tournament.specialPrizes.findIndex(p => p.category === category);
     if (prizeIndex === -1) {
       return res.status(404).json({ success: false, message: 'Special prize category not found' });
+    }
+
+    const eligibleIds = new Set([
+      ...(tournament.participants || []).map(idString),
+      ...(tournament.teams || []).map(idString)
+    ]);
+    if (!winnerId || !eligibleIds.has(idString(winnerId))) {
+      return res.status(400).json({ success: false, message: 'Special prize winner must be a registered participant' });
     }
 
     tournament.specialPrizes[prizeIndex].winnerId = winnerId;
@@ -4356,6 +5872,7 @@ const assignSpecialPrize = async (req, res) => {
     }
 
     await tournament.save();
+    await emitTournamentUpdated(req, tournament._id);
 
     // Propagate special prize to player history (non-blocking)
     try {
@@ -4442,6 +5959,7 @@ module.exports = {
   getTournamentByName,
   updateTournament,
   joinTournament,
+  joinDuoTournament,
   leaveTournament,
   leaveTournamentAsTeam,
   autoAssignGroups,
@@ -4484,6 +6002,10 @@ module.exports = {
   assignSpecialPrize,
   getHostingLimits,
   _private: {
+    isTournamentHost,
+    getSocketIo,
+    emitTournamentUpdated,
+    emitTournamentBroadcast,
     isDirectTournamentParticipant,
     canReadTournamentMessages,
     canReadGroupMessages,

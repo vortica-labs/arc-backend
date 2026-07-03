@@ -11,6 +11,225 @@ const uniqueRecipientIds = (values = []) =>
 
 const idString = (value) => String(value?._id || value || '');
 
+const SCRIM_MATCH_COUNTS = Object.freeze([1, 2, 3, 4, 5, 6]);
+const SCRIM_TYPES = new Set(['Daily', 'Weekly']);
+const SCRIM_FORMATS = new Set(['Solo', 'Squad']);
+const SCRIM_BROADCAST_TYPES = new Set(['info', 'warning', 'match_starting', 'custom']);
+const SCRIM_PRIZE_CURRENCIES = new Set(['INR', 'USD']);
+const BGMI_MAPS = new Set(['Erangel', 'Miramar', 'Sanhok', 'Vikendi', 'Livik', 'Karakin', 'Nusa']);
+const TIME_OF_DAY_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const DEFAULT_SCRIM_TIMEZONE = 'Asia/Kolkata';
+const MAX_BROADCAST_MESSAGE_LENGTH = 2000;
+
+const DAILY_TIME_SLOTS_BY_MATCH_COUNT = Object.freeze({
+  1: new Set(['1-2', '2-3', '3-4', '4-5', '5-6', '6-7', '7-8', '8-9', '9-10']),
+  2: new Set(['1-2', '2-3', '3-4', '4-5', '5-6', '6-7', '7-8', '8-9', '9-10']),
+  3: new Set(['1-3', '2-4', '3-5', '4-6', '5-7', '6-8', '7-9', '8-10']),
+  4: new Set(['1-3', '2-4', '3-5', '4-6', '5-7', '6-8', '7-9', '8-10']),
+  5: new Set(['1-4', '2-5', '3-6', '4-7', '5-8', '6-9', '7-10']),
+  6: new Set(['1-4', '2-5', '3-6', '4-7', '5-8', '6-9', '7-10'])
+});
+
+const parseInteger = (value) => {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? parsed : null;
+};
+
+const isSupportedTimeZone = (timeZone) => {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone }).format(new Date());
+    return true;
+  } catch (_error) {
+    return false;
+  }
+};
+
+const dateKeyInTimeZone = (date, timeZone) => {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(date);
+  const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${byType.year}-${byType.month}-${byType.day}`;
+};
+
+const parseScrimDate = (value) => {
+  if (typeof value === 'string' && DATE_ONLY_PATTERN.test(value)) {
+    const parsed = new Date(`${value}T00:00:00.000Z`);
+    return Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value
+      ? null
+      : { date: parsed, dateKey: value };
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : { date: parsed, dateKey: null };
+};
+
+const validateScrimCreationInput = (payload = {}, options = {}) => {
+  const now = options.now instanceof Date ? options.now : new Date();
+  const name = typeof payload.name === 'string' ? payload.name.trim() : '';
+  if (!name) return { error: 'Scrim name is required' };
+
+  const scrimType = typeof payload.scrimType === 'string' ? payload.scrimType.trim() : '';
+  if (!SCRIM_TYPES.has(scrimType)) return { error: 'Scrim type must be either Daily or Weekly' };
+
+  const format = typeof payload.format === 'string' ? payload.format.trim() : 'Squad';
+  if (!SCRIM_FORMATS.has(format)) return { error: 'Scrim format must be either Solo or Squad' };
+
+  const numberOfMatches = parseInteger(payload.numberOfMatches);
+  if (!SCRIM_MATCH_COUNTS.includes(numberOfMatches)) {
+    return { error: 'Number of matches must be between 1 and 6' };
+  }
+
+  const maxTeams = parseInteger(payload.maxTeams);
+  if (maxTeams === null || maxTeams < 16 || maxTeams > 25) {
+    return { error: 'Maximum teams must be between 16 and 25' };
+  }
+
+  const timezone = typeof payload.timezone === 'string' && payload.timezone.trim()
+    ? payload.timezone.trim()
+    : DEFAULT_SCRIM_TIMEZONE;
+  if (!isSupportedTimeZone(timezone)) return { error: 'Invalid scrim timezone' };
+
+  const parsedDate = parseScrimDate(payload.date);
+  if (!parsedDate) return { error: 'A valid scrim date is required' };
+  const scrimDateKey = parsedDate.dateKey || dateKeyInTimeZone(parsedDate.date, timezone);
+  const todayKey = dateKeyInTimeZone(now, timezone);
+  if (scrimDateKey < todayKey) return { error: 'Scrim date cannot be in the past' };
+
+  let endDate = null;
+  if (scrimType === 'Weekly') {
+    const parsedEndDate = parseScrimDate(payload.endDate);
+    if (!parsedEndDate) return { error: 'End date is required for Weekly scrims' };
+    const endDateKey = parsedEndDate.dateKey || dateKeyInTimeZone(parsedEndDate.date, timezone);
+    if (endDateKey < scrimDateKey) return { error: 'End date cannot be before the scrim date' };
+    endDate = parsedEndDate.date;
+  }
+
+  const timeSlot = typeof payload.timeSlot === 'string' ? payload.timeSlot.trim() : '';
+  if (scrimType === 'Daily' && !DAILY_TIME_SLOTS_BY_MATCH_COUNT[numberOfMatches].has(timeSlot)) {
+    return { error: `Select a valid Daily time slot for ${numberOfMatches} match${numberOfMatches === 1 ? '' : 'es'}` };
+  }
+
+  if (!Array.isArray(payload.matches) || payload.matches.length !== numberOfMatches) {
+    return { error: `Matches array must contain exactly ${numberOfMatches} matches` };
+  }
+  for (let index = 0; index < payload.matches.length; index += 1) {
+    const match = payload.matches[index] || {};
+    if (!BGMI_MAPS.has(match.map)) return { error: `Match ${index + 1} has an invalid BGMI map` };
+    if (!TIME_OF_DAY_PATTERN.test(String(match.idpTime || '')) || !TIME_OF_DAY_PATTERN.test(String(match.startTime || ''))) {
+      return { error: `Match ${index + 1} must have valid IDP and start times in HH:MM format` };
+    }
+  }
+
+  const normalizedPrizePoolType = payload.prizePoolType === 'no_prize'
+    ? 'without_prize'
+    : (payload.prizePoolType || 'without_prize');
+  if (!['with_prize', 'without_prize'].includes(normalizedPrizePoolType)) {
+    return { error: 'Invalid prize pool type' };
+  }
+  const prizePoolCurrency = typeof payload.prizePoolCurrency === 'string'
+    ? payload.prizePoolCurrency.trim().toUpperCase()
+    : 'INR';
+  if (!SCRIM_PRIZE_CURRENCIES.has(prizePoolCurrency)) {
+    return { error: 'Prize pool currency must be INR or USD' };
+  }
+  const requestedPrizePool = payload.prizePool === undefined || payload.prizePool === null || payload.prizePool === ''
+    ? 0
+    : Number(payload.prizePool);
+  if (!Number.isFinite(requestedPrizePool) || requestedPrizePool < 0) {
+    return { error: 'Prize pool amount must be a valid non-negative number' };
+  }
+  if (normalizedPrizePoolType === 'with_prize' && requestedPrizePool <= 0) {
+    return { error: 'Prize pool amount must be greater than zero for prize scrims' };
+  }
+
+  return {
+    value: {
+      name,
+      scrimType,
+      format,
+      numberOfMatches,
+      maxTeams,
+      timezone,
+      date: parsedDate.date,
+      endDate,
+      timeSlot: scrimType === 'Daily' ? timeSlot : null,
+      prizePoolType: normalizedPrizePoolType,
+      prizePool: normalizedPrizePoolType === 'with_prize' ? requestedPrizePool : 0,
+      prizePoolCurrency,
+      matches: payload.matches.map((match, index) => ({
+        matchNumber: index + 1,
+        map: match.map,
+        idpTime: match.idpTime,
+        startTime: match.startTime
+      }))
+    }
+  };
+};
+
+const validateScrimResultInput = (teams, registeredParticipants) => {
+  const registeredIds = uniqueRecipientIds(registeredParticipants);
+  if (registeredIds.length === 0) return { error: 'Cannot submit results without registered participants' };
+  if (!Array.isArray(teams) || teams.length === 0) return { error: 'Teams data is required' };
+  if (teams.length !== registeredIds.length) return { error: 'Results must include every registered participant exactly once' };
+
+  const registeredSet = new Set(registeredIds);
+  const participantIds = new Set();
+  const placements = new Set();
+  const normalized = [];
+  for (const team of teams) {
+    const teamId = idString(team?.teamId);
+    if (!registeredSet.has(teamId)) return { error: `Participant ${teamId || 'unknown'} is not registered for this scrim` };
+    if (participantIds.has(teamId)) return { error: 'Each registered participant can appear only once in match results' };
+
+    const placement = parseInteger(team?.placement);
+    if (placement === null || placement < 1 || placement > registeredIds.length) {
+      return { error: `Placement must be an integer between 1 and ${registeredIds.length}` };
+    }
+    if (placements.has(placement)) return { error: 'Each participant must have a unique placement' };
+
+    const kills = parseInteger(team?.kills ?? 0);
+    if (kills === null || kills < 0 || kills > 50) return { error: 'Kills must be an integer between 0 and 50' };
+
+    participantIds.add(teamId);
+    placements.add(placement);
+    normalized.push({ teamId, placement, kills });
+  }
+  return { value: normalized };
+};
+
+const hasSubmittedResultsForEveryMatch = (matches) => (
+  Array.isArray(matches)
+  && matches.length > 0
+  && matches.every((match) => (
+    Boolean(match?.results?.submittedAt)
+    && Array.isArray(match?.results?.teams)
+    && match.results.teams.length > 0
+  ))
+);
+
+const refreshScrimFinalResult = (scrim, generatedAt = new Date()) => {
+  const standings = (scrim.overallStandings?.teams || []).map((entry, index) => {
+    const team = typeof entry?.toObject === 'function' ? entry.toObject() : { ...entry };
+    const rank = index + 1;
+    const prizeSplit = (scrim.prizeDistribution || []).find((prize) => prize.rank === rank);
+    return {
+      ...team,
+      rank,
+      prizeAmount: prizeSplit ? prizeSplit.amount : 0
+    };
+  });
+  scrim.finalResult = {
+    standings,
+    specialPrizeWinners: scrim.specialPrizes || [],
+    generatedAt
+  };
+  return scrim.finalResult;
+};
+
 const canReadScrimBroadcasts = async (scrim, userId) => {
   const viewerId = idString(userId);
   if (!viewerId || !scrim) return false;
@@ -40,24 +259,37 @@ const notifyScrimRecipients = async ({ scrim, recipients, sender, title, message
   const recipientIds = uniqueRecipientIds(recipients);
   if (recipientIds.length === 0) return [];
   const dedupeKey = `scrim:${scrim._id}:${eventType}:${String(revision || scrim.updatedAt || '').slice(0, 80)}`;
-  return Promise.all(recipientIds.map((recipient) => createAndEmitNotification({
-    recipient,
-    sender,
-    type: 'tournament',
-    title,
-    message,
-    data: {
-      deepLink: `/scrim/${scrim.scrimCode || scrim._id}`,
-      customData: {
-        eventType,
-        scrimId: scrim._id,
-        scrimCode: scrim.scrimCode,
-        notificationDedupeKey: dedupeKey,
-        pushRequestId: dedupeKey,
-        ...extraData
+  const results = await Promise.allSettled(recipientIds.map((recipient) => (
+    Promise.resolve().then(() => createAndEmitNotification({
+      recipient,
+      sender,
+      type: 'tournament',
+      title,
+      message,
+      data: {
+        deepLink: `/scrim/${scrim.scrimCode || scrim._id}`,
+        customData: {
+          eventType,
+          scrimId: scrim._id,
+          scrimCode: scrim.scrimCode,
+          notificationDedupeKey: dedupeKey,
+          pushRequestId: dedupeKey,
+          ...extraData
+        }
       }
+    }))
+  )));
+  results.forEach((result, index) => {
+    if (result.status === 'rejected') {
+      log.error('Scrim notification delivery failed after persistence', {
+        error: String(result.reason),
+        recipientId: recipientIds[index],
+        scrimId: String(scrim._id),
+        eventType
+      });
     }
-  })));
+  });
+  return results;
 };
 
 // Helper to find scrim by ObjectId or Scrim Code
@@ -74,77 +306,24 @@ const findScrimByIdOrCode = async (idOrCode) => {
 const createScrim = async (req, res) => {
   try {
     const {
-      name,
       description,
-      format,
-      scrimType,
-      timeSlot,
-      numberOfMatches,
-      date,
-      endDate,
-      maxTeams,
-      timezone,
-      matches,
-      prizePool,
-      prizePoolType,
-      prizePoolCurrency,
       prizeDistribution,
       specialPrizes
     } = req.body;
 
     const hostId = req.user._id;
 
-    // Validate dates
-    const now = new Date();
-    const scrimDate = new Date(date);
-    
-    if (scrimDate < now) {
-      return res.status(400).json({
-        success: false,
-        message: 'Scrim date must be in the future'
-      });
+    const validation = validateScrimCreationInput(req.body);
+    if (validation.error) {
+      return res.status(400).json({ success: false, message: validation.error });
     }
-
-    // Validate number of matches
-    if (![1, 2, 3, 4].includes(parseInt(numberOfMatches))) {
-      return res.status(400).json({
-        success: false,
-        message: 'Number of matches must be between 1 and 4'
-      });
-    }
-
-    const normalizedFormat = typeof format === 'string' ? format.trim() : 'Squad';
-    if (!['Solo', 'Squad'].includes(normalizedFormat)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Scrim format must be either Solo or Squad'
-      });
-    }
-
-    // Validate matches array
-    if (!matches || !Array.isArray(matches) || matches.length !== parseInt(numberOfMatches)) {
-      return res.status(400).json({
-        success: false,
-        message: `Matches array must contain exactly ${numberOfMatches} matches`
-      });
-    }
-
-    // Validate each match
-    for (let i = 0; i < matches.length; i++) {
-      const match = matches[i];
-      if (!match.map || !match.idpTime || !match.startTime) {
-        return res.status(400).json({
-          success: false,
-          message: `Match ${i + 1} must have map, idpTime, and startTime`
-        });
-      }
-    }
+    const normalized = validation.value;
 
     const host = await User.findById(hostId).select('isVerifiedHost').lean();
     const isVerifiedHost = host?.isVerifiedHost === true;
 
     // Enforce isVerifiedHost for prize pool scrims
-    if (prizePoolType === 'with_prize' && isVerifiedHost !== true) {
+    if (normalized.prizePoolType === 'with_prize' && isVerifiedHost !== true) {
       return res.status(403).json({
         success: false,
         message: 'You are not authorized to host prize pool scrims. Please apply for Verified Host status.'
@@ -175,26 +354,26 @@ const createScrim = async (req, res) => {
 
     // Create scrim data
     const scrimData = {
-      name,
+      name: normalized.name,
       description: description || '',
       game: 'BGMI',
-      format: normalizedFormat,
-      scrimType,
-      timeSlot: scrimType === 'Daily' ? timeSlot : null,
-      numberOfMatches: parseInt(numberOfMatches),
-      date: scrimDate,
-      endDate: endDate ? new Date(endDate) : null,
-      maxTeams: parseInt(maxTeams) || 16,
-      timezone: timezone || 'Asia/Kolkata',
-      prizePool: prizePoolType === 'with_prize' ? (prizePool || 0) : 0,
-      prizePoolType: prizePoolType || 'without_prize',
-      prizePoolCurrency: prizePoolCurrency || 'INR',
+      format: normalized.format,
+      scrimType: normalized.scrimType,
+      timeSlot: normalized.timeSlot,
+      numberOfMatches: normalized.numberOfMatches,
+      date: normalized.date,
+      endDate: normalized.endDate,
+      maxTeams: normalized.maxTeams,
+      timezone: normalized.timezone,
+      prizePool: normalized.prizePool,
+      prizePoolType: normalized.prizePoolType,
+      prizePoolCurrency: normalized.prizePoolCurrency,
       prizeDistribution: (prizeDistribution || []).filter(p => p.rank && p.amount),
       specialPrizes: (specialPrizes || []).filter(p => p.category && p.category.trim() !== '' && p.amount),
       host: hostId,
       status: 'Open',
-      matches: matches.map((match, index) => ({
-        matchNumber: index + 1,
+      matches: normalized.matches.map((match) => ({
+        matchNumber: match.matchNumber,
         map: match.map,
         idpTime: match.idpTime,
         startTime: match.startTime,
@@ -213,7 +392,7 @@ const createScrim = async (req, res) => {
     const scrim = await Scrim.create(scrimData);
 
     // Populate host info
-    await scrim.populate('host', 'username profile.displayName profile.avatar');
+    await scrim.populate('host', 'username userType profile.displayName profile.avatar');
 
     res.status(201).json({
       success: true,
@@ -301,8 +480,8 @@ const getScrims = async (req, res) => {
     }
 
     let scrims = await Scrim.find(queryFilter)
-      .populate('host', 'username profile.displayName profile.avatar')
-      .populate('registeredTeams', 'username profile.displayName profile.avatar')
+      .populate('host', 'username userType profile.displayName profile.avatar')
+      .populate('registeredTeams', 'username userType profile.displayName profile.avatar')
       .sort({ date: -1 })
       .skip(skip)
       .limit(limit);
@@ -370,8 +549,8 @@ const getScrim = async (req, res) => {
       });
     }
 
-    await scrim.populate('host', 'username profile.displayName profile.avatar');
-    await scrim.populate('registeredTeams', 'username profile.displayName profile.avatar');
+    await scrim.populate('host', 'username userType profile.displayName profile.avatar');
+    await scrim.populate('registeredTeams', 'username userType profile.displayName profile.avatar');
     
     // Populate team info in results
     if (scrim.matches) {
@@ -420,18 +599,26 @@ const joinScrim = async (req, res) => {
       });
     }
 
-    // Check if scrim is open
-    if (scrim.status !== 'Open' && scrim.status !== 'Full') {
+    const userId = req.user._id;
+
+    if (idString(scrim.host) === idString(userId)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Scrim hosts cannot register for their own scrim'
+      });
+    }
+
+    // A Full status is never treated as joinable. If a participant leaves, the
+    // leave command atomically reopens the scrim.
+    if (scrim.status !== 'Open') {
       return res.status(400).json({
         success: false,
         message: `Cannot join scrim. Current status: ${scrim.status}`
       });
     }
 
-    const userId = req.user._id;
-
     // Check if user is already registered
-    if (scrim.registeredTeams.includes(userId)) {
+    if ((scrim.registeredTeams || []).some((participant) => idString(participant) === idString(userId))) {
       return res.status(400).json({
         success: false,
         message: 'You are already registered for this scrim'
@@ -440,8 +627,7 @@ const joinScrim = async (req, res) => {
 
     // Check if scrim is full
     if (scrim.registeredTeams.length >= scrim.maxTeams) {
-      scrim.status = 'Full';
-      await scrim.save();
+      await Scrim.updateOne({ _id: scrim._id, status: 'Open' }, { $set: { status: 'Full' } });
       return res.status(400).json({
         success: false,
         message: 'Scrim is full'
@@ -449,7 +635,6 @@ const joinScrim = async (req, res) => {
     }
 
     // Format-based join validation
-    const User = require('../models/User');
     const joiningUser = await User.findById(userId).select('userType');
     
     if (scrim.format === 'Squad') {
@@ -463,37 +648,78 @@ const joinScrim = async (req, res) => {
     }
     // Solo scrims: both players and teams can join (no restriction)
 
-    // Add user to registered teams
-    scrim.registeredTeams.push(userId);
-    
-    // Update status if full
-    if (scrim.registeredTeams.length >= scrim.maxTeams) {
-      scrim.status = 'Full';
+    // Capacity and duplicate admission are one database command. Concurrent
+    // requests for the final slot cannot both pass the $expr guard.
+    const joinedScrim = await Scrim.findOneAndUpdate(
+      {
+        _id: scrim._id,
+        host: { $ne: userId },
+        status: 'Open',
+        registeredTeams: { $ne: userId },
+        $expr: {
+          $lt: [
+            { $size: { $ifNull: ['$registeredTeams', []] } },
+            '$maxTeams'
+          ]
+        }
+      },
+      [
+        {
+          $set: {
+            registeredTeams: {
+              $concatArrays: [{ $ifNull: ['$registeredTeams', []] }, [userId]]
+            }
+          }
+        },
+        {
+          $set: {
+            status: {
+              $cond: [
+                { $gte: [{ $size: '$registeredTeams' }, '$maxTeams'] },
+                'Full',
+                '$status'
+              ]
+            }
+          }
+        }
+      ],
+      { new: true }
+    );
+
+    if (!joinedScrim) {
+      const latest = await Scrim.findById(scrim._id).select('host status registeredTeams maxTeams');
+      if (!latest) return res.status(404).json({ success: false, message: 'Scrim not found' });
+      if ((latest.registeredTeams || []).some((participant) => idString(participant) === idString(userId))) {
+        return res.status(400).json({ success: false, message: 'You are already registered for this scrim' });
+      }
+      if (latest.status === 'Full' || latest.registeredTeams.length >= latest.maxTeams) {
+        if (latest.status === 'Open') {
+          await Scrim.updateOne({ _id: latest._id, status: 'Open' }, { $set: { status: 'Full' } });
+        }
+        return res.status(400).json({ success: false, message: 'Scrim is full' });
+      }
+      return res.status(409).json({ success: false, message: 'Scrim registration changed. Please try again.' });
     }
 
-    await scrim.save();
-
-    if (String(scrim.host) !== String(userId)) {
-      await notifyScrimRecipients({
-        scrim,
-        recipients: [scrim.host],
-        sender: userId,
-        title: 'New Scrim Registration',
-        message: `${req.user.profile?.displayName || req.user.username} joined "${scrim.name}"`,
-        eventType: 'scrim_registration_joined',
-        revision: scrim.updatedAt,
-        extraData: { participantId: userId }
-      });
-    }
+    await notifyScrimRecipients({
+      scrim: joinedScrim,
+      recipients: [joinedScrim.host],
+      sender: userId,
+      title: 'New Scrim Registration',
+      message: `${req.user.profile?.displayName || req.user.username} joined "${joinedScrim.name}"`,
+      eventType: 'scrim_registration_joined',
+      revision: joinedScrim.updatedAt,
+      extraData: { participantId: userId }
+    });
 
     // Populate team info
-    await scrim.populate('registeredTeams', 'username profile.displayName profile.avatar');
+    await joinedScrim.populate('registeredTeams', 'username userType profile.displayName profile.avatar');
 
     res.status(200).json({
       success: true,
       message: 'Successfully joined scrim',
       data: {
-        scrim
+        scrim: joinedScrim
       }
     });
   } catch (error) {
@@ -521,7 +747,7 @@ const leaveScrim = async (req, res) => {
     const userId = req.user._id;
 
     // Check if user is registered
-    if (!scrim.registeredTeams.includes(userId)) {
+    if (!(scrim.registeredTeams || []).some((participant) => idString(participant) === idString(userId))) {
       return res.status(400).json({
         success: false,
         message: 'You are not registered for this scrim'
@@ -554,7 +780,7 @@ const leaveScrim = async (req, res) => {
     }
 
     // Populate team info
-    await scrim.populate('registeredTeams', 'username profile.displayName profile.avatar');
+    await scrim.populate('registeredTeams', 'username userType profile.displayName profile.avatar');
 
     res.status(200).json({
       success: true,
@@ -594,43 +820,55 @@ const submitMatchResults = async (req, res) => {
       });
     }
 
+    const routeMatchNumber = parseInteger(req.params.matchNumber);
+    const bodyMatchNumber = matchNumber === undefined ? routeMatchNumber : parseInteger(matchNumber);
+    if (!SCRIM_MATCH_COUNTS.includes(routeMatchNumber) || bodyMatchNumber !== routeMatchNumber) {
+      return res.status(400).json({
+        success: false,
+        message: 'Match number in the request body must match the route'
+      });
+    }
+
     // Find match
-    const match = scrim.matches.find(m => m.matchNumber === parseInt(matchNumber));
+    const match = scrim.matches.find(m => m.matchNumber === routeMatchNumber);
     if (!match) {
       return res.status(404).json({
         success: false,
-        message: `Match ${matchNumber} not found`
+        message: `Match ${routeMatchNumber} not found`
       });
     }
 
-    // Validate teams data
-    if (!teams || !Array.isArray(teams) || teams.length === 0) {
+    const resultValidation = validateScrimResultInput(teams, scrim.registeredTeams);
+    if (resultValidation.error) {
       return res.status(400).json({
         success: false,
-        message: 'Teams data is required'
+        message: resultValidation.error
       });
     }
 
-    // Validate all teams are registered
-    const registeredTeamIds = scrim.registeredTeams.map(t => t.toString());
-    for (let team of teams) {
-      if (!registeredTeamIds.includes(team.teamId)) {
-        return res.status(400).json({
-          success: false,
-          message: `Team ${team.teamName} is not registered for this scrim`
-        });
-      }
+    // Names and avatars are server-owned profile data. Do not persist client
+    // supplied presentation fields in official standings.
+    const participantRecords = await User.find({
+      _id: { $in: resultValidation.value.map((team) => team.teamId) }
+    }).select('username profile.displayName profile.avatar').lean();
+    const participantById = new Map(participantRecords.map((participant) => [idString(participant), participant]));
+    if (participantById.size !== resultValidation.value.length) {
+      return res.status(400).json({
+        success: false,
+        message: 'Every result participant must reference an existing registered account'
+      });
     }
 
     // Calculate points for each team
-    const teamsWithPoints = teams.map(team => {
-      const points = calculateBGMIPoints(team.placement, team.kills || 0);
+    const teamsWithPoints = resultValidation.value.map(team => {
+      const participant = participantById.get(team.teamId);
+      const points = calculateBGMIPoints(team.placement, team.kills);
       return {
         teamId: team.teamId,
-        teamName: team.teamName,
-        teamLogo: team.teamLogo || null,
+        teamName: participant.profile?.displayName || participant.username,
+        teamLogo: participant.profile?.avatar || null,
         placement: team.placement,
-        kills: team.kills || 0,
+        kills: team.kills,
         placementPoints: points.placementPoints,
         killPoints: points.killPoints,
         totalPoints: points.totalPoints,
@@ -652,10 +890,16 @@ const submitMatchResults = async (req, res) => {
     match.status = 'Completed';
 
     // Calculate match results using model method
-    scrim.calculateMatchResults(parseInt(matchNumber));
+    scrim.calculateMatchResults(routeMatchNumber);
 
     // Calculate overall standings
     scrim.calculateOverallStandings();
+
+    // Web intentionally keeps Edit Results available after finalization. Keep
+    // the published standings transactionally consistent with that workflow.
+    if (scrim.finalResult?.generatedAt) {
+      refreshScrimFinalResult(scrim);
+    }
 
     await scrim.save();
 
@@ -664,15 +908,15 @@ const submitMatchResults = async (req, res) => {
       recipients: scrim.registeredTeams,
       sender: req.user._id,
       title: `Results Update: ${scrim.name}`,
-      message: `Match ${matchNumber} results are now available.`,
+      message: `Match ${routeMatchNumber} results are now available.`,
       eventType: 'scrim_match_results',
       revision: scrim.updatedAt,
-      extraData: { matchNumber: Number(matchNumber) }
+      extraData: { matchNumber: routeMatchNumber }
     });
 
     res.status(200).json({
       success: true,
-      message: `Match ${matchNumber} results submitted successfully`,
+      message: `Match ${routeMatchNumber} results submitted successfully`,
       data: {
         match: match,
         overallStandings: scrim.overallStandings
@@ -725,7 +969,7 @@ const updateScrim = async (req, res) => {
     });
 
     await scrim.save();
-    await scrim.populate('host', 'username profile.displayName profile.avatar');
+    await scrim.populate('host', 'username userType profile.displayName profile.avatar');
 
     res.status(200).json({
       success: true,
@@ -880,32 +1124,21 @@ const generateScrimFinalResult = async (req, res) => {
       return res.status(403).json({ success: false, message: 'Only host can generate final result' });
     }
 
+    if (!hasSubmittedResultsForEveryMatch(scrim.matches)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Submit results for every match before generating final standings'
+      });
+    }
+
     // Use existing calculateOverallStandings to ensure standings are up to date
     scrim.calculateOverallStandings();
     
-    const standings = [...(scrim.overallStandings?.teams || [])];
-    
-    // Assign ranks and prize money based on prize distribution
-    standings.forEach((team, index) => {
-      // Re-assign rank just to be safe
-      team.rank = index + 1;
-      
-      const prizeSplit = scrim.prizeDistribution.find(p => p.rank === team.rank);
-      team.prizeAmount = prizeSplit ? prizeSplit.amount : 0;
-    });
+    refreshScrimFinalResult(scrim);
 
-    scrim.finalResult = {
-      standings,
-      specialPrizeWinners: scrim.specialPrizes,
-      generatedAt: new Date()
-    };
-
-    // Auto-mark scrim as completed if not already
-    const allMatchesCompleted = scrim.matches.every(match => 
-      match.status === 'Completed' || match.results?.submittedAt
-    );
-    
-    if (scrim.status !== 'Completed' && allMatchesCompleted) {
+    // The completeness guard above is server-authoritative. A final result is
+    // therefore also the single command that marks the scrim complete.
+    if (scrim.status !== 'Completed') {
       scrim.status = 'Completed';
     }
 
@@ -990,16 +1223,31 @@ const broadcastScrimMessage = async (req, res) => {
       return res.status(403).json({ success: false, message: 'Only scrim host can send broadcasts' });
     }
 
-    if (!message || !message.trim()) {
+    if (typeof message !== 'string' || !message.trim()) {
       return res.status(400).json({ success: false, message: 'Message is required' });
+    }
+    const normalizedMessage = message.trim();
+    if (normalizedMessage.length > MAX_BROADCAST_MESSAGE_LENGTH) {
+      return res.status(400).json({
+        success: false,
+        message: `Broadcast message cannot exceed ${MAX_BROADCAST_MESSAGE_LENGTH} characters`
+      });
+    }
+
+    const normalizedType = type || 'info';
+    if (!SCRIM_BROADCAST_TYPES.has(normalizedType)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Broadcast type must be info, warning, match_starting, or custom'
+      });
     }
 
     const senderName = req.user.profile?.displayName || req.user.username || 'Host';
 
     // Save broadcast to scrim document
     const broadcastEntry = {
-      message: message.trim(),
-      type: type || 'info',
+      message: normalizedMessage,
+      type: normalizedType,
       senderName,
       sentAt: new Date()
     };
@@ -1014,29 +1262,29 @@ const broadcastScrimMessage = async (req, res) => {
     // Send notification to all registered participants.
     const broadcastDeliveryKey = `scrim-broadcast:${scrim._id}:${broadcastEntry.sentAt.toISOString()}`;
     const broadcastRecipients = uniqueRecipientIds(scrim.registeredTeams);
-    const notificationPromises = broadcastRecipients.map(teamId =>
-      createAndEmitNotification({
+    const notificationPromises = broadcastRecipients.map(teamId => (
+      Promise.resolve().then(() => createAndEmitNotification({
         recipient: teamId,
         sender: req.user._id,
         type: 'tournament',
         title: `📢 ${scrim.name}`,
-        message: message.trim(),
+        message: normalizedMessage,
         data: {
           scrimId: scrim._id,
           scrimCode: scrim.scrimCode,
-          broadcastType: type || 'info',
+          broadcastType: normalizedType,
           openTab: 'broadcast',
           customData: {
             scrimId: scrim._id,
             scrimCode: scrim.scrimCode,
-            broadcastType: type || 'info',
+            broadcastType: normalizedType,
             openTab: 'broadcast',
             notificationDedupeKey: broadcastDeliveryKey,
             pushRequestId: broadcastDeliveryKey
           }
         }
-      })
-    );
+      }))
+    ));
 
     const notificationResults = await Promise.allSettled(notificationPromises);
     notificationResults.forEach((result, index) => {
@@ -1077,5 +1325,14 @@ module.exports = {
   updateScrimPrizeDistribution,
   generateScrimFinalResult,
   assignScrimSpecialPrize,
-  broadcastScrimMessage
+  broadcastScrimMessage,
+  __testables: {
+    SCRIM_MATCH_COUNTS,
+    SCRIM_BROADCAST_TYPES,
+    MAX_BROADCAST_MESSAGE_LENGTH,
+    validateScrimCreationInput,
+    validateScrimResultInput,
+    hasSubmittedResultsForEveryMatch,
+    refreshScrimFinalResult
+  }
 };

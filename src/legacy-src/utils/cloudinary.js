@@ -7,8 +7,8 @@ const path = require('path');
 // __dirname = src/legacy-src/utils — go 3 levels up to /app/, then into dist/infrastructure/storage/s3
 const s3 = require(path.join(__dirname, '../../../dist/infrastructure/storage/s3'));
 
-const uploadImage = (file, folder = 'gaming-social') =>
-  s3.uploadImage(file, folder);
+const uploadImage = (file, folder = 'gaming-social', options) =>
+  s3.uploadImage(file, folder, options);
 
 const uploadVideo = (file, folder = 'gaming-social') =>
   s3.uploadVideo(file, folder);

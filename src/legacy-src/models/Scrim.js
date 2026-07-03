@@ -60,11 +60,11 @@ const scrimSchema = new mongoose.Schema({
     default: null
   },
   
-  // Number of matches: 1, 2, 3, or 4
+  // Number of matches exposed by the Web creation flow: 1 through 6.
   numberOfMatches: {
     type: Number,
     required: true,
-    enum: [1, 2, 3, 4],
+    enum: [1, 2, 3, 4, 5, 6],
     default: 1
   },
   
@@ -120,7 +120,7 @@ const scrimSchema = new mongoose.Schema({
       type: Number,
       required: true,
       min: 1,
-      max: 4
+      max: 6
     },
     map: {
       type: String,
@@ -443,7 +443,6 @@ scrimSchema.methods.calculateOverallStandings = function() {
 // Indexes for better performance
 scrimSchema.index({ status: 1, date: 1 });
 scrimSchema.index({ host: 1 });
-scrimSchema.index({ scrimCode: 1 });
 scrimSchema.index({ scrimType: 1, date: 1 });
 
 module.exports = mongoose.model('Scrim', scrimSchema);

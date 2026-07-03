@@ -1,4 +1,5 @@
 const User = require('../models/User');
+const crypto = require('crypto');
 const Post = require('../models/Post');
 const Tournament = require('../models/Tournament');
 const Follow = require('../models/Follow');
@@ -75,11 +76,12 @@ const getUsers = async (req, res) => {
       if (excludedIds.length > 0) andConditions.push({ _id: { $nin: excludedIds } });
     }
 
-    // If searching for followers, filter to only show users that the current user follows
+    // If searching for followers, return users who follow the current user.
+    // This is the canonical Duo-partner picker contract used by Web/Mobile.
     if (followers === 'true' && req.user && !isGuest) {
-      const followedIds = await Follow.find({ follower: req.user._id }).distinct('following');
-      if (followedIds.length > 0) {
-        filter._id = { $in: followedIds };
+      const followerIds = await Follow.find({ following: req.user._id }).distinct('follower');
+      if (followerIds.length > 0) {
+        filter._id = { $in: followerIds };
       } else {
         // If user has no followers, return empty array
         return res.status(200).json({
@@ -2773,6 +2775,10 @@ const syncClashRoyaleData = async (req, res) => {
 
 // Create team
 const createTeam = async (req, res) => {
+  let reservedTournamentId = null;
+  let reservedMemberIds = [];
+  let createdDuoTeamId = null;
+  let duoRegistrationCommitted = false;
   try {
     const { username, teamType, members, game, tournamentId } = req.body;
     const currentUserId = req.user._id;
@@ -2780,12 +2786,106 @@ const createTeam = async (req, res) => {
     if (process.env.NODE_ENV === 'development') { console.log('Creating team with data:', { username, teamType, members, game, tournamentId });
 }
     // Validate required fields
-    if (!username || !members || !Array.isArray(members) || members.length === 0) {
+    if (!username || !members || !Array.isArray(members) || members.length !== 1) {
       return res.status(400).json({
         success: false,
-        message: 'Username and at least one member are required'
+        message: 'A team name and exactly one teammate are required'
       });
     }
+
+    if (req.user.userType !== 'player' || teamType !== 'duo' || !tournamentId) {
+      return res.status(400).json({
+        success: false,
+        message: 'This endpoint only creates player Duo teams for a tournament'
+      });
+    }
+
+    const teammateId = members[0];
+    if (!/^[0-9a-fA-F]{24}$/.test(String(teammateId)) || String(teammateId) === String(currentUserId)) {
+      return res.status(400).json({ success: false, message: 'A valid teammate is required' });
+    }
+
+    const [duoTournament, teammate] = await Promise.all([
+      Tournament.findById(tournamentId),
+      User.findOne({ _id: teammateId, userType: 'player', isActive: true })
+    ]);
+    if (!duoTournament) {
+      return res.status(404).json({ success: false, message: 'Tournament not found' });
+    }
+    if (!teammate) {
+      return res.status(404).json({ success: false, message: 'Teammate not found' });
+    }
+    if (duoTournament.format !== 'Duo') {
+      return res.status(400).json({ success: false, message: 'Duo teams can only join Duo tournaments' });
+    }
+    if ([currentUserId, teammateId].some((candidate) => String(candidate) === String(duoTournament.host))) {
+      return res.status(400).json({
+        success: false,
+        message: 'Tournament hosts cannot register as Duo participants'
+      });
+    }
+    const now = new Date();
+    const registrationDeadline = new Date(duoTournament.registrationEndDate || duoTournament.registrationDeadline || 0);
+    if (duoTournament.status !== 'Registration Open' || Number.isNaN(registrationDeadline.getTime()) || registrationDeadline < now) {
+      return res.status(409).json({ success: false, message: 'Tournament registration is not open' });
+    }
+    const registrationCount = (duoTournament.participants?.length || 0) + (duoTournament.teams?.length || 0);
+    if (registrationCount >= duoTournament.totalSlots) {
+      return res.status(409).json({ success: false, message: 'Tournament is full' });
+    }
+    const directlyRegistered = [currentUserId, teammateId].some((candidate) => (
+      (duoTournament.participants || []).some((participant) => String(participant) === String(candidate))
+      || (duoTournament.teams || []).some((team) => String(team) === String(candidate))
+    ));
+    const registeredTeamMembership = (duoTournament.teams || []).length > 0
+      ? await User.exists({
+          _id: { $in: duoTournament.teams },
+          userType: 'team',
+          isActive: true,
+          'teamInfo.members.user': { $in: [currentUserId, teammateId] }
+        })
+      : null;
+    if (directlyRegistered || registeredTeamMembership) {
+      return res.status(409).json({ success: false, message: 'You or your teammate are already registered' });
+    }
+    if (!await Follow.isFollowing(teammateId, currentUserId)) {
+      return res.status(403).json({ success: false, message: 'Duo teammate must be one of your followers' });
+    }
+
+    reservedMemberIds = [String(currentUserId), String(teammateId)].sort();
+    const reservation = await Tournament.findOneAndUpdate(
+      {
+        _id: duoTournament._id,
+        format: 'Duo',
+        status: 'Registration Open',
+        host: { $nin: reservedMemberIds },
+        duoRegistrationMembers: { $nin: reservedMemberIds },
+        $or: [
+          { registrationEndDate: { $gte: now } },
+          { registrationEndDate: null, registrationDeadline: { $gte: now } }
+        ],
+        $expr: {
+          $lt: [
+            {
+              $add: [
+                { $size: { $ifNull: ['$participants', []] } },
+                { $size: { $ifNull: ['$teams', []] } }
+              ]
+            },
+            '$totalSlots'
+          ]
+        }
+      },
+      { $addToSet: { duoRegistrationMembers: { $each: reservedMemberIds } } },
+      { new: true }
+    );
+    if (!reservation) {
+      return res.status(409).json({
+        success: false,
+        message: 'You or your teammate are already registered, or the tournament is no longer available.'
+      });
+    }
+    reservedTournamentId = duoTournament._id;
 
     // Create a unique team username (max 20 chars)
     const timestamp = Date.now().toString().slice(-8); // Last 8 digits
@@ -2805,11 +2905,14 @@ const createTeam = async (req, res) => {
     const teamData = {
       username: teamUsername,
       email: `${teamUsername}@team.com`,
-      password: 'team123', // Temporary password
+      // Duo teams are tournament entities, not shared-login accounts. A
+      // random credential prevents the predictable historical `team123`
+      // password from becoming an account-takeover path.
+      password: crypto.randomBytes(32).toString('hex'),
       userType: 'team',
       profile: {
         displayName: username, // Use the provided team name as display name
-        bio: `Duo team for ${game || 'tournament'}`,
+        bio: `Duo team for ${duoTournament.game}`,
         location: '',
         website: ''
       },
@@ -2831,22 +2934,70 @@ const createTeam = async (req, res) => {
     };
 
     // Add the duo partner
-    if (members && members.length > 0) {
-      const memberId = members[0]; // Take first member for duo
-      const member = await User.findById(memberId);
-      if (member) {
-        teamData.teamInfo.members.push({
-          user: memberId,
-          role: 'Player 2',
-          joinedAt: new Date()
-        });
-      }
-    }
+    teamData.teamInfo.members.push({
+      user: teammate._id,
+      role: 'Player 2',
+      joinedAt: new Date()
+    });
 
     if (process.env.NODE_ENV === 'development') { console.log('Creating team with data:', teamData);}
     const team = await User.create(teamData);
+    createdDuoTeamId = team._id;
     if (process.env.NODE_ENV === 'development') { console.log('Team created successfully:', team._id);
 }
+
+    // Capacity and registration state can change while the team document is
+    // being created. Register atomically and remove the temporary team if the
+    // tournament no longer accepts it.
+    const registeredTournament = await Tournament.findOneAndUpdate(
+      {
+        _id: duoTournament._id,
+        format: 'Duo',
+        status: 'Registration Open',
+        $or: [
+          { registrationEndDate: { $gte: now } },
+          {
+            registrationEndDate: null,
+            registrationDeadline: { $gte: now }
+          }
+        ],
+        participants: { $nin: [currentUserId, teammateId] },
+        duoRegistrationMembers: { $all: reservedMemberIds },
+        $expr: {
+          $lt: [
+            {
+              $add: [
+                { $size: { $ifNull: ['$participants', []] } },
+                { $size: { $ifNull: ['$teams', []] } }
+              ]
+            },
+            '$totalSlots'
+          ]
+        }
+      },
+      { $addToSet: { teams: team._id } },
+      { new: true }
+    );
+    if (!registeredTournament) {
+      await User.deleteOne({ _id: team._id });
+      createdDuoTeamId = null;
+      await Tournament.updateOne(
+        { _id: duoTournament._id },
+        { $pull: { duoRegistrationMembers: { $in: reservedMemberIds } } }
+      );
+      reservedTournamentId = null;
+      return res.status(409).json({
+        success: false,
+        message: 'Tournament registration changed. Please refresh and try again.'
+      });
+    }
+    duoRegistrationCommitted = true;
+    try {
+      const { _private } = require('./tournamentController');
+      await _private?.emitTournamentUpdated?.(req, registeredTournament._id);
+    } catch (realtimeError) {
+      log.error('Duo tournament realtime update failed', { error: String(realtimeError) });
+    }
     // Add team to both users' joined teams
     const allMembers = [...new Set([currentUserId, ...(members || [])])]; // Remove duplicates
     
@@ -2859,7 +3010,7 @@ const createTeam = async (req, res) => {
           }
           member.playerInfo.joinedTeams.push({
             team: team._id,
-            game: game || 'General',
+            game: duoTournament.game,
             role: memberId === currentUserId ? 'Player 1' : 'Player 2',
             inGameName: null,
             joinedAt: new Date(),
@@ -2875,31 +3026,19 @@ const createTeam = async (req, res) => {
       }
     }
 
-    // If tournamentId is provided, add team to tournament
-    if (tournamentId) {
-      try {
-        const Tournament = require('../models/Tournament');
-        const tournament = await Tournament.findById(tournamentId);
-        
-        if (tournament) {
-          // Add team to tournament's teams array
-          tournament.teams.push(team._id);
-          
-          // For duo tournaments, we don't add individual users to participants
-          // because the team itself is the participant. Individual users get
-          // participant view through team membership check in frontend.
-          if (process.env.NODE_ENV === 'development') { console.log('Team added to tournament. Individual users not added to participants for duo format.');
-          }
-          await tournament.save();
-          if (process.env.NODE_ENV === 'development') { console.log(`Added team and members to tournament ${tournamentId}. Participants:`, tournament.participants);}
-        } else {
-          console.error(`Tournament ${tournamentId} not found`);
-        }
-      } catch (tournamentError) {
-        console.error(`Error updating tournament ${tournamentId}:`, tournamentError);
-        // Don't fail the entire operation if tournament update fails
+    await createAndEmitNotification({
+      recipient: registeredTournament.host,
+      sender: currentUserId,
+      type: 'tournament',
+      title: 'New Duo Registration',
+      message: `${team.profile?.displayName || team.username} joined "${registeredTournament.name}"`,
+      data: {
+        tournamentId: registeredTournament._id,
+        customData: { action: 'tournament_join', teamId: team._id }
       }
-    }
+    }).catch((notificationError) => {
+      log.error('Duo tournament registration notification failed', { error: String(notificationError) });
+    });
 
     res.status(201).json({
       success: true,
@@ -2915,6 +3054,15 @@ const createTeam = async (req, res) => {
     });
 
   } catch (error) {
+    if (!duoRegistrationCommitted && reservedTournamentId && reservedMemberIds.length > 0) {
+      await Tournament.updateOne(
+        { _id: reservedTournamentId },
+        { $pull: { duoRegistrationMembers: { $in: reservedMemberIds } } }
+      ).catch(() => {});
+    }
+    if (!duoRegistrationCommitted && createdDuoTeamId) {
+      await User.deleteOne({ _id: createdDuoTeamId }).catch(() => {});
+    }
     log.error('Error creating team:', { error: String(error) });
     
     // Handle validation errors specifically
