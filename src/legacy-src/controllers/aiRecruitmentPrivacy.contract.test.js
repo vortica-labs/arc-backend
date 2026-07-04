@@ -100,24 +100,48 @@ assert(!source.match(/AI_CANDIDATE_OWNER_PROJECTION[\s\S]*?blockedUsers:\s*1/));
   const capturedPipeline = capturedPipelines.find((p) => !p.some((stage) => stage.$count));
   const countPipeline = capturedPipelines.find((p) => p.some((stage) => stage.$count));
   assert(capturedPipeline && countPipeline, 'privacy filtering must precede pagination and count');
-  const ownerLookup = capturedPipeline.find((stage) => stage.$lookup)?.$lookup;
-  assert(ownerLookup, 'candidate owner lookup must exist');
-  const privacyFollowIndex = ownerLookup.pipeline.findIndex(
+
+  // The owner validity lookup must not nest the relationship lookup inside its
+  // sub-pipeline: Amazon DocumentDB rejects a correlated $lookup nested inside
+  // another correlated $lookup ("$lookup on multiple join conditions").
+  const ownerLookupStage = capturedPipeline.find(
+    (stage) => stage.$lookup?.as === '__validOwner'
+  );
+  assert(ownerLookupStage, 'candidate owner lookup must exist');
+  assert(
+    !ownerLookupStage.$lookup.pipeline.some((stage) => stage.$lookup),
+    'owner lookup must not embed a nested $lookup (DocumentDB rejects it)'
+  );
+  // The owner projection carries privacySettings/blockedUsers only so the
+  // top-level privacy checks can read them; they must be stripped afterwards.
+  const ownerProjectionStage = ownerLookupStage.$lookup.pipeline.find(
+    (stage) => stage.$project?.['playerInfo.gamingStats'] === 1
+  );
+  assert(ownerProjectionStage, 'candidate owner fields must be projected');
+  assert.strictEqual(ownerProjectionStage.$project.privacySettings, 1);
+  assert.strictEqual(ownerProjectionStage.$project.blockedUsers, 1);
+
+  // Follow lookup, block/visibility match, and the privacy-field strip all run at
+  // the top level of the pipeline.
+  const privacyFollowIndex = capturedPipeline.findIndex(
     (stage) => stage.$lookup?.from === 'follows'
   );
-  const privacyMatchIndex = ownerLookup.pipeline.findIndex(
+  const privacyMatchIndex = capturedPipeline.findIndex(
     (stage, index) => index > privacyFollowIndex && stage.$match?.$expr?.$and
   );
-  const projectionIndex = ownerLookup.pipeline.findIndex(
-    (stage) => stage.$project?.['playerInfo.gamingStats'] === 1
+  const stripIndex = capturedPipeline.findIndex(
+    (stage) => stage.$project?.['__validOwner.privacySettings'] === 0
   );
 
   assert(privacyFollowIndex >= 0, 'approved-follower lookup must be applied');
   assert(privacyMatchIndex > privacyFollowIndex, 'block and visibility checks must follow relationship lookup');
-  assert(projectionIndex > privacyMatchIndex, 'candidate data must be projected only after privacy checks');
-  assert.deepStrictEqual(ownerLookup.pipeline[projectionIndex].$project, customOwnerProjection);
+  assert(stripIndex > privacyMatchIndex, 'privacy fields must be stripped only after the privacy checks');
+  assert.strictEqual(
+    capturedPipeline[stripIndex].$project['__validOwner.blockedUsers'], 0,
+    'blockedUsers must not leak to a narrow candidate projection'
+  );
   assert(
-    capturedPipeline.findIndex((stage) => stage.$limit) > capturedPipeline.findIndex((stage) => stage.$lookup),
+    capturedPipeline.findIndex((stage) => stage.$limit) > privacyMatchIndex,
     'privacy filtering must happen before the candidate limit'
   );
   assert(countPipeline.some((stage) => stage.$count), 'total count must be a dedicated $count aggregation');

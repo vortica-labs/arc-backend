@@ -26,6 +26,31 @@ const {
 const future = new Date(Date.now() + 60_000);
 const past = new Date(Date.now() - 60_000);
 
+// Amazon DocumentDB rejects a pipeline $lookup that carries more than one $expr
+// ("$lookup on multiple join conditions"). Every recruitment $lookup sub-pipeline
+// must therefore contain at most a single $expr — the correlated join — with all
+// other validation ($expr-bearing) applied at the top level after $unwind.
+const countExpr = (value) => {
+  if (Array.isArray(value)) return value.reduce((n, item) => n + countExpr(item), 0);
+  if (value && typeof value === 'object') {
+    return Object.entries(value).reduce(
+      (n, [key, item]) => n + (key === '$expr' ? 1 : 0) + countExpr(item),
+      0
+    );
+  }
+  return 0;
+};
+const assertSingleJoinCondition = (pipeline, label) => {
+  pipeline.forEach((stage) => {
+    if (!stage.$lookup || !Array.isArray(stage.$lookup.pipeline)) return;
+    const exprCount = countExpr(stage.$lookup.pipeline);
+    assert(
+      exprCount <= 1,
+      `${label}: $lookup on '${stage.$lookup.as}' carries ${exprCount} $expr conditions; DocumentDB allows one`
+    );
+  });
+};
+
 const recruitment = {
   _id: 'recruitment-1',
   status: 'active',
@@ -98,6 +123,7 @@ const authenticatedPrivacyStages = buildRecruitmentOwnerPrivacyStages({
 });
 assert(authenticatedPrivacyStages.some((stage) => stage.$lookup?.from === 'follows'));
 assert(authenticatedPrivacyStages.some((stage) => stage.$match?.$expr));
+assertSingleJoinCondition(authenticatedPrivacyStages, 'privacy stages');
 assert.strictEqual(isValidRecruitmentOwner({
   _id: 'player-1', username: 'wrong_role', userType: 'team', isActive: true
 }, 'player'), false);
@@ -252,8 +278,19 @@ const runValidation = async (middlewares, body) => {
   const lookup = recordsPipeline.find(stage => stage.$lookup)?.$lookup;
   assert.strictEqual(lookup.from, 'users');
   assert.strictEqual(lookup.let.ownerId, '$player');
-  assert.deepStrictEqual(lookup.pipeline[1].$match, getValidRecruitmentOwnerMatch('player'));
+  // The owner $lookup must carry only the correlated join; DocumentDB rejects a
+  // second $expr inside the sub-pipeline.
+  assertSingleJoinCondition(recordsPipeline, 'records');
+  assert.deepStrictEqual(lookup.pipeline[0].$match, { $expr: { $eq: ['$_id', '$$ownerId'] } });
   assert(recordsPipeline.some(stage => stage.$unwind === '$__validOwner'));
+  // Owner validity now runs at the top level against the unwound owner path.
+  assert(
+    recordsPipeline.some(stage =>
+      stage.$match
+      && stage.$match['__validOwner.userType'] === 'player'
+      && stage.$match.$expr),
+    'owner validity must run at the top level after $unwind'
+  );
   assert(recordsPipeline.some(stage => stage.$limit === 10), 'records pipeline must paginate');
 
   let capturedApplicationPipelines = [];
@@ -282,6 +319,17 @@ const runValidation = async (middlewares, body) => {
   const applicationLookups = applicationRecordsPipeline.filter(stage => stage.$lookup);
   assert.strictEqual(applicationLookups[0].$lookup.from, 'teamrecruitments');
   assert.strictEqual(applicationLookups[1].$lookup.from, 'users');
+  // None of the three application $lookups may embed a second $expr.
+  assertSingleJoinCondition(applicationRecordsPipeline, 'applications');
+  // Recruitment structural integrity runs at the top level against the unwound
+  // recruitment, not inside the recruitment $lookup.
+  assert(
+    applicationRecordsPipeline.some(stage =>
+      stage.$match
+      && Array.isArray(stage.$match.$or)
+      && stage.$match.$or.some(branch => branch['__validRecruitment.recruitmentType'] === 'roster')),
+    'recruitment integrity must run at the top level after $unwind'
+  );
   assert(applicationRecordsPipeline.filter(stage => stage.$unwind).length >= 2);
   assert(applicationRecordsPipeline.some(stage => stage.$limit === 10), 'application records pipeline must paginate');
 

@@ -431,17 +431,28 @@ const transitionCallSession = async ({ callId, actorId, action, reason = '', ins
       }
     };
   } else if (action === 'end') {
-    filter = { callId: normalizedCallId, $or: [{ caller: actorId }, { callee: actorId }], status: { $in: ['ringing', 'accepted'] } };
-    update = [{
+    // A ringing call that ends is "cancelled"; an accepted one is "ended". We
+    // pin the compare-and-set to the status we just observed (only 'ringing' or
+    // 'accepted' can reach here — terminal states returned early above) and
+    // derive the next status in JS. Amazon DocumentDB does not support
+    // aggregation-pipeline updates (conditional expressions in the update), so
+    // this must be a plain $set rather than an update pipeline.
+    const endingFromRinging = current.status === 'ringing';
+    filter = {
+      callId: normalizedCallId,
+      $or: [{ caller: actorId }, { callee: actorId }],
+      status: endingFromRinging ? 'ringing' : 'accepted'
+    };
+    update = {
       $set: {
-        status: { $cond: [{ $eq: ['$status', 'ringing'] }, 'cancelled', 'ended'] },
+        status: endingFromRinging ? 'cancelled' : 'ended',
         endedAt: now,
         endedBy: actorId,
         endReason: bounded(reason, 80) || 'ended',
         participantLeaseActive: false,
         ...callStatePushMarker()
       }
-    }];
+    };
   } else {
     throw serviceError('Unsupported call action');
   }

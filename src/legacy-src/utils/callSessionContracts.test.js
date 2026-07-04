@@ -52,7 +52,7 @@ for (const contract of [
   "status: 'accepted'",
   "status: 'declined'",
   "status: 'missed'",
-  "status: { $cond: [{ $eq: ['$status', 'ringing'] }, 'cancelled', 'ended'] }",
+  "status: endingFromRinging ? 'cancelled' : 'ended'",
   'expiresAt: { $gt: now }',
   'MAX_CALL_DURATION_SECONDS',
   'acceptedInstallationId',
@@ -65,6 +65,10 @@ for (const contract of [
   'stopCallSessionSweeper'
 ]) assert(service.includes(contract), `Missing durable call contract: ${contract}`);
 
+// Amazon DocumentDB does not support aggregation-pipeline updates (an update
+// passed as an array, or update expressions such as $cond). Every call-session
+// state transition must therefore use plain update operators.
+assert(!service.includes('$cond'), 'DocumentDB rejects pipeline updates; call transitions must use plain $set (no $cond)');
 assert(service.includes("actor !== callerId && actor !== calleeId"), 'actions must be participant-scoped');
 assert(service.includes("actor !== calleeId"), 'accept/decline must be callee-scoped');
 assert(!service.includes("require('./apnsVoipPushService')"), 'call-state cleanup must not use PushKit-only transport');

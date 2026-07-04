@@ -83,21 +83,31 @@ const hasNonBlankStringExpression = (field) => ({
   ]
 });
 
-const addTeamRecruitmentIntegrityFilters = (query = {}) => addAndCondition(query, {
-  $or: [
-    {
-      recruitmentType: 'roster',
-      game: { $in: RECRUITMENT_GAMES },
-      role: { $type: 'string' },
-      $expr: hasNonBlankStringExpression('role')
-    },
-    {
-      recruitmentType: 'staff',
-      staffRole: { $type: 'string' },
-      $expr: hasNonBlankStringExpression('staffRole')
-    }
-  ]
-});
+// Structural-integrity $or for team recruitments, parameterized by an optional
+// field prefix so it can also run against an unwound owner path (e.g.
+// `__validRecruitment`) at the TOP level of an aggregation. Keeping this out of
+// a $lookup sub-pipeline matters: Amazon DocumentDB rejects a pipeline $lookup
+// that carries more than one $expr ("$lookup on multiple join conditions").
+const teamRecruitmentIntegrityOr = (prefix = '') => {
+  const p = prefix ? `${prefix}.` : '';
+  return {
+    $or: [
+      {
+        [`${p}recruitmentType`]: 'roster',
+        [`${p}game`]: { $in: RECRUITMENT_GAMES },
+        [`${p}role`]: { $type: 'string' },
+        $expr: hasNonBlankStringExpression(`${p}role`)
+      },
+      {
+        [`${p}recruitmentType`]: 'staff',
+        [`${p}staffRole`]: { $type: 'string' },
+        $expr: hasNonBlankStringExpression(`${p}staffRole`)
+      }
+    ]
+  };
+};
+
+const addTeamRecruitmentIntegrityFilters = (query = {}) => addAndCondition(query, teamRecruitmentIntegrityOr());
 
 const addPlayerProfileIntegrityFilters = (query = {}) => addAndCondition(query, {
   $or: [
@@ -122,6 +132,23 @@ const getValidRecruitmentOwnerMatch = (expectedUserType) => ({
   username: { $type: 'string' },
   $expr: hasNonBlankStringExpression('username')
 });
+
+// Top-level owner-validity $match for an unwound owner path. Used AFTER a
+// $unwind rather than inside the $lookup sub-pipeline so the join stays a single
+// DocumentDB-compatible condition (see teamRecruitmentIntegrityOr). The validity
+// fields it inspects must be projected out of the owner $lookup.
+const buildValidOwnerMatchStage = (ownerPath, expectedUserType) => {
+  const p = ownerPath ? `${ownerPath}.` : '';
+  return {
+    $match: {
+      [`${p}userType`]: expectedUserType,
+      [`${p}isActive`]: true,
+      [`${p}needsProfileCompletion`]: { $ne: true },
+      [`${p}username`]: { $type: 'string' },
+      $expr: hasNonBlankStringExpression(`${p}username`)
+    }
+  };
+};
 
 const isTeamRecruitmentStructurallyValid = (recruitment) => {
   if (!recruitment) return false;
@@ -157,31 +184,41 @@ const isValidRecruitmentOwner = (owner, expectedUserType) => Boolean(
   && owner.username.trim()
 );
 
-const effectiveProfileVisibilityExpression = {
-  $switch: {
-    branches: [
-      {
-        case: { $in: ['$privacySettings.profileVisibility', ['public', 'followers', 'private']] },
-        then: '$privacySettings.profileVisibility'
-      },
-      {
-        case: {
-          $and: [
-            { $eq: [{ $type: '$privacySettings.profileVisibility' }, 'missing'] },
-            {
-              $or: [
-                { $eq: ['$privacySettings.accountType', 'public'] },
-                { $eq: [{ $type: '$privacySettings.accountType' }, 'missing'] }
-              ]
-            }
-          ]
+// Builds the effective-visibility expression against an optional owner base path.
+// When the owner document has been unwound into a nested field (e.g. `__validOwner`)
+// the privacy check runs at the top level of the pipeline, so it must reference
+// `$__validOwner.privacySettings.*` instead of `$privacySettings.*`.
+const buildEffectiveVisibilityExpression = (base = '') => {
+  const prefix = base ? `${base}.` : '';
+  const field = (name) => `$${prefix}${name}`;
+  return {
+    $switch: {
+      branches: [
+        {
+          case: { $in: [field('privacySettings.profileVisibility'), ['public', 'followers', 'private']] },
+          then: field('privacySettings.profileVisibility')
         },
-        then: 'public'
-      }
-    ],
-    default: 'private'
-  }
+        {
+          case: {
+            $and: [
+              { $eq: [{ $type: field('privacySettings.profileVisibility') }, 'missing'] },
+              {
+                $or: [
+                  { $eq: [field('privacySettings.accountType'), 'public'] },
+                  { $eq: [{ $type: field('privacySettings.accountType') }, 'missing'] }
+                ]
+              }
+            ]
+          },
+          then: 'public'
+        }
+      ],
+      default: 'private'
+    }
+  };
 };
+
+const effectiveProfileVisibilityExpression = buildEffectiveVisibilityExpression();
 
 const DEFAULT_RECRUITMENT_OWNER_PROJECTION = Object.freeze({
   _id: 1,
@@ -194,10 +231,23 @@ const DEFAULT_RECRUITMENT_OWNER_PROJECTION = Object.freeze({
   blockedUsers: 1
 });
 
-const buildRecruitmentOwnerPrivacyStages = ({ viewerId, viewerBlockedIds = [], followCollectionName = 'follows' } = {}) => {
+// Emits the owner privacy/blocklist stages. These run at the TOP level of the
+// aggregation (after the owner has been unwound into `ownerPath`) rather than
+// inside the owner $lookup sub-pipeline. Amazon DocumentDB rejects a correlated
+// $lookup nested inside another correlated $lookup ("$lookup on multiple join
+// conditions"), so the follows join must not be embedded in the owner lookup.
+const buildRecruitmentOwnerPrivacyStages = ({
+  viewerId,
+  viewerBlockedIds = [],
+  followCollectionName = 'follows',
+  ownerPath = ''
+} = {}) => {
+  const prefix = ownerPath ? `${ownerPath}.` : '';
+  const ownerField = (name) => `$${prefix}${name}`;
+  const visibilityExpr = buildEffectiveVisibilityExpression(ownerPath);
   const hasViewer = viewerId && mongoose.Types.ObjectId.isValid(String(viewerId));
   if (!hasViewer) {
-    return [{ $match: { $expr: { $eq: [effectiveProfileVisibilityExpression, 'public'] } } }];
+    return [{ $match: { $expr: { $eq: [visibilityExpr, 'public'] } } }];
   }
   const viewerObjectId = new mongoose.Types.ObjectId(String(viewerId));
   const blockedObjectIds = (viewerBlockedIds || [])
@@ -207,7 +257,7 @@ const buildRecruitmentOwnerPrivacyStages = ({ viewerId, viewerBlockedIds = [], f
     {
       $lookup: {
         from: followCollectionName,
-        let: { ownerId: '$_id' },
+        let: { ownerId: ownerField('_id') },
         pipeline: [
           // Amazon DocumentDB rejects a correlated $lookup with more than one
           // join condition. `follower` is a constant (the viewer), so it stays a
@@ -223,12 +273,12 @@ const buildRecruitmentOwnerPrivacyStages = ({ viewerId, viewerBlockedIds = [], f
       $match: {
         $expr: {
           $and: [
-            { $not: [{ $in: ['$_id', blockedObjectIds] }] },
-            { $not: [{ $in: [viewerObjectId, { $ifNull: ['$blockedUsers', []] }] }] },
+            { $not: [{ $in: [ownerField('_id'), blockedObjectIds] }] },
+            { $not: [{ $in: [viewerObjectId, { $ifNull: [ownerField('blockedUsers'), []] }] }] },
             {
               $or: [
-                { $eq: ['$_id', viewerObjectId] },
-                { $eq: [effectiveProfileVisibilityExpression, 'public'] },
+                { $eq: [ownerField('_id'), viewerObjectId] },
+                { $eq: [visibilityExpr, 'public'] },
                 { $gt: [{ $size: '$__viewerFollow' }, 0] }
               ]
             }
@@ -265,6 +315,32 @@ const listCanonicalRecruitmentRecords = async ({
   const sort = sortBy === 'createdAt'
     ? { createdAt: sortDirection, _id: 1 }
     : { [sortBy]: sortDirection, createdAt: -1, _id: 1 };
+
+  // Owner validity and privacy/blocklist filtering both run at the TOP level of
+  // the pipeline (after $unwind), not inside the owner $lookup. Amazon DocumentDB
+  // rejects a pipeline $lookup that carries more than one $expr condition
+  // ("$lookup on multiple join conditions"), so the sub-pipeline keeps only the
+  // single correlated join and the validity/privacy checks (which add their own
+  // $expr predicates) are applied afterwards. That in turn means the owner
+  // $lookup must project the fields those top-level checks inspect
+  // (userType/isActive/needsProfileCompletion/username/privacySettings/
+  // blockedUsers) even when the caller asked for a narrower set (e.g. the AI
+  // candidate reader). They are stripped again unless the caller requested them.
+  const ownerKeeps = (field) => Object.prototype.hasOwnProperty.call(ownerProjection, field);
+  const ownerLookupProjection = {
+    ...ownerProjection,
+    userType: 1,
+    isActive: 1,
+    needsProfileCompletion: 1,
+    username: 1,
+    privacySettings: 1,
+    blockedUsers: 1
+  };
+  const fieldsToStrip = {};
+  for (const field of ['userType', 'isActive', 'needsProfileCompletion', 'username', 'privacySettings', 'blockedUsers']) {
+    if (!ownerKeeps(field)) fieldsToStrip[`__validOwner.${field}`] = 0;
+  }
+
   const basePipeline = [
     { $match: query },
     {
@@ -273,14 +349,27 @@ const listCanonicalRecruitmentRecords = async ({
         let: { ownerId: `$${ownerField}` },
         pipeline: [
           { $match: { $expr: { $eq: ['$_id', '$$ownerId'] } } },
-          { $match: getValidRecruitmentOwnerMatch(expectedUserType) },
-          ...buildRecruitmentOwnerPrivacyStages({ viewerId, viewerBlockedIds, followCollectionName }),
-          { $project: ownerProjection }
+          { $project: ownerLookupProjection }
         ],
         as: '__validOwner'
       }
     },
     { $unwind: '$__validOwner' },
+    // Owner validity runs at the top level (not inside the $lookup above) so the
+    // sub-pipeline keeps a single DocumentDB-compatible join condition.
+    buildValidOwnerMatchStage('__validOwner', expectedUserType),
+    // Privacy/blocklist filtering also runs at the top level because Amazon
+    // DocumentDB rejects a correlated $lookup nested within another correlated
+    // $lookup.
+    ...buildRecruitmentOwnerPrivacyStages({
+      viewerId,
+      viewerBlockedIds,
+      followCollectionName,
+      ownerPath: '__validOwner'
+    }),
+    // Drop the fields that were only needed for the validity/privacy checks above
+    // so a narrower caller projection (e.g. AI candidate reads) never leaks them.
+    ...(Object.keys(fieldsToStrip).length ? [{ $project: fieldsToStrip }] : []),
     { $set: { [ownerField]: '$__validOwner' } },
     { $project: { __validOwner: 0 } },
     { $addFields: { [countField]: { $size: { $ifNull: [`$${countSource}`, []] } } } }
@@ -317,9 +406,16 @@ const listCanonicalRecruitmentApplications = async ({
   page,
   limit
 }) => {
-  const recruitmentIntegrityQuery = addTeamRecruitmentIntegrityFilters({});
+  // Every $lookup sub-pipeline below carries only a single correlated join
+  // ($expr $eq). The recruitment structural-integrity check and the team/
+  // applicant owner-validity checks add their own $expr predicates, so they run
+  // at the TOP level after each $unwind. Amazon DocumentDB rejects a pipeline
+  // $lookup that carries more than one $expr ("$lookup on multiple join
+  // conditions"), which is why none of that validation lives inside the lookups.
   const basePipeline = [
     { $match: query },
+    // Resolve the referenced recruitment. Structural integrity is enforced at the
+    // top level (below) rather than inside this $lookup.
     {
       $lookup: {
         from: recruitmentModel.collection.name,
@@ -327,27 +423,6 @@ const listCanonicalRecruitmentApplications = async ({
         pipeline: [
           { $match: { $expr: { $eq: ['$_id', '$$recruitmentId'] } } },
           { $match: { isActive: true } },
-          { $match: recruitmentIntegrityQuery },
-          {
-            $lookup: {
-              from: userModel.collection.name,
-              let: { teamId: '$team' },
-              pipeline: [
-                { $match: { $expr: { $eq: ['$_id', '$$teamId'] } } },
-                { $match: getValidRecruitmentOwnerMatch('team') },
-                {
-                  $project: {
-                    _id: 1,
-                    username: 1,
-                    'profile.displayName': 1,
-                    'profile.avatar': 1
-                  }
-                }
-              ],
-              as: '__validTeam'
-            }
-          },
-          { $unwind: '$__validTeam' },
           {
             $project: {
               _id: 1,
@@ -359,7 +434,7 @@ const listCanonicalRecruitmentApplications = async ({
               isActive: 1,
               expiresAt: 1,
               recruitmentCode: 1,
-              team: '$__validTeam'
+              team: 1
             }
           }
         ],
@@ -367,17 +442,58 @@ const listCanonicalRecruitmentApplications = async ({
       }
     },
     { $unwind: '$__validRecruitment' },
+    { $match: teamRecruitmentIntegrityOr('__validRecruitment') },
+    {
+      $lookup: {
+        from: userModel.collection.name,
+        let: { teamId: '$__validRecruitment.team' },
+        pipeline: [
+          { $match: { $expr: { $eq: ['$_id', '$$teamId'] } } },
+          {
+            $project: {
+              _id: 1,
+              username: 1,
+              userType: 1,
+              isActive: 1,
+              needsProfileCompletion: 1,
+              'profile.displayName': 1,
+              'profile.avatar': 1
+            }
+          }
+        ],
+        as: '__validTeam'
+      }
+    },
+    { $unwind: '$__validTeam' },
+    buildValidOwnerMatchStage('__validTeam', 'team'),
+    // Merge only the presentable team fields so the validity-only fields
+    // (userType/isActive/needsProfileCompletion) never leak into the response.
+    {
+      $set: {
+        __validRecruitment: {
+          $mergeObjects: ['$__validRecruitment', {
+            team: {
+              _id: '$__validTeam._id',
+              username: '$__validTeam.username',
+              profile: '$__validTeam.profile'
+            }
+          }]
+        }
+      }
+    },
     {
       $lookup: {
         from: userModel.collection.name,
         let: { applicantId: '$applicant' },
         pipeline: [
           { $match: { $expr: { $eq: ['$_id', '$$applicantId'] } } },
-          { $match: getValidRecruitmentOwnerMatch('player') },
           {
             $project: {
               _id: 1,
               username: 1,
+              userType: 1,
+              isActive: 1,
+              needsProfileCompletion: 1,
               'profile.displayName': 1,
               'profile.avatar': 1
             }
@@ -387,14 +503,19 @@ const listCanonicalRecruitmentApplications = async ({
       }
     },
     { $unwind: '$__validApplicant' },
+    buildValidOwnerMatchStage('__validApplicant', 'player'),
     {
       $set: {
         recruitment: '$__validRecruitment',
-        applicant: '$__validApplicant',
+        applicant: {
+          _id: '$__validApplicant._id',
+          username: '$__validApplicant.username',
+          profile: '$__validApplicant.profile'
+        },
         appliedAt: '$createdAt'
       }
     },
-    { $project: { __validRecruitment: 0, __validApplicant: 0 } }
+    { $project: { __validRecruitment: 0, __validApplicant: 0, __validTeam: 0 } }
   ];
 
   // Amazon DocumentDB does not support $facet, so the page and the total count
