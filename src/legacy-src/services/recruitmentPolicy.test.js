@@ -119,10 +119,13 @@ assert.strictEqual(guestPrivacyStages.length, 1);
 assert.strictEqual(guestPrivacyStages[0].$match.$expr.$eq[1], 'public');
 const authenticatedPrivacyStages = buildRecruitmentOwnerPrivacyStages({
   viewerId: '507f1f77bcf86cd799439011',
-  viewerBlockedIds: ['507f1f77bcf86cd799439012']
+  viewerBlockedIds: ['507f1f77bcf86cd799439012'],
+  viewerFollowingIds: ['507f1f77bcf86cd799439099']
 });
-assert(authenticatedPrivacyStages.some((stage) => stage.$lookup?.from === 'follows'));
-assert(authenticatedPrivacyStages.some((stage) => stage.$match?.$expr));
+// DocumentDB has no correlated $lookup, so the follow relationship is resolved in
+// JS and passed in as viewerFollowingIds; the privacy stage is a plain $match.
+assert(!authenticatedPrivacyStages.some((stage) => stage.$lookup), 'privacy stages must not use a $lookup');
+assert(authenticatedPrivacyStages.some((stage) => stage.$match?.$expr?.$and), 'privacy stages must apply block/visibility checks');
 assertSingleJoinCondition(authenticatedPrivacyStages, 'privacy stages');
 assert.strictEqual(isValidRecruitmentOwner({
   _id: 'player-1', username: 'wrong_role', userType: 'team', isActive: true
@@ -255,7 +258,7 @@ const runValidation = async (middlewares, body) => {
     aggregate(pipeline) {
       capturedPipelines.push(pipeline);
       const isCount = pipeline.some(stage => stage.$count);
-      return { allowDiskUse: async () => (isCount ? [{ total: 1 }] : [{ _id: 'valid-1' }]) };
+      return Promise.resolve(isCount ? [{ total: 1 }] : [{ _id: 'valid-1' }]);
     }
   };
   const canonical = await listCanonicalRecruitmentRecords({
@@ -277,19 +280,25 @@ const runValidation = async (middlewares, body) => {
   assert(recordsPipeline && countPipeline, 'canonical validity must run before pagination and count');
   const lookup = recordsPipeline.find(stage => stage.$lookup)?.$lookup;
   assert.strictEqual(lookup.from, 'users');
-  assert.strictEqual(lookup.let.ownerId, '$player');
-  // The owner $lookup must carry only the correlated join; DocumentDB rejects a
-  // second $expr inside the sub-pipeline.
+  // DocumentDB rejects the correlated ($lookup with let/pipeline) form, so the
+  // owner join must be a basic localField/foreignField lookup.
+  assert.strictEqual(lookup.localField, 'player');
+  assert.strictEqual(lookup.foreignField, '_id');
+  assert(!lookup.let && !lookup.pipeline, 'owner lookup must not be correlated');
   assertSingleJoinCondition(recordsPipeline, 'records');
-  assert.deepStrictEqual(lookup.pipeline[0].$match, { $expr: { $eq: ['$_id', '$$ownerId'] } });
   assert(recordsPipeline.some(stage => stage.$unwind === '$__validOwner'));
-  // Owner validity now runs at the top level against the unwound owner path.
+  // Owner validity runs at the top level against the unwound owner path.
   assert(
     recordsPipeline.some(stage =>
       stage.$match
       && stage.$match['__validOwner.userType'] === 'player'
       && stage.$match.$expr),
     'owner validity must run at the top level after $unwind'
+  );
+  // The owner is reduced to the caller projection via a $set that rebuilds it.
+  assert(
+    recordsPipeline.some(stage => stage.$set && stage.$set.player),
+    'owner must be reduced to the requested projection'
   );
   assert(recordsPipeline.some(stage => stage.$limit === 10), 'records pipeline must paginate');
 
@@ -299,7 +308,7 @@ const runValidation = async (middlewares, body) => {
       aggregate(pipeline) {
         capturedApplicationPipelines.push(pipeline);
         const isCount = pipeline.some(stage => stage.$count);
-        return { allowDiskUse: async () => (isCount ? [{ total: 1 }] : [{ _id: 'application-1' }]) };
+        return Promise.resolve(isCount ? [{ total: 1 }] : [{ _id: 'application-1' }]);
       }
     },
     recruitmentModel: { collection: { name: 'teamrecruitments' } },
