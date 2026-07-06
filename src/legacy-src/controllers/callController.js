@@ -23,7 +23,8 @@ const {
   createCallSession,
   getCallSessionForParticipant,
   transitionCallSession,
-  serializeCallSession
+  serializeCallSession,
+  CALL_RING_TTL_SECONDS
 } = require('../services/callSessionService');
 const log = require('../utils/logger');
 const { resolvePrivacyAccess } = require('../utils/privacyPolicy');
@@ -33,6 +34,27 @@ const { assertCallSessionPrivacy } = require('../utils/callPrivacy');
 const ZEGO_APP_ID = parseInt(process.env.ZEGOCLOUD_APP_ID || '0', 10);
 const ZEGO_SERVER_SECRET = process.env.ZEGOCLOUD_SERVER_SECRET || '';
 const TOKEN_EXPIRY_SECONDS = 3600; // 1 hour
+
+const emitCallSessionUpdate = (session) => {
+  const io = global._arcSocketIO;
+  if (!io?.to || !session) return;
+  const participants = [...new Set([String(session.caller), String(session.callee)].filter(Boolean))];
+  const serialized = serializeCallSession(session);
+  for (const participantId of participants) {
+    io.to(`user-${participantId}`).emit('call-session-updated', serialized);
+  }
+};
+
+const sendCallFailure = (res, error, fallbackMessage) => {
+  const statusCode = Number(error?.statusCode || 500);
+  const isClientError = statusCode >= 400 && statusCode < 500;
+  return res.status(statusCode).json({
+    success: false,
+    ...(typeof error?.code === 'string' ? { code: error.code } : {}),
+    message: isClientError && error?.message ? error.message : fallbackMessage,
+    error: process.env.NODE_ENV === 'development' ? error?.message : undefined
+  });
+};
 
 /**
  * POST /api/calls/token
@@ -235,7 +257,7 @@ const initiateCall = async (req, res) => {
         displayName: callerUser?.profile?.displayName || callerUser?.username,
         avatar: callerUser?.profile?.avatar
       },
-      expiresAt: new Date(Date.now() + 30_000)
+      expiresAt: new Date(Date.now() + CALL_RING_TTL_SECONDS * 1000)
     });
     try {
       await assertCallSessionPrivacy(callSession);
@@ -249,7 +271,10 @@ const initiateCall = async (req, res) => {
       throw privacyError;
     }
 
-    // Emit to target user's socket room
+    const expiresAt = new Date(callSession.expiresAt).toISOString();
+
+    // Emit to target user's socket room. Keep the legacy Zego event while also
+    // emitting the canonical event consumed by the current Web and Mobile apps.
     const callData = {
       roomId,
       callId: roomId,
@@ -268,9 +293,18 @@ const initiateCall = async (req, res) => {
     // Use the io instance from notificationEmitter (it's injected at boot)
     if (global._arcSocketIO) {
       global._arcSocketIO.to(`user-${targetUserId}`).emit('call:offer', callData);
+      global._arcSocketIO.to(`user-${targetUserId}`).emit('call-request', {
+        callId: roomId,
+        nativeCallId: callSession.nativeCallId,
+        fromUserId: callerId,
+        callType,
+        fromUsername: callerUser?.username,
+        fromDisplayName: callerUser?.profile?.displayName || callerUser?.username,
+        fromAvatar: callerUser?.profile?.avatar,
+        deadlineAt: expiresAt
+      });
     }
 
-    const expiresAt = new Date(callSession.expiresAt).toISOString();
     const incomingCallNotification = {
       recipient: targetUserId,
       sender: callerId,
@@ -292,7 +326,7 @@ const initiateCall = async (req, res) => {
           expiresAt,
           url: `/conversation/direct_${callerId}`,
           pushOptions: {
-            ttl: 30,
+            ttl: CALL_RING_TTL_SECONDS,
             priority: 'high',
             collapseKey: `incoming-call-${roomId}`
           }
@@ -342,11 +376,7 @@ const initiateCall = async (req, res) => {
 
   } catch (error) {
     log.error('initiateCall error', { error: String(error) });
-    res.status(Number(error?.statusCode || 500)).json({
-      success: false,
-      message: 'Failed to initiate call',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
+    return sendCallFailure(res, error, 'Failed to initiate call');
   }
 };
 
@@ -422,7 +452,13 @@ const acceptCall = async (req, res) => {
         accepted: true,
         timestamp: Date.now()
       });
+      global._arcSocketIO.to(`user-${callerId}`).emit('call-accept', {
+        callId: roomId,
+        nativeCallId: durableSession.nativeCallId,
+        fromUserId: calleeId
+      });
     }
+    emitCallSessionUpdate(durableSession);
 
     res.status(200).json({
       success: true,
@@ -438,11 +474,7 @@ const acceptCall = async (req, res) => {
 
   } catch (error) {
     log.error('acceptCall error', { error: String(error) });
-    res.status(Number(error?.statusCode || 500)).json({
-      success: false,
-      message: 'Failed to accept call',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
+    return sendCallFailure(res, error, 'Failed to accept call');
   }
 };
 
@@ -491,7 +523,14 @@ const rejectCall = async (req, res) => {
         calleeId,
         timestamp: Date.now()
       });
+      global._arcSocketIO.to(`user-${callerId}`).emit('call-reject', {
+        callId: roomId,
+        nativeCallId: durableSession.nativeCallId,
+        fromUserId: calleeId,
+        reason: 'declined'
+      });
     }
+    emitCallSessionUpdate(durableSession);
 
     res.status(200).json({
       success: true,
@@ -500,10 +539,7 @@ const rejectCall = async (req, res) => {
 
   } catch (error) {
     log.error('rejectCall error', { error: String(error) });
-    res.status(Number(error?.statusCode || 500)).json({
-      success: false,
-      message: 'Failed to reject call'
-    });
+    return sendCallFailure(res, error, 'Failed to reject call');
   }
 };
 
@@ -575,7 +611,14 @@ const endCall = async (req, res) => {
         endedBy: userId,
         timestamp: Date.now()
       });
+      global._arcSocketIO.to(`user-${resolvedParticipantId}`).emit('call-end', {
+        callId: roomId,
+        nativeCallId: durableSession.nativeCallId,
+        fromUserId: userId,
+        reason: outcome || 'ended'
+      });
     }
+    emitCallSessionUpdate(durableSession);
 
     // Record call summary as a message in the chat
     const messageData = {
@@ -614,11 +657,7 @@ const endCall = async (req, res) => {
 
   } catch (error) {
     log.error('endCall error', { error: String(error) });
-    res.status(Number(error?.statusCode || 500)).json({
-      success: false,
-      message: 'Failed to end call',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
+    return sendCallFailure(res, error, 'Failed to end call');
   }
 };
 

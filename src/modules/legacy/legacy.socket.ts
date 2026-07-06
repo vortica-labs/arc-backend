@@ -3,7 +3,14 @@ import path from "path";
 import { logger } from "../../config/logger";
 import { backendControllerPath, backendModelPath, backendRootPath } from "./legacy.paths";
 
-const CALL_RING_TTL_SECONDS = 30;
+const CALL_RING_TTL_SECONDS = Math.max(
+  15,
+  Math.min(120, Number(process.env.CALL_RING_TTL_SECONDS || 30))
+);
+const CALL_DISCONNECT_GRACE_MS = Math.max(
+  1000,
+  Math.min(30_000, Number(process.env.CALL_DISCONNECT_GRACE_MS || 30_000))
+);
 const OBJECT_ID_PATTERN = /^[a-f\d]{24}$/i;
 const CALL_ID_PATTERN = /^[A-Za-z0-9:_-]{8,160}$/;
 const MAX_ACTIVE_GROUP_CALLS = 10_000;
@@ -64,7 +71,7 @@ type CallSessionService = {
   getCallSessionForParticipant: (callId: string, userId: string) => Promise<DurableCallSession>;
   transitionCallSession: (input: Record<string, unknown>) => Promise<DurableCallSession>;
   serializeCallSession: (session: DurableCallSession) => Record<string, unknown>;
-  endLiveCallSessionsForUser?: (userId: string, reason?: string) => Promise<DurableCallSession[]>;
+  endAcceptedCallSessionsForUser?: (userId: string, reason?: string) => Promise<DurableCallSession[]>;
 };
 
 type ApnsVoipPushService = {
@@ -143,6 +150,34 @@ const boundedString = (value: unknown, maxLength: number): string =>
 
 const getCallSessionService = (): CallSessionService | null =>
   safeRequire<CallSessionService>(path.join(backendRootPath, "services", "callSessionService.js"));
+
+export const releaseDisconnectedUserCallSessions = async (
+  io: Server,
+  userId: string,
+  callSessionService: CallSessionService
+): Promise<DurableCallSession[]> => {
+  // Socket.IO removes the disconnecting socket from its rooms before the
+  // `disconnect` event. A non-empty user room therefore means another tab or
+  // installation is still connected and owns the same durable call session.
+  const remainingSockets = await io.in(`user-${userId}`).fetchSockets();
+  if (remainingSockets.length > 0 || !callSessionService.endAcceptedCallSessionsForUser) {
+    return [];
+  }
+
+  const ended = await callSessionService.endAcceptedCallSessionsForUser(userId, "peer_disconnected");
+  for (const session of ended) {
+    const callerId = getObjectIdString(session.caller);
+    const calleeId = getObjectIdString(session.callee);
+    const otherUserId = userId === callerId ? calleeId : callerId;
+    io.to(`user-${otherUserId}`).emit("call-end", {
+      callId: session.callId,
+      nativeCallId: session.nativeCallId,
+      fromUserId: userId,
+      reason: "peer_disconnected"
+    });
+  }
+  return ended;
+};
 
 const getApnsVoipPushService = (): ApnsVoipPushService | null =>
   safeRequire<ApnsVoipPushService>(path.join(backendRootPath, "services", "apnsVoipPushService.js"));
@@ -545,7 +580,10 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
       });
     } catch (error) {
       logger.warn("Call session creation rejected", { callId, callerId: userIdStr, targetUserId, error: String(error) });
-      socket.emit("call-error", { callId, code: "CALL_SESSION_REJECTED" });
+      socket.emit("call-error", {
+        callId,
+        code: boundedString((error as { code?: unknown })?.code, 80) || "CALL_SESSION_REJECTED"
+      });
       return;
     }
     try {
@@ -791,6 +829,14 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
       [callId]: chatRoomId
     };
     await socket.join(`call-${callId}`);
+    // The Web initiator acquires local media from this acknowledgement. Without
+    // it, only later joiners initialize media and no offer can be created.
+    socket.emit("group-call-joined", {
+      callId,
+      callType: data.callType,
+      chatRoomId,
+      participants: []
+    });
     io.to(`chat-${chatRoomId}`).emit("group-call-incoming", {
       callId,
       callType: data.callType,
@@ -875,34 +921,26 @@ export const registerLegacySocketHandlers = (io: Server, socket: Socket): void =
         handleGroupCallLeave(io, callId, userIdStr);
       }
     }
-    // Release any durable 1:1 call-session lease held by this user. A refresh,
-    // tab close, or network drop during an accepted call otherwise leaves the
-    // session leased (participantLeaseActive) until activeUntil — up to
+    // Release accepted durable 1:1 call-session leases held by this user. A
+    // refresh, tab close, or network drop during an accepted call otherwise
+    // leaves the session leased (participantLeaseActive) until activeUntil — up to
     // MAX_CALL_DURATION_SECONDS (default 4h) — which blocks this account's next
     // call with CALL_PARTICIPANT_BUSY → "A previous call is still active."
     const callSessionService = getCallSessionService();
-    if (callSessionService?.endLiveCallSessionsForUser) {
-      void callSessionService
-        .endLiveCallSessionsForUser(userIdStr, "peer_disconnected")
-        .then((ended) => {
-          for (const session of ended) {
-            const callerId = getObjectIdString(session.caller);
-            const calleeId = getObjectIdString(session.callee);
-            const otherUserId = userIdStr === callerId ? calleeId : callerId;
-            io.to(`user-${otherUserId}`).emit("call-end", {
-              callId: session.callId,
-              nativeCallId: session.nativeCallId,
-              fromUserId: userIdStr,
-              reason: "peer_disconnected"
+    if (callSessionService?.endAcceptedCallSessionsForUser) {
+      // Let short network changes and app foreground transitions reconnect.
+      // Ringing calls are never released here: native push/CallKit acceptance
+      // legitimately happens while the callee has no active Socket.IO client.
+      const releaseTimer = setTimeout(() => {
+        void releaseDisconnectedUserCallSessions(io, userIdStr, callSessionService)
+          .catch((error: unknown) => {
+            logger.warn("Failed to release call sessions on disconnect", {
+              userId: userIdStr,
+              error: String(error)
             });
-          }
-        })
-        .catch((error: unknown) => {
-          logger.warn("Failed to release call sessions on disconnect", {
-            userId: userIdStr,
-            error: String(error)
           });
-        });
+      }, CALL_DISCONNECT_GRACE_MS);
+      releaseTimer.unref?.();
     }
   });
 };

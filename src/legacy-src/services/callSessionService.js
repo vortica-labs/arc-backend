@@ -59,6 +59,27 @@ const serializeCallSession = (session) => session ? {
   updatedAt: session.updatedAt
 } : null;
 
+const emitTerminalCallSession = (session, reason = '') => {
+  const io = global._arcSocketIO;
+  if (!session || !io?.to) return;
+
+  const terminalReason = bounded(reason, 80) || bounded(session.endReason, 80) || 'ended';
+  const terminalPayload = {
+    callId: session.callId,
+    nativeCallId: session.nativeCallId,
+    fromUserId: 'server',
+    reason: terminalReason
+  };
+  const serialized = serializeCallSession(session);
+  const participants = [...new Set([toId(session.caller), toId(session.callee)].filter(Boolean))];
+
+  for (const participantId of participants) {
+    const room = io.to(`user-${participantId}`);
+    room.emit('call-end', terminalPayload);
+    room.emit('call-session-updated', serialized);
+  }
+};
+
 const dispatchCallStatePushes = async (session, excludeInstallationId = '') => {
   if (!session?._id) return null;
   const expectedRevision = String(session.statePushRevision || '');
@@ -297,7 +318,7 @@ const expireCallSession = async (callId, now = new Date()) => {
     targetUserId: toId(session.callee),
     reason: 'timeout'
   });
-  io?.to?.(`user-${toId(session.callee)}`).emit('call-session-updated', serializeCallSession(session));
+  emitTerminalCallSession(session, 'timeout');
   void dispatchCallStatePushes(session).catch((error) => {
     log.error('Missed call-state reconciliation push failed', { callId: session.callId, error: String(error) });
   });
@@ -319,9 +340,7 @@ const expireActiveCallSession = async (callId, now = new Date()) => {
     { new: true }
   );
   if (!session) return null;
-  const io = global._arcSocketIO;
-  io?.to?.(`user-${toId(session.caller)}`).emit('call-session-updated', serializeCallSession(session));
-  io?.to?.(`user-${toId(session.callee)}`).emit('call-session-updated', serializeCallSession(session));
+  emitTerminalCallSession(session, 'max_duration');
   void dispatchCallStatePushes(session).catch((error) => {
     log.error('Expired active call-state push failed', { callId: session.callId, error: String(error) });
   });
@@ -477,25 +496,23 @@ const transitionCallSession = async ({ callId, actorId, action, reason = '', ins
   return updated;
 };
 
-// Release every still-leased 1:1 call session this user participates in. Called
-// when the user's realtime socket disconnects (tab close, refresh, network drop)
-// so a call that was never cleanly hung up does not keep its
+// Release every accepted 1:1 call session this user participates in. Ringing
+// sessions intentionally survive socket disconnects because CallKit / Android
+// push actions accept them over REST while the app has no realtime socket.
+// Called after a reconnect grace period so a call that was never cleanly hung
+// up does not keep its
 // `participantLeaseActive` lease until `activeUntil` (up to
 // MAX_CALL_DURATION_SECONDS, default 4h) and block the account's next call with
 // CALL_PARTICIPANT_BUSY → "A previous call is still active."
-const endLiveCallSessionsForUser = async (userId, reason = 'peer_disconnected') => {
+const endAcceptedCallSessionsForUser = async (userId, reason = 'peer_disconnected') => {
   const actorId = toId(userId);
   if (!actorId) return [];
   const now = new Date();
   const live = await CallSession.find({
     participantLeaseActive: true,
-    $and: [
-      { $or: [
-        { status: 'ringing', expiresAt: { $gt: now } },
-        { status: 'accepted', activeUntil: { $gt: now } }
-      ] },
-      { $or: [{ caller: actorId }, { callee: actorId }] }
-    ]
+    status: 'accepted',
+    activeUntil: { $gt: now },
+    $or: [{ caller: actorId }, { callee: actorId }]
   }).select('callId').lean();
 
   const ended = [];
@@ -602,6 +619,7 @@ module.exports = {
   CALL_RING_TTL_SECONDS,
   MAX_CALL_DURATION_SECONDS,
   serializeCallSession,
+  emitTerminalCallSession,
   createCallSession,
   expireCallSession,
   expireActiveCallSession,
@@ -610,7 +628,7 @@ module.exports = {
   getCallSessionForParticipant,
   getPendingCallSession,
   transitionCallSession,
-  endLiveCallSessionsForUser,
+  endAcceptedCallSessionsForUser,
   recoverCallStatePushes,
   startCallSessionSweeper,
   stopCallSessionSweeper

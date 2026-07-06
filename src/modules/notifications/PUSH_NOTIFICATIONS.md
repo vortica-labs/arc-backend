@@ -151,6 +151,7 @@ and never expose media credentials.
 - `PUSH_REQUEST_RECOVERY_MAX_ATTEMPTS` (default 5)
 - `NOTIFICATION_PUSH_OUTBOX_MAX_ATTEMPTS` (default 12)
 - `CALL_RING_TTL_SECONDS` (default 30)
+- `CALL_DISCONNECT_GRACE_MS` (default 30000; reconnect window before an accepted call is released)
 - `MAX_CALL_DURATION_SECONDS` (default 14400 / four hours)
 - `CALL_STATE_PUSH_MAX_ATTEMPTS` (default 12)
 - `INITIAL_VOIP_OUTBOX_MAX_ATTEMPTS` (default 5)

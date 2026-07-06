@@ -49,6 +49,7 @@ const envSchema = z.object({
   PUSH_REQUEST_RECOVERY_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(10).default(5),
   NOTIFICATION_PUSH_OUTBOX_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(50).default(12),
   CALL_RING_TTL_SECONDS: z.coerce.number().int().min(15).max(120).default(30),
+  CALL_DISCONNECT_GRACE_MS: z.coerce.number().int().min(1000).max(30000).default(30000),
   MAX_CALL_DURATION_SECONDS: z.coerce.number().int().min(300).max(86400).default(14400),
   CALL_STATE_PUSH_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(50).default(12),
   INITIAL_VOIP_OUTBOX_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(20).default(5),

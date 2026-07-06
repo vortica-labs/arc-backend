@@ -82,6 +82,21 @@ assert(socket.includes('callSessionService.createCallSession'));
 assert(socket.includes('callSessionService.transitionCallSession'));
 assert(socket.includes('"signal_forwarded"'), 'Socket signaling forwarding must expose diagnostics');
 assert(socket.includes('nativeCallId: durableSession.nativeCallId'));
+assert(socket.includes('endAcceptedCallSessionsForUser'), 'disconnect cleanup must only release accepted calls');
+assert(socket.includes('fetchSockets()'), 'disconnect cleanup must preserve calls owned by another user socket');
+assert(!socket.includes('endLiveCallSessionsForUser'), 'disconnect cleanup must not terminate native-push ringing calls');
+const acceptedDisconnectCleanup = service.slice(
+  service.indexOf('const endAcceptedCallSessionsForUser'),
+  service.indexOf('const recoverCallStatePushes')
+);
+assert(acceptedDisconnectCleanup.includes("status: 'accepted'"));
+assert(!acceptedDisconnectCleanup.includes("status: 'ringing'"));
+const groupCallRequestHandler = socket.slice(
+  socket.indexOf('socket.on("group-call-request"'),
+  socket.indexOf('socket.on("group-call-join"')
+);
+assert(groupCallRequestHandler.includes('socket.emit("group-call-joined"'), 'group initiator must receive its media-start acknowledgement');
+assert(socket.includes('(error as { code?: unknown })?.code'), 'socket call creation must preserve busy/conflict error codes');
 assert(!socketBootstrap.includes('registerCallSocketHandlers'), 'unsafe target-ID call relay must not be mounted beside durable signaling');
 assert(socketBootstrap.includes('registerLegacySocketHandlers'));
 assert(push.includes('nativeCallId: sanitizeString(customData.nativeCallId)'));
@@ -120,5 +135,11 @@ assert(migration.includes('...statePushMarker()'), 'migration-created terminal c
 assert(callController.includes("participantId does not match the durable call session"));
 assert(!callController.includes('Ending legacy call without durable session'));
 assert(callController.includes("'callSummary.callId': durableSession.callId"));
+for (const canonicalEvent of ["'call-request'", "'call-accept'", "'call-reject'", "'call-end'"]) {
+  assert(callController.includes(`emit(${canonicalEvent}`), `legacy REST calls must bridge ${canonicalEvent}`);
+}
+assert(callController.includes("emit('call-session-updated'"), 'legacy REST transitions must reconcile every device');
+assert(service.includes("emitTerminalCallSession(session, 'timeout')"), 'ring timeout must end the Web call UI');
+assert(service.includes("emitTerminalCallSession(session, 'max_duration')"), 'max duration must end the Web call UI');
 
 console.log('Durable call-session contracts passed');
