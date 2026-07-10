@@ -3,6 +3,7 @@ const { body } = require('express-validator');
 const { protect, optionalAuth } = require('../middleware/auth');
 const { uploadFields } = require('../middleware/upload');
 const { handleValidationErrors } = require('../middleware/validation');
+const { validateAchievementPostBody } = require('../utils/achievementPostPolicy');
 const {
   createPost,
   getPosts,
@@ -47,7 +48,12 @@ const createPostValidation = [
   body('visibility')
     .optional()
     .isIn(['public', 'followers', 'private'])
-    .withMessage('Invalid visibility setting')
+    .withMessage('Invalid visibility setting'),
+  body().custom((_, { req }) => {
+    const validationError = validateAchievementPostBody(req.body);
+    if (validationError) throw new Error(validationError);
+    return true;
+  })
 ];
 
 const updatePostValidation = [
