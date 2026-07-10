@@ -40,6 +40,67 @@ const decryptOptional = (bank, encryptedField, legacyField) => (
 );
 const BANK_OWNER_SENSITIVE_SELECT = '+taxIdHash +upiId +upiIdEncrypted +paypalEmail +paypalEmailEncrypted +gstNumber +gstNumberEncrypted';
 
+// Only errors deliberately created by this controller may control a public
+// status/message. Database/driver errors sometimes expose `code`, `statusCode`,
+// or sensitive infrastructure text, so never reflect their message directly.
+const PUBLIC_MONETIZATION_ERRORS = Object.freeze({
+  CREATOR_NOT_APPROVED: Object.freeze({
+    status: 403,
+    message: 'Only approved creators can submit withdrawal requests.'
+  }),
+  VERIFIED_BANK_DETAILS_REQUIRED: Object.freeze({
+    status: 409,
+    message: 'Bank details must be verified before submitting a withdrawal request.'
+  }),
+  BANK_DETAILS_NOT_FOUND: Object.freeze({
+    status: 404,
+    message: 'Bank details not found.'
+  }),
+  STALE_BANK_DETAILS: Object.freeze({
+    status: 409,
+    message: 'Bank details changed. Refresh and try again.'
+  }),
+  BANK_DETAILS_LOCKED_FOR_PAYOUT: Object.freeze({
+    status: 409,
+    message: 'Bank details cannot be changed while a payout or withdrawal is pending or processing.'
+  }),
+  PAYOUT_ON_HOLD: Object.freeze({
+    status: 409,
+    message: 'Your creator payout is currently on hold and cannot be withdrawn.'
+  }),
+  EARNINGS_CYCLE_NOT_FINALIZED: Object.freeze({
+    status: 409,
+    message: 'Current-cycle earnings cannot be withdrawn until the cycle is finalized.'
+  }),
+  MINIMUM_WITHDRAWAL_NOT_MET: Object.freeze({
+    status: 422,
+    message: 'Finalized earnings are below the payout threshold and will carry forward.'
+  }),
+  NO_FINALIZED_EARNINGS: Object.freeze({
+    status: 409,
+    message: 'No finalized, unreserved earnings are available for withdrawal.'
+  }),
+  DUPLICATE_WITHDRAWAL_REQUEST: Object.freeze({
+    status: 409,
+    message: 'A withdrawal request for this cycle already exists.'
+  }),
+  DISBURSEMENT_ALREADY_RESERVED: Object.freeze({
+    status: 409,
+    message: 'A payout or withdrawal is already reserved for this earnings cycle.'
+  }),
+  EARNINGS_NO_LONGER_AVAILABLE: Object.freeze({
+    status: 409,
+    message: 'These earnings are no longer available for withdrawal.'
+  })
+});
+
+const sendPublicMonetizationError = (res, code) => {
+  const response = PUBLIC_MONETIZATION_ERRORS[code];
+  if (!response) return false;
+  res.status(response.status).json({ success: false, code, message: response.message });
+  return true;
+};
+
 function maskBankDetails(bank) {
   if (!bank) return null;
   const verificationStatus = bank.verificationStatus === 'failed' ? 'rejected' : bank.verificationStatus;
@@ -681,10 +742,12 @@ async function upsertBankDetails(req, res) {
       }, FINANCIAL_TRANSACTION_OPTIONS);
     } catch (error) {
       if (error?.code === 11000 || error?.code === 'STALE_BANK_DETAILS') {
-        return res.status(409).json({ success: false, code: 'STALE_BANK_DETAILS', message: error.message || 'Bank details changed. Refresh and try again.' });
+        sendPublicMonetizationError(res, 'STALE_BANK_DETAILS');
+        return;
       }
       if (error?.code === 'BANK_DETAILS_LOCKED_FOR_PAYOUT') {
-        return res.status(409).json({ success: false, code: error.code, message: error.message });
+        sendPublicMonetizationError(res, 'BANK_DETAILS_LOCKED_FOR_PAYOUT');
+        return;
       }
       throw error;
     } finally {
@@ -751,7 +814,8 @@ async function deleteBankDetails(req, res) {
       }, FINANCIAL_TRANSACTION_OPTIONS);
     } catch (error) {
       if (error?.code === 'STALE_BANK_DETAILS' || error?.code === 'BANK_DETAILS_LOCKED_FOR_PAYOUT') {
-        return res.status(409).json({ success: false, code: error.code, message: error.message });
+        sendPublicMonetizationError(res, error.code);
+        return;
       }
       throw error;
     } finally {
@@ -827,9 +891,13 @@ async function deleteBankTaxId(req, res) {
         });
       }, FINANCIAL_TRANSACTION_OPTIONS);
     } catch (error) {
-      if (error?.code === 'BANK_DETAILS_NOT_FOUND') return res.status(404).json({ success: false, code: error.code, message: error.message });
+      if (error?.code === 'BANK_DETAILS_NOT_FOUND') {
+        sendPublicMonetizationError(res, 'BANK_DETAILS_NOT_FOUND');
+        return;
+      }
       if (error?.code === 'STALE_BANK_DETAILS' || error?.code === 'BANK_DETAILS_LOCKED_FOR_PAYOUT') {
-        return res.status(409).json({ success: false, code: error.code, message: error.message });
+        sendPublicMonetizationError(res, error.code);
+        return;
       }
       throw error;
     } finally {
@@ -917,7 +985,7 @@ async function submitWithdrawalRequest(req, res) {
       await session.withTransaction(async () => {
         const user = await User.findById(userId).select('isCreator creatorMonetizationStatus').session(session).lean();
         if (!user?.isCreator || user.creatorMonetizationStatus !== 'approved') {
-          throw Object.assign(new Error('Only approved creators can submit withdrawal requests.'), { statusCode: 403 });
+          throw Object.assign(new Error('Creator is not approved.'), { code: 'CREATOR_NOT_APPROVED' });
         }
         const bank = await CreatorBankDetails.findOne({ user: userId, verificationStatus: 'verified' })
           .select('accountHolderName bankName lastFourDigits ifsc swiftCode branch country version activePayoutLocks activeWithdrawalLocks')
@@ -1074,10 +1142,11 @@ async function submitWithdrawalRequest(req, res) {
     });
   } catch (err) {
     if (err?.code === 11000) {
-      return res.status(409).json({ success: false, code: 'DISBURSEMENT_ALREADY_RESERVED', message: 'A payout or withdrawal is already reserved for this earnings cycle.' });
+      sendPublicMonetizationError(res, 'DISBURSEMENT_ALREADY_RESERVED');
+      return;
     }
-    if (err?.statusCode) {
-      return res.status(err.statusCode).json({ success: false, code: err.code, message: err.message });
+    if (sendPublicMonetizationError(res, err?.code)) {
+      return;
     }
     return sendInternalError({
       res,

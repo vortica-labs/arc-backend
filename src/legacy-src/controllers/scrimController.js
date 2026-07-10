@@ -7,11 +7,15 @@ const log = require('../utils/logger');
 const { sanitizePublicScrim } = require('../utils/tournamentPublicDto');
 const { normalizePagination } = require('../utils/pagination');
 const { normalizeQuerySearch, escapeRegex } = require('../utils/searchQuery');
+const { getTimezoneDayBounds } = require('../utils/timezoneDayBounds');
 
 const uniqueRecipientIds = (values = []) =>
-  Array.from(new Set(values.map((value) => String(value?._id || value)).filter(Boolean)));
+  Array.from(new Set((Array.isArray(values) ? values : [])
+    .map((value) => idString(value))
+    .filter(Boolean)));
 
 const idString = (value) => String(value?._id || value || '');
+const scrimParticipants = (scrim) => (Array.isArray(scrim?.registeredTeams) ? scrim.registeredTeams : []);
 
 const SCRIM_MATCH_COUNTS = Object.freeze([1, 2, 3, 4, 5, 6]);
 const SCRIM_TYPES = new Set(['Daily', 'Weekly']);
@@ -25,6 +29,37 @@ const TIME_OF_DAY_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const DEFAULT_SCRIM_TIMEZONE = 'Asia/Kolkata';
 const MAX_BROADCAST_MESSAGE_LENGTH = 2000;
+const SCRIM_CODE_PATTERN = /^SCR-BGM-[A-F0-9]{8}$/i;
+const SCRIM_EDITABLE_FIELDS = new Set([
+  'name',
+  'description',
+  'date',
+  'endDate',
+  'maxTeams',
+  'timezone',
+  'matches',
+  'prizePool',
+  'prizePoolType',
+  'prizePoolCurrency',
+  'prizeDistribution',
+  'specialPrizes'
+]);
+
+const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value || {}, key);
+
+const isValidScrimIdentifier = (value) => {
+  if (typeof value !== 'string' || !value.trim()) return false;
+  const normalized = value.trim();
+  return mongoose.Types.ObjectId.isValid(normalized) || SCRIM_CODE_PATTERN.test(normalized);
+};
+
+const validateScrimIdentifierParam = (req, res, next, value, name) => {
+  if (!isValidScrimIdentifier(value)) {
+    return res.status(400).json({ success: false, message: 'Invalid scrim identifier' });
+  }
+  req.params[name] = String(value).trim();
+  return next();
+};
 
 const normalizeScrimPrizes = ({ prizeDistribution = [], specialPrizes = [], prizePool = 0 }) => {
   if (!Array.isArray(prizeDistribution) || !Array.isArray(specialPrizes)) {
@@ -43,9 +78,7 @@ const normalizeScrimPrizes = ({ prizeDistribution = [], specialPrizes = [], priz
   }));
   const special = specialPrizes.map((entry) => ({
     category: typeof entry.category === 'string' ? entry.category.trim().slice(0, 120) : '',
-    amount: Number(entry.amount || 0),
-    ...(entry.winnerId ? { winnerId: entry.winnerId } : {}),
-    ...(entry.winnerName ? { winnerName: String(entry.winnerName).slice(0, 120) } : {})
+    amount: Number(entry.amount || 0)
   }));
   const ranks = distribution.map((entry) => entry.rank);
   const categories = special.map((entry) => entry.category.toLowerCase());
@@ -59,6 +92,38 @@ const normalizeScrimPrizes = ({ prizeDistribution = [], specialPrizes = [], priz
     return { error: 'Invalid or over-budget prize distribution' };
   }
   return { value: { prizeDistribution: distribution, specialPrizes: special } };
+};
+
+const preserveSpecialPrizeWinners = (existingPrizes = [], normalizedPrizes = []) => (
+  (Array.isArray(normalizedPrizes) ? normalizedPrizes : []).map((prize) => {
+    const existing = (Array.isArray(existingPrizes) ? existingPrizes : [])
+      .find((entry) => String(entry?.category || '').trim().toLowerCase()
+        === String(prize?.category || '').trim().toLowerCase());
+    return {
+      category: prize.category,
+      amount: prize.amount,
+      ...(existing?.winnerId ? { winnerId: existing.winnerId } : {}),
+      ...(existing?.winnerName ? { winnerName: String(existing.winnerName).slice(0, 120) } : {})
+    };
+  })
+);
+
+const scrimPrizeConfigurationFingerprint = (value = {}) => {
+  const prizePoolType = value.prizePoolType === 'no_prize'
+    ? 'without_prize'
+    : (value.prizePoolType || 'without_prize');
+  const prizePool = prizePoolType === 'with_prize' ? Number(value.prizePool || 0) : 0;
+  const prizes = normalizeScrimPrizes({
+    prizeDistribution: prizePoolType === 'with_prize' ? (value.prizeDistribution || []) : [],
+    specialPrizes: prizePoolType === 'with_prize' ? (value.specialPrizes || []) : [],
+    prizePool
+  });
+  return JSON.stringify({
+    prizePoolType,
+    prizePool,
+    prizePoolCurrency: String(value.prizePoolCurrency || 'INR').toUpperCase(),
+    prizes: prizes.value || { invalid: prizes.error }
+  });
 };
 
 const DAILY_TIME_SLOTS_BY_MATCH_COUNT = Object.freeze({
@@ -140,7 +205,7 @@ const validateScrimCreationInput = (payload = {}, options = {}) => {
   if (!parsedDate) return { error: 'A valid scrim date is required' };
   const scrimDateKey = parsedDate.dateKey || dateKeyInTimeZone(parsedDate.date, timezone);
   const todayKey = dateKeyInTimeZone(now, timezone);
-  if (scrimDateKey < todayKey) return { error: 'Scrim date cannot be in the past' };
+  if (!options.allowPastDate && scrimDateKey < todayKey) return { error: 'Scrim date cannot be in the past' };
 
   let endDate = null;
   if (scrimType === 'Weekly') {
@@ -221,6 +286,135 @@ const validateScrimCreationInput = (payload = {}, options = {}) => {
   };
 };
 
+/**
+ * Validate an edit against the same canonical contract used for creation.
+ *
+ * The edit endpoint is intentionally partial, so the persisted values are
+ * merged before validation. Workflow-owned match fields (status/results) are
+ * retained server-side and cannot be overwritten through the configuration
+ * payload. This also keeps legacy scrims with an unchanged historical date
+ * editable without permitting a new past date.
+ */
+const validateScrimUpdateInput = (scrim, payload = {}, options = {}) => {
+  if (!scrim || !payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return { error: 'A valid scrim update payload is required' };
+  }
+
+  const suppliedFields = Object.keys(payload).filter((field) => SCRIM_EDITABLE_FIELDS.has(field));
+  if (suppliedFields.length === 0) return { error: 'No supported scrim fields were provided' };
+
+  const existingMatches = Array.isArray(scrim.matches) ? scrim.matches : [];
+  const requestedMatches = hasOwn(payload, 'matches') ? payload.matches : existingMatches;
+  const requestedPrizePoolType = hasOwn(payload, 'prizePoolType') ? payload.prizePoolType : scrim.prizePoolType;
+  const disablingPrizePool = ['without_prize', 'no_prize'].includes(requestedPrizePoolType);
+  const comparisonTimezone = typeof (hasOwn(payload, 'timezone') ? payload.timezone : scrim.timezone) === 'string'
+    && isSupportedTimeZone(hasOwn(payload, 'timezone') ? payload.timezone : scrim.timezone)
+    ? (hasOwn(payload, 'timezone') ? payload.timezone : scrim.timezone)
+    : DEFAULT_SCRIM_TIMEZONE;
+  const suppliedDate = hasOwn(payload, 'date') ? parseScrimDate(payload.date) : null;
+  const persistedDate = parseScrimDate(scrim.date);
+  const suppliedDateMatchesPersisted = Boolean(suppliedDate && persistedDate)
+    && (suppliedDate.dateKey || dateKeyInTimeZone(suppliedDate.date, comparisonTimezone))
+      === (persistedDate.dateKey || dateKeyInTimeZone(persistedDate.date, comparisonTimezone));
+  const mergedPayload = {
+    name: hasOwn(payload, 'name') ? payload.name : scrim.name,
+    description: hasOwn(payload, 'description') ? payload.description : scrim.description,
+    scrimType: scrim.scrimType,
+    format: scrim.format,
+    timeSlot: scrim.timeSlot,
+    numberOfMatches: scrim.numberOfMatches,
+    date: hasOwn(payload, 'date') ? payload.date : scrim.date,
+    endDate: hasOwn(payload, 'endDate') ? payload.endDate : scrim.endDate,
+    maxTeams: hasOwn(payload, 'maxTeams') ? payload.maxTeams : scrim.maxTeams,
+    timezone: hasOwn(payload, 'timezone') ? payload.timezone : scrim.timezone,
+    prizePoolType: requestedPrizePoolType,
+    prizePool: disablingPrizePool ? 0 : (hasOwn(payload, 'prizePool') ? payload.prizePool : scrim.prizePool),
+    prizePoolCurrency: hasOwn(payload, 'prizePoolCurrency') ? payload.prizePoolCurrency : scrim.prizePoolCurrency,
+    prizeDistribution: disablingPrizePool ? [] : (hasOwn(payload, 'prizeDistribution') ? payload.prizeDistribution : scrim.prizeDistribution),
+    specialPrizes: disablingPrizePool ? [] : (hasOwn(payload, 'specialPrizes') ? payload.specialPrizes : scrim.specialPrizes),
+    matches: Array.isArray(requestedMatches)
+      ? requestedMatches.map((match) => ({
+          matchNumber: match?.matchNumber,
+          map: match?.map,
+          idpTime: match?.idpTime,
+          startTime: match?.startTime
+        }))
+      : requestedMatches
+  };
+
+  const validation = validateScrimCreationInput(mergedPayload, {
+    ...options,
+    // Unchanged legacy dates remain idempotently editable even when a client
+    // echoes the full persisted form. A newly changed past date is rejected.
+    allowPastDate: !hasOwn(payload, 'date') || suppliedDateMatchesPersisted
+  });
+  if (validation.error) return validation;
+
+  const registeredCount = Array.isArray(scrim.registeredTeams) ? scrim.registeredTeams.length : 0;
+  if (validation.value.maxTeams < registeredCount) {
+    return { error: `Maximum teams cannot be lower than the ${registeredCount} registered participants` };
+  }
+
+  const normalized = validation.value;
+  const updates = {};
+  if (hasOwn(payload, 'name')) updates.name = normalized.name;
+  if (hasOwn(payload, 'description')) updates.description = String(payload.description || '');
+  if (hasOwn(payload, 'date')) updates.date = normalized.date;
+  if (hasOwn(payload, 'endDate')) updates.endDate = normalized.endDate;
+  if (hasOwn(payload, 'maxTeams')) updates.maxTeams = normalized.maxTeams;
+  if (hasOwn(payload, 'timezone')) updates.timezone = normalized.timezone;
+  if (hasOwn(payload, 'prizePool')) updates.prizePool = normalized.prizePool;
+  if (hasOwn(payload, 'prizePoolType')) {
+    updates.prizePoolType = normalized.prizePoolType;
+    if (normalized.prizePoolType === 'without_prize') {
+      updates.prizePool = 0;
+      updates.prizeDistribution = [];
+      updates.specialPrizes = [];
+    }
+  }
+  if (hasOwn(payload, 'prizePoolCurrency')) updates.prizePoolCurrency = normalized.prizePoolCurrency;
+  if (hasOwn(payload, 'prizeDistribution')) updates.prizeDistribution = normalized.prizeDistribution;
+  if (hasOwn(payload, 'specialPrizes')) {
+    updates.specialPrizes = preserveSpecialPrizeWinners(scrim.specialPrizes, normalized.specialPrizes);
+  }
+  if (hasOwn(payload, 'matches')) {
+    updates.matches = normalized.matches.map((match) => {
+      const existing = existingMatches.find((entry) => Number(entry?.matchNumber) === match.matchNumber);
+      return {
+        ...match,
+        status: existing?.status || 'Scheduled',
+        results: existing?.results?.toObject?.() || existing?.results || { teams: [], submittedAt: null }
+      };
+    });
+  }
+
+  return { value: updates, normalized };
+};
+
+const scrimCapacityArrayPath = (maxTeams) => `registeredTeams.${Math.max(0, Number(maxTeams) - 1)}`;
+
+// A classic modifier update is mandatory here: production runs on Amazon
+// DocumentDB, which rejects aggregation-pipeline updates passed as an array.
+const buildScrimJoinAdmission = ({ scrimId, userId, maxTeams }) => ({
+  filter: {
+    _id: scrimId,
+    host: { $ne: userId },
+    status: 'Open',
+    maxTeams,
+    $and: [
+      { registeredTeams: { $ne: userId } },
+      {
+        $or: [
+          { registeredTeams: { $exists: false } },
+          { registeredTeams: { $type: 'array' } }
+        ]
+      }
+    ],
+    [scrimCapacityArrayPath(maxTeams)]: { $exists: false }
+  },
+  update: { $addToSet: { registeredTeams: userId } }
+});
+
 const validateScrimResultInput = (teams, registeredParticipants) => {
   const registeredIds = uniqueRecipientIds(registeredParticipants);
   if (registeredIds.length === 0) return { error: 'Cannot submit results without registered participants' };
@@ -262,6 +456,13 @@ const hasSubmittedResultsForEveryMatch = (matches) => (
   ))
 );
 
+const advanceScrimStatusForResult = (scrim) => {
+  if (scrim && (scrim.status === 'Open' || scrim.status === 'Full')) {
+    scrim.status = 'In Progress';
+  }
+  return scrim?.status;
+};
+
 const refreshScrimFinalResult = (scrim, generatedAt = new Date()) => {
   const standings = (scrim.overallStandings?.teams || []).map((entry, index) => {
     const team = typeof entry?.toObject === 'function' ? entry.toObject() : { ...entry };
@@ -285,7 +486,9 @@ const canReadScrimBroadcasts = async (scrim, userId) => {
   const viewerId = idString(userId);
   if (!viewerId || !scrim) return false;
   if (idString(scrim.host) === viewerId) return true;
-  const participantIds = (scrim.registeredTeams || []).map(idString).filter(Boolean);
+  const participantIds = (Array.isArray(scrim.registeredTeams) ? scrim.registeredTeams : [])
+    .map(idString)
+    .filter(Boolean);
   if (participantIds.includes(viewerId)) return true;
   return Boolean(await User.exists({
     _id: { $in: participantIds },
@@ -306,8 +509,37 @@ const canReadScrimBroadcasts = async (scrim, userId) => {
   }));
 };
 
+const expandScrimRecipientIds = async (values = []) => {
+  const recipientIds = uniqueRecipientIds(values);
+  if (recipientIds.length === 0) return [];
+  try {
+    const registeredTeams = await User.find({
+      _id: { $in: recipientIds },
+      userType: 'team',
+      isActive: true
+    }).select('teamInfo.members.user teamInfo.rosters.players teamInfo.rosters.isActive teamInfo.staff').lean();
+    return uniqueRecipientIds([
+      ...recipientIds,
+      ...registeredTeams.flatMap((team) => [
+        ...(team.teamInfo?.members || []).map((member) => member.user),
+        ...(team.teamInfo?.rosters || [])
+          .filter((roster) => roster.isActive !== false)
+          .flatMap((roster) => (roster.players || [])
+            .filter((player) => player.isActive !== false && !player.leftAt)
+            .map((player) => player.user)),
+        ...(team.teamInfo?.staff || [])
+          .filter((staff) => staff.isActive !== false && !staff.leftAt)
+          .map((staff) => staff.user)
+      ])
+    ]);
+  } catch (error) {
+    log.error('Failed to expand Scrim team recipients', { error: String(error) });
+    return recipientIds;
+  }
+};
+
 const notifyScrimRecipients = async ({ scrim, recipients, sender, title, message, eventType, revision, extraData = {} }) => {
-  const recipientIds = uniqueRecipientIds(recipients);
+  const recipientIds = await expandScrimRecipientIds(recipients);
   if (recipientIds.length === 0) return [];
   const dedupeKey = `scrim:${scrim._id}:${eventType}:${String(revision || scrim.updatedAt || '').slice(0, 80)}`;
   const results = await Promise.allSettled(recipientIds.map((recipient) => (
@@ -356,17 +588,21 @@ const findScrimByIdOrCode = async (idOrCode) => {
 // Create new scrim
 const createScrim = async (req, res) => {
   try {
-    const { description } = req.body;
+    const payload = req.body && typeof req.body === 'object' ? req.body : {};
+    const { description } = payload;
 
     const hostId = req.user._id;
 
-    const validation = validateScrimCreationInput(req.body);
+    const validation = validateScrimCreationInput(payload);
     if (validation.error) {
       return res.status(400).json({ success: false, message: validation.error });
     }
     const normalized = validation.value;
 
     const host = await User.findById(hostId).select('isVerifiedHost').lean();
+    if (!host) {
+      return res.status(401).json({ success: false, message: 'Host account is unavailable' });
+    }
     const isVerifiedHost = host?.isVerifiedHost === true;
 
     // Enforce isVerifiedHost for prize pool scrims
@@ -379,21 +615,18 @@ const createScrim = async (req, res) => {
 
     // ── Daily limit for unverified hosts (5 scrims per day) ──
     if (!isVerifiedHost) {
-      const startOfDay = new Date();
-      startOfDay.setHours(0, 0, 0, 0);
-      const Scrim = require('../models/Scrim');
+      const { start: startOfDay, end: nextDay } = getTimezoneDayBounds(DEFAULT_SCRIM_TIMEZONE);
       const todayCount = await Scrim.countDocuments({
         host: hostId,
-        createdAt: { $gte: startOfDay }
+        createdAt: { $gte: startOfDay, $lt: nextDay }
       });
 
       if (todayCount >= 5) {
-        const tomorrow = new Date(startOfDay.getTime() + 24 * 60 * 60 * 1000);
         return res.status(429).json({
           success: false,
           message: 'Daily scrim limit reached (5/day).',
           limitType: 'scrim_daily',
-          nextAllowedAt: tomorrow.toISOString(),
+          nextAllowedAt: nextDay.toISOString(),
           upgradeMessage: 'Get Verified Host status to host unlimited scrims.'
         });
       }
@@ -439,7 +672,14 @@ const createScrim = async (req, res) => {
     const scrim = await Scrim.create(scrimData);
 
     // Populate host info
-    await scrim.populate('host', 'username userType profile.displayName profile.avatar');
+    try {
+      await scrim.populate('host', 'username userType profile.displayName profile.avatar');
+    } catch (populateError) {
+      log.error('Scrim created but host population failed', {
+        error: String(populateError),
+        scrimId: idString(scrim._id)
+      });
+    }
 
     res.status(201).json({
       success: true,
@@ -545,14 +785,21 @@ const getScrims = async (req, res) => {
       
       if (scrim.date < now && scrim.status !== 'Completed' && scrim.status !== 'Cancelled') {
         // Check if all matches are completed
-        const allMatchesCompleted = scrim.matches.every(match => 
+        const persistedMatches = Array.isArray(scrim.matches) ? scrim.matches : [];
+        const allMatchesCompleted = persistedMatches.length > 0 && persistedMatches.every(match =>
           match.status === 'Completed' || match.results?.submittedAt
         );
-        
+
         if (allMatchesCompleted) {
-          scrim.status = 'Completed';
-          await scrim.save();
-          scrimsToUpdate.push(scrim._id);
+          const completed = await Scrim.updateOne(
+            { _id: scrim._id, status: beforeStatus },
+            { $set: { status: 'Completed' } },
+            { runValidators: true }
+          );
+          if (Number(completed?.modifiedCount || completed?.nModified || 0) > 0) {
+            scrim.status = 'Completed';
+            scrimsToUpdate.push(scrim._id);
+          }
         }
       }
     }
@@ -670,7 +917,7 @@ const joinScrim = async (req, res) => {
     }
 
     // Check if user is already registered
-    if ((scrim.registeredTeams || []).some((participant) => idString(participant) === idString(userId))) {
+    if (scrimParticipants(scrim).some((participant) => idString(participant) === idString(userId))) {
       return res.status(400).json({
         success: false,
         message: 'You are already registered for this scrim'
@@ -678,8 +925,15 @@ const joinScrim = async (req, res) => {
     }
 
     // Check if scrim is full
-    if (scrim.registeredTeams.length >= scrim.maxTeams) {
-      await Scrim.updateOne({ _id: scrim._id, status: 'Open' }, { $set: { status: 'Full' } });
+    if (scrimParticipants(scrim).length >= scrim.maxTeams) {
+      try {
+        await Scrim.updateOne({ _id: scrim._id, status: 'Open' }, { $set: { status: 'Full' } });
+      } catch (statusError) {
+        log.error('Failed to reconcile full Scrim status', {
+          error: String(statusError),
+          scrimId: idString(scrim._id)
+        });
+      }
       return res.status(400).json({
         success: false,
         message: 'Scrim is full'
@@ -687,11 +941,14 @@ const joinScrim = async (req, res) => {
     }
 
     // Format-based join validation
-    const joiningUser = await User.findById(userId).select('userType');
+    const joiningUser = await User.findById(userId).select('userType isActive moderationStatus');
+    if (!joiningUser || joiningUser.isActive === false || ['banned', 'soft_deleted'].includes(joiningUser.moderationStatus)) {
+      return res.status(403).json({ success: false, message: 'Your account is not eligible to join scrims' });
+    }
     
     if (scrim.format === 'Squad') {
       // Squad scrims: only teams can join
-      if (!joiningUser || joiningUser.userType !== 'team') {
+      if (joiningUser.userType !== 'team') {
         return res.status(400).json({
           success: false,
           message: 'Only teams can join Squad scrims. Please use a team account.'
@@ -700,57 +957,68 @@ const joinScrim = async (req, res) => {
     }
     // Solo scrims: both players and teams can join (no restriction)
 
-    // Capacity and duplicate admission are one database command. Concurrent
-    // requests for the final slot cannot both pass the $expr guard.
+    // Capacity and duplicate admission are one classic modifier command.
+    // Amazon DocumentDB rejects aggregation-pipeline updates (array updates),
+    // while this positional existence guard remains atomic and compatible.
+    const admission = buildScrimJoinAdmission({
+      scrimId: scrim._id,
+      userId,
+      maxTeams: scrim.maxTeams
+    });
     const joinedScrim = await Scrim.findOneAndUpdate(
-      {
-        _id: scrim._id,
-        host: { $ne: userId },
-        status: 'Open',
-        registeredTeams: { $ne: userId },
-        $expr: {
-          $lt: [
-            { $size: { $ifNull: ['$registeredTeams', []] } },
-            '$maxTeams'
-          ]
-        }
-      },
-      [
-        {
-          $set: {
-            registeredTeams: {
-              $concatArrays: [{ $ifNull: ['$registeredTeams', []] }, [userId]]
-            }
-          }
-        },
-        {
-          $set: {
-            status: {
-              $cond: [
-                { $gte: [{ $size: '$registeredTeams' }, '$maxTeams'] },
-                'Full',
-                '$status'
-              ]
-            }
-          }
-        }
-      ],
-      { new: true }
+      admission.filter,
+      admission.update,
+      { new: true, runValidators: true }
     );
 
     if (!joinedScrim) {
       const latest = await Scrim.findById(scrim._id).select('host status registeredTeams maxTeams');
       if (!latest) return res.status(404).json({ success: false, message: 'Scrim not found' });
-      if ((latest.registeredTeams || []).some((participant) => idString(participant) === idString(userId))) {
+      if (scrimParticipants(latest).some((participant) => idString(participant) === idString(userId))) {
         return res.status(400).json({ success: false, message: 'You are already registered for this scrim' });
       }
-      if (latest.status === 'Full' || latest.registeredTeams.length >= latest.maxTeams) {
+      if (latest.status === 'Full' || scrimParticipants(latest).length >= latest.maxTeams) {
         if (latest.status === 'Open') {
-          await Scrim.updateOne({ _id: latest._id, status: 'Open' }, { $set: { status: 'Full' } });
+          try {
+            await Scrim.updateOne({ _id: latest._id, status: 'Open' }, { $set: { status: 'Full' } });
+          } catch (statusError) {
+            log.error('Failed to reconcile concurrently full Scrim status', {
+              error: String(statusError),
+              scrimId: idString(latest._id)
+            });
+          }
         }
         return res.status(400).json({ success: false, message: 'Scrim is full' });
       }
       return res.status(409).json({ success: false, message: 'Scrim registration changed. Please try again.' });
+    }
+
+    // Classic modifiers cannot derive another field from the post-update array.
+    // Marking the exact-capacity document Full is therefore a second guarded
+    // command. A concurrent leave makes the guard false and safely keeps it Open.
+    if (scrimParticipants(joinedScrim).length >= joinedScrim.maxTeams) {
+      try {
+        const fullResult = await Scrim.updateOne(
+          {
+            _id: joinedScrim._id,
+            status: 'Open',
+            maxTeams: joinedScrim.maxTeams,
+            [scrimCapacityArrayPath(joinedScrim.maxTeams)]: { $exists: true }
+          },
+          { $set: { status: 'Full' } },
+          { runValidators: true }
+        );
+        if (Number(fullResult?.modifiedCount || fullResult?.nModified || 0) > 0) {
+          joinedScrim.status = 'Full';
+        }
+      } catch (statusError) {
+        // Registration already committed. Do not report a false failure; the
+        // admission capacity guard still prevents a seventeenth participant.
+        log.error('Scrim joined but Full status reconciliation failed', {
+          error: String(statusError),
+          scrimId: idString(joinedScrim._id)
+        });
+      }
     }
 
     await notifyScrimRecipients({
@@ -764,14 +1032,24 @@ const joinScrim = async (req, res) => {
       extraData: { participantId: userId }
     });
 
-    // Populate team info
-    await joinedScrim.populate('registeredTeams', 'username userType profile.displayName profile.avatar');
+    let joinResponseScrim = joinedScrim;
+    try {
+      await joinedScrim.populate('registeredTeams', 'username userType profile.displayName profile.avatar');
+    } catch (populateError) {
+      // Admission is already durable. Optional response enrichment must never
+      // turn a successful registration into a reported 500.
+      log.error('Scrim joined but participant population failed', {
+        error: String(populateError),
+        scrimId: idString(joinedScrim._id)
+      });
+      joinResponseScrim = sanitizePublicScrim(joinedScrim);
+    }
 
     res.status(200).json({
       success: true,
       message: 'Successfully joined scrim',
       data: {
-        scrim: joinedScrim
+        scrim: joinResponseScrim
       }
     });
   } catch (error) {
@@ -798,47 +1076,97 @@ const leaveScrim = async (req, res) => {
 
     const userId = req.user._id;
 
+    if (scrim.status !== 'Open' && scrim.status !== 'Full') {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot leave scrim. Current status: ${scrim.status}`
+      });
+    }
+
     // Check if user is registered
-    if (!(scrim.registeredTeams || []).some((participant) => idString(participant) === idString(userId))) {
+    if (!scrimParticipants(scrim).some((participant) => idString(participant) === idString(userId))) {
       return res.status(400).json({
         success: false,
         message: 'You are not registered for this scrim'
       });
     }
 
-    // Remove user from registered teams
-    scrim.registeredTeams = scrim.registeredTeams.filter(
-      teamId => teamId.toString() !== userId.toString()
+    // Do not save a stale hydrated participant array: a concurrent join would
+    // otherwise be overwritten. $pull is atomic and DocumentDB-compatible.
+    const leftScrim = await Scrim.findOneAndUpdate(
+      {
+        _id: scrim._id,
+        status: { $in: ['Open', 'Full'] },
+        registeredTeams: userId
+      },
+      { $pull: { registeredTeams: userId } },
+      { new: true, runValidators: true }
     );
-
-    // Update status if not full anymore
-    if (scrim.status === 'Full' && scrim.registeredTeams.length < scrim.maxTeams) {
-      scrim.status = 'Open';
+    if (!leftScrim) {
+      const latest = await Scrim.findById(scrim._id).select('status registeredTeams');
+      if (!latest) return res.status(404).json({ success: false, message: 'Scrim not found' });
+      if (!scrimParticipants(latest).some((participant) => idString(participant) === idString(userId))) {
+        return res.status(400).json({ success: false, message: 'You are not registered for this scrim' });
+      }
+      return res.status(409).json({ success: false, message: 'Scrim registration changed. Please try again.' });
     }
 
-    await scrim.save();
+    if (leftScrim.status === 'Full') {
+      try {
+        const reopenResult = await Scrim.updateOne(
+          {
+            _id: leftScrim._id,
+            status: 'Full',
+            maxTeams: leftScrim.maxTeams,
+            [scrimCapacityArrayPath(leftScrim.maxTeams)]: { $exists: false }
+          },
+          { $set: { status: 'Open' } },
+          { runValidators: true }
+        );
+        if (Number(reopenResult?.modifiedCount || reopenResult?.nModified || 0) > 0) {
+          leftScrim.status = 'Open';
+        }
+      } catch (statusError) {
+        // The participant removal is already durable; return success and let a
+        // later guarded reconciliation reopen registration.
+        log.error('Scrim left but Open status reconciliation failed', {
+          error: String(statusError),
+          scrimId: idString(leftScrim._id)
+        });
+      }
+    }
 
-    if (String(scrim.host) !== String(userId)) {
+    if (String(leftScrim.host) !== String(userId)) {
       await notifyScrimRecipients({
-        scrim,
-        recipients: [scrim.host],
+        scrim: leftScrim,
+        recipients: [leftScrim.host],
         sender: userId,
         title: 'Scrim Registration Withdrawn',
-        message: `${req.user.profile?.displayName || req.user.username} left "${scrim.name}"`,
+        message: `${req.user.profile?.displayName || req.user.username} left "${leftScrim.name}"`,
         eventType: 'scrim_registration_left',
-        revision: scrim.updatedAt,
+        revision: leftScrim.updatedAt,
         extraData: { participantId: userId }
       });
     }
 
-    // Populate team info
-    await scrim.populate('registeredTeams', 'username userType profile.displayName profile.avatar');
+    try {
+      await leftScrim.populate('registeredTeams', 'username userType profile.displayName profile.avatar');
+    } catch (populateError) {
+      // Removal already committed; the sanitized fallback below does not need
+      // populated presentation fields to remain safe and useful.
+      log.error('Scrim left but participant population failed', {
+        error: String(populateError),
+        scrimId: idString(leftScrim._id)
+      });
+    }
 
     res.status(200).json({
       success: true,
       message: 'Successfully left scrim',
       data: {
-        scrim
+        // Membership has already been revoked, so do not return the private
+        // broadcast archive that was present on the hydrated document.
+        scrim: sanitizePublicScrim(leftScrim)
       }
     });
   } catch (error) {
@@ -854,7 +1182,7 @@ const leaveScrim = async (req, res) => {
 // Submit match results
 const submitMatchResults = async (req, res) => {
   try {
-    const { matchNumber, teams } = req.body;
+    const { matchNumber, teams } = req.body && typeof req.body === 'object' ? req.body : {};
     const scrim = await findScrimByIdOrCode(req.params.id);
 
     if (!scrim) {
@@ -865,11 +1193,15 @@ const submitMatchResults = async (req, res) => {
     }
 
     // Check if user is the host
-    if (scrim.host.toString() !== req.user._id.toString()) {
+    if (idString(scrim.host) !== idString(req.user?._id)) {
       return res.status(403).json({
         success: false,
         message: 'Only scrim host can submit match results'
       });
+    }
+
+    if (scrim.status === 'Cancelled') {
+      return res.status(400).json({ success: false, message: 'Cannot submit results for a cancelled scrim' });
     }
 
     const routeMatchNumber = parseInteger(req.params.matchNumber);
@@ -882,7 +1214,8 @@ const submitMatchResults = async (req, res) => {
     }
 
     // Find match
-    const match = scrim.matches.find(m => m.matchNumber === routeMatchNumber);
+    const match = (Array.isArray(scrim.matches) ? scrim.matches : [])
+      .find(m => m.matchNumber === routeMatchNumber);
     if (!match) {
       return res.status(404).json({
         success: false,
@@ -940,6 +1273,7 @@ const submitMatchResults = async (req, res) => {
       submittedAt: new Date()
     };
     match.status = 'Completed';
+    advanceScrimStatusForResult(scrim);
 
     // Calculate match results using model method
     scrim.calculateMatchResults(routeMatchNumber);
@@ -976,6 +1310,9 @@ const submitMatchResults = async (req, res) => {
     });
   } catch (error) {
     log.error('Error submitting match results:', { error: String(error) });
+    if (error?.name === 'VersionError') {
+      return res.status(409).json({ success: false, message: 'Scrim results changed. Refresh and try again.' });
+    }
     res.status(500).json({
       success: false,
       message: 'Failed to submit match results',
@@ -997,7 +1334,7 @@ const updateScrim = async (req, res) => {
     }
 
     // Check if user is the host
-    if (scrim.host.toString() !== req.user._id.toString()) {
+    if (idString(scrim.host) !== idString(req.user?._id)) {
       return res.status(403).json({
         success: false,
         message: 'Only scrim host can update scrim'
@@ -1012,22 +1349,93 @@ const updateScrim = async (req, res) => {
       });
     }
 
-    // Update allowed fields
-    const allowedUpdates = ['name', 'description', 'date', 'endDate', 'maxTeams', 'timezone', 'matches', 'prizePool', 'prizePoolType', 'prizePoolCurrency', 'prizeDistribution', 'specialPrizes'];
-    allowedUpdates.forEach(field => {
-      if (req.body[field] !== undefined) {
-        scrim[field] = req.body[field];
+    const validation = validateScrimUpdateInput(scrim, req.body);
+    if (validation.error) {
+      return res.status(400).json({ success: false, message: validation.error });
+    }
+
+    const prizeConfigurationChanged = scrimPrizeConfigurationFingerprint(scrim)
+      !== scrimPrizeConfigurationFingerprint(validation.normalized);
+    if (validation.normalized.prizePoolType === 'with_prize' && prizeConfigurationChanged) {
+      const host = await User.findById(req.user._id).select('isVerifiedHost').lean();
+      if (host?.isVerifiedHost !== true) {
+        return res.status(403).json({
+          success: false,
+          message: 'You are not authorized to edit prize pool scrims. Please apply for Verified Host status.'
+        });
       }
+    }
+
+    const persistedUpdates = { ...validation.value };
+    const participantCount = Array.isArray(scrim.registeredTeams) ? scrim.registeredTeams.length : 0;
+    if ((scrim.status === 'Open' || scrim.status === 'Full') && hasOwn(validation.value, 'maxTeams')) {
+      persistedUpdates.status = participantCount >= validation.normalized.maxTeams ? 'Full' : 'Open';
+    }
+
+    const updateFilter = {
+      _id: scrim._id,
+      host: req.user._id,
+      status: scrim.status
+    };
+    if (Number.isInteger(scrim.__v)) updateFilter.__v = scrim.__v;
+    else if (scrim.updatedAt instanceof Date) updateFilter.updatedAt = scrim.updatedAt;
+    if (hasOwn(validation.value, 'maxTeams')) {
+      // A capacity edit must be based on the exact participant count that was
+      // validated. A simultaneous join/leave returns 409 instead of applying
+      // a stale Open/Full decision.
+      if (participantCount > 0) {
+        updateFilter[`registeredTeams.${participantCount - 1}`] = { $exists: true };
+      }
+      updateFilter[`registeredTeams.${participantCount}`] = { $exists: false };
+    }
+
+    const updateCommand = { $set: persistedUpdates };
+    if (Number.isInteger(scrim.__v)) updateCommand.$inc = { __v: 1 };
+    const updatedScrim = await Scrim.findOneAndUpdate(updateFilter, updateCommand, {
+      new: true,
+      runValidators: true
+    });
+    if (!updatedScrim) {
+      const latest = await Scrim.findById(scrim._id).select('host status');
+      if (!latest) return res.status(404).json({ success: false, message: 'Scrim not found' });
+      if (idString(latest.host) !== idString(req.user?._id)) {
+        return res.status(403).json({ success: false, message: 'Only scrim host can update scrim' });
+      }
+      if (latest.status === 'Completed' || latest.status === 'Cancelled') {
+        return res.status(400).json({ success: false, message: 'Cannot update completed or cancelled scrim' });
+      }
+      return res.status(409).json({
+        success: false,
+        message: 'Scrim changed while it was being edited. Refresh and try again.'
+      });
+    }
+
+    await notifyScrimRecipients({
+      scrim: updatedScrim,
+      recipients: updatedScrim.registeredTeams,
+      sender: req.user._id,
+      title: `Scrim Updated: ${updatedScrim.name}`,
+      message: 'The host updated the scrim details.',
+      eventType: 'scrim_updated',
+      revision: updatedScrim.updatedAt,
+      extraData: { changedFields: Object.keys(validation.value) }
     });
 
-    await scrim.save();
-    await scrim.populate('host', 'username userType profile.displayName profile.avatar');
+    try {
+      await updatedScrim.populate('host', 'username userType profile.displayName profile.avatar');
+      await updatedScrim.populate('registeredTeams', 'username userType profile.displayName profile.avatar');
+    } catch (populateError) {
+      log.error('Scrim updated but response population failed', {
+        error: String(populateError),
+        scrimId: idString(updatedScrim._id)
+      });
+    }
 
     res.status(200).json({
       success: true,
       message: 'Scrim updated successfully',
       data: {
-        scrim
+        scrim: updatedScrim
       }
     });
   } catch (error) {
@@ -1060,7 +1468,7 @@ const deleteScrim = async (req, res) => {
     }
 
     // Check if user is the host
-    if (scrim.host.toString() !== req.user._id.toString()) {
+    if (idString(scrim.host) !== idString(req.user?._id)) {
       return res.status(403).json({
         success: false,
         message: 'Only scrim host can delete scrim'
@@ -1096,21 +1504,53 @@ const cancelScrim = async (req, res) => {
     }
 
     // Check if user is the host
-    if (scrim.host.toString() !== req.user._id.toString()) {
+    if (idString(scrim.host) !== idString(req.user?._id)) {
       return res.status(403).json({
         success: false,
         message: 'Only scrim host can cancel scrim'
       });
     }
 
-    scrim.status = 'Cancelled';
-    await scrim.save();
+    if (scrim.status === 'Completed') {
+      return res.status(400).json({
+        success: false,
+        message: 'Completed scrims cannot be cancelled'
+      });
+    }
+    if (scrim.status === 'Cancelled') {
+      return res.status(200).json({
+        success: true,
+        message: 'Scrim is already cancelled',
+        data: { scrim }
+      });
+    }
+
+    const cancelledScrim = await Scrim.findOneAndUpdate(
+      {
+        _id: scrim._id,
+        host: req.user._id,
+        status: { $nin: ['Completed', 'Cancelled'] }
+      },
+      { $set: { status: 'Cancelled' } },
+      { new: true, runValidators: true }
+    );
+    if (!cancelledScrim) {
+      const latest = await Scrim.findById(scrim._id).select('host status');
+      if (!latest) return res.status(404).json({ success: false, message: 'Scrim not found' });
+      if (idString(latest.host) !== idString(req.user?._id)) {
+        return res.status(403).json({ success: false, message: 'Only scrim host can cancel scrim' });
+      }
+      if (latest.status === 'Completed') {
+        return res.status(400).json({ success: false, message: 'Completed scrims cannot be cancelled' });
+      }
+      return res.status(200).json({ success: true, message: 'Scrim is already cancelled', data: { scrim: latest } });
+    }
 
     await notifyScrimRecipients({
-      scrim,
-      recipients: scrim.registeredTeams,
+      scrim: cancelledScrim,
+      recipients: cancelledScrim.registeredTeams,
       sender: req.user._id,
-      title: `Scrim Cancelled: ${scrim.name}`,
+      title: `Scrim Cancelled: ${cancelledScrim.name}`,
       message: 'This scrim has been cancelled by the host.',
       eventType: 'scrim_cancelled',
       revision: 'cancelled'
@@ -1120,7 +1560,7 @@ const cancelScrim = async (req, res) => {
       success: true,
       message: 'Scrim cancelled successfully',
       data: {
-        scrim
+        scrim: cancelledScrim
       }
     });
   } catch (error) {
@@ -1140,15 +1580,21 @@ const cancelScrim = async (req, res) => {
 // Update prize distribution
 const updateScrimPrizeDistribution = async (req, res) => {
   try {
-    const { prizeDistribution, specialPrizes } = req.body;
+    const { prizeDistribution, specialPrizes } = req.body && typeof req.body === 'object' ? req.body : {};
     const scrim = await findScrimByIdOrCode(req.params.id);
 
     if (!scrim) {
       return res.status(404).json({ success: false, message: 'Scrim not found' });
     }
 
-    if (scrim.host.toString() !== req.user._id.toString()) {
+    if (idString(scrim.host) !== idString(req.user?._id)) {
       return res.status(403).json({ success: false, message: 'Only host can update prize distribution' });
+    }
+    if (scrim.status === 'Completed' || scrim.status === 'Cancelled') {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot update prize distribution for a completed or cancelled scrim'
+      });
     }
 
     const prizes = normalizeScrimPrizes({
@@ -1159,8 +1605,26 @@ const updateScrimPrizeDistribution = async (req, res) => {
     if (prizes.error) {
       return res.status(400).json({ success: false, message: prizes.error });
     }
+    const nextSpecialPrizes = preserveSpecialPrizeWinners(scrim.specialPrizes, prizes.value.specialPrizes);
+    const prizeConfigurationChanged = scrimPrizeConfigurationFingerprint(scrim)
+      !== scrimPrizeConfigurationFingerprint({
+        prizePoolType: scrim.prizePoolType,
+        prizePool: scrim.prizePool,
+        prizePoolCurrency: scrim.prizePoolCurrency,
+        prizeDistribution: prizes.value.prizeDistribution,
+        specialPrizes: nextSpecialPrizes
+      });
+    if (scrim.prizePoolType === 'with_prize' && prizeConfigurationChanged) {
+      const host = await User.findById(req.user._id).select('isVerifiedHost').lean();
+      if (host?.isVerifiedHost !== true) {
+        return res.status(403).json({
+          success: false,
+          message: 'You are not authorized to edit prize pool scrims. Please apply for Verified Host status.'
+        });
+      }
+    }
     scrim.prizeDistribution = prizes.value.prizeDistribution;
-    scrim.specialPrizes = prizes.value.specialPrizes;
+    scrim.specialPrizes = nextSpecialPrizes;
 
     await scrim.save();
 
@@ -1174,6 +1638,9 @@ const updateScrimPrizeDistribution = async (req, res) => {
     });
   } catch (error) {
     log.error('Error updating scrim prize distribution:', { error: String(error) });
+    if (error?.name === 'VersionError') {
+      return res.status(409).json({ success: false, message: 'Scrim prizes changed. Refresh and try again.' });
+    }
     if (error?.name === 'ValidationError' || error?.name === 'CastError') {
       return res.status(400).json({ success: false, message: 'Invalid prize distribution' });
     }
@@ -1190,8 +1657,12 @@ const generateScrimFinalResult = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Scrim not found' });
     }
 
-    if (scrim.host.toString() !== req.user._id.toString()) {
+    if (idString(scrim.host) !== idString(req.user?._id)) {
       return res.status(403).json({ success: false, message: 'Only host can generate final result' });
+    }
+
+    if (scrim.status === 'Cancelled') {
+      return res.status(400).json({ success: false, message: 'Cannot generate results for a cancelled scrim' });
     }
 
     if (!hasSubmittedResultsForEveryMatch(scrim.matches)) {
@@ -1231,6 +1702,9 @@ const generateScrimFinalResult = async (req, res) => {
     });
   } catch (error) {
     log.error('Error generating scrim final result:', { error: String(error) });
+    if (error?.name === 'VersionError') {
+      return res.status(409).json({ success: false, message: 'Scrim results changed. Refresh and try again.' });
+    }
     res.status(500).json({ success: false, message: 'Failed to generate final result' });
   }
 };
@@ -1238,10 +1712,9 @@ const generateScrimFinalResult = async (req, res) => {
 // Assign special prize winner
 const assignScrimSpecialPrize = async (req, res) => {
   try {
-    const { category, winnerId, winnerName } = req.body;
+    const { category, winnerId } = req.body && typeof req.body === 'object' ? req.body : {};
     if (typeof category !== 'string' || !category.trim() || category.length > 120 ||
-        typeof winnerId !== 'string' || !mongoose.Types.ObjectId.isValid(winnerId) ||
-        (winnerName !== undefined && (typeof winnerName !== 'string' || winnerName.length > 120))) {
+        typeof winnerId !== 'string' || !mongoose.Types.ObjectId.isValid(winnerId)) {
       return res.status(400).json({ success: false, message: 'Valid special prize winner details are required' });
     }
     const scrim = await findScrimByIdOrCode(req.params.id);
@@ -1250,11 +1723,31 @@ const assignScrimSpecialPrize = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Scrim not found' });
     }
 
-    if (scrim.host.toString() !== req.user._id.toString()) {
+    if (idString(scrim.host) !== idString(req.user?._id)) {
       return res.status(403).json({ success: false, message: 'Only host can assign special prizes' });
     }
+    if (scrim.status === 'Cancelled') {
+      return res.status(400).json({ success: false, message: 'Cannot assign prizes for a cancelled scrim' });
+    }
 
-    const prizeIndex = scrim.specialPrizes.findIndex(p => p.category === category.trim());
+    if (!scrimParticipants(scrim).some((participant) => idString(participant) === idString(winnerId))) {
+      return res.status(400).json({
+        success: false,
+        message: 'Special prize winner must be a registered scrim participant'
+      });
+    }
+
+    const winner = await User.findOne({ _id: winnerId, isActive: true })
+      .select('username profile.displayName')
+      .lean();
+    if (!winner) {
+      return res.status(400).json({ success: false, message: 'Registered winner account is unavailable' });
+    }
+
+    const normalizedCategory = category.trim();
+    const winnerName = winner.profile?.displayName || winner.username;
+    const prizes = Array.isArray(scrim.specialPrizes) ? scrim.specialPrizes : [];
+    const prizeIndex = prizes.findIndex(p => p.category === normalizedCategory);
     if (prizeIndex === -1) {
       return res.status(404).json({ success: false, message: 'Special prize category not found' });
     }
@@ -1264,7 +1757,7 @@ const assignScrimSpecialPrize = async (req, res) => {
 
     // Optional: update finalResult if it exists
     if (scrim.finalResult && scrim.finalResult.specialPrizeWinners) {
-      const frIndex = scrim.finalResult.specialPrizeWinners.findIndex(p => p.category === category);
+      const frIndex = scrim.finalResult.specialPrizeWinners.findIndex(p => p.category === normalizedCategory);
       if (frIndex !== -1) {
         scrim.finalResult.specialPrizeWinners[frIndex].winnerId = winnerId;
         scrim.finalResult.specialPrizeWinners[frIndex].winnerName = winnerName;
@@ -1280,6 +1773,9 @@ const assignScrimSpecialPrize = async (req, res) => {
     });
   } catch (error) {
     log.error('Error assigning scrim special prize:', { error: String(error) });
+    if (error?.name === 'VersionError') {
+      return res.status(409).json({ success: false, message: 'Scrim prizes changed. Refresh and try again.' });
+    }
     res.status(500).json({ success: false, message: 'Failed to assign special prize' });
   }
 };
@@ -1287,14 +1783,14 @@ const assignScrimSpecialPrize = async (req, res) => {
 // Broadcast message to all scrim participants
 const broadcastScrimMessage = async (req, res) => {
   try {
-    const { message, type } = req.body;
+    const { message, type } = req.body && typeof req.body === 'object' ? req.body : {};
     const scrim = await findScrimByIdOrCode(req.params.id);
 
     if (!scrim) {
       return res.status(404).json({ success: false, message: 'Scrim not found' });
     }
 
-    if (scrim.host.toString() !== req.user._id.toString()) {
+    if (idString(scrim.host) !== idString(req.user?._id)) {
       return res.status(403).json({ success: false, message: 'Only scrim host can send broadcasts' });
     }
 
@@ -1336,7 +1832,7 @@ const broadcastScrimMessage = async (req, res) => {
 
     // Send notification to all registered participants.
     const broadcastDeliveryKey = `scrim-broadcast:${scrim._id}:${broadcastEntry.sentAt.toISOString()}`;
-    const broadcastRecipients = uniqueRecipientIds(scrim.registeredTeams);
+    const broadcastRecipients = await expandScrimRecipientIds(scrim.registeredTeams);
     const notificationPromises = broadcastRecipients.map(teamId => (
       Promise.resolve().then(() => createAndEmitNotification({
         recipient: teamId,
@@ -1374,15 +1870,18 @@ const broadcastScrimMessage = async (req, res) => {
 
     res.status(200).json({
       success: true,
-      message: `Broadcast sent to ${scrim.registeredTeams.length} participants`,
+      message: `Broadcast sent to ${broadcastRecipients.length} recipients`,
       data: {
-        sentTo: scrim.registeredTeams.length,
+        sentTo: broadcastRecipients.length,
         broadcast: broadcastEntry,
         timestamp: new Date()
       }
     });
   } catch (error) {
     log.error('Error broadcasting scrim message:', { error: String(error) });
+    if (error?.name === 'VersionError') {
+      return res.status(409).json({ success: false, message: 'Scrim changed. Refresh and try again.' });
+    }
     res.status(500).json({ success: false, message: 'Failed to send broadcast' });
   }
 };
@@ -1401,12 +1900,19 @@ module.exports = {
   generateScrimFinalResult,
   assignScrimSpecialPrize,
   broadcastScrimMessage,
+  validateScrimIdentifierParam,
   __testables: {
     SCRIM_MATCH_COUNTS,
     SCRIM_BROADCAST_TYPES,
     MAX_BROADCAST_MESSAGE_LENGTH,
     validateScrimCreationInput,
+    validateScrimUpdateInput,
+    scrimPrizeConfigurationFingerprint,
+    buildScrimJoinAdmission,
+    scrimCapacityArrayPath,
+    isValidScrimIdentifier,
     validateScrimResultInput,
+    advanceScrimStatusForResult,
     hasSubmittedResultsForEveryMatch,
     refreshScrimFinalResult
   }

@@ -1,10 +1,10 @@
 # API Inventory
 
-Generated from the mounted Express routers on 2026-07-09T11:04:58.339Z.
+Generated from the mounted Express routers on 2026-07-10T11:11:11.648Z.
 
-- HTTP endpoints: **475**
-- Socket event handlers/emissions: **62**
-- Access classes: `admin`: 140, `authenticated`: 282, `authenticated-onboarding`: 4, `public`: 23, `public-optional-auth`: 13, `user-or-guest`: 13
+- HTTP endpoints: **484**
+- Socket event handlers/emissions: **185**
+- Access classes: `admin`: 146, `authenticated`: 283, `authenticated-onboarding`: 4, `public`: 23, `public-optional-auth`: 15, `user-or-guest`: 13
 
 > This is a static registration inventory. Runtime health and behavioral coverage are reported separately; inclusion here does not imply an endpoint has a live-database integration test.
 
@@ -17,13 +17,13 @@ Generated from the mounted Express routers on 2026-07-09T11:04:58.339Z.
 | GET | `/api/admin/analytics/users` | admin | `src/modules/admin/admin.routes.ts:83` |
 | GET | `/api/admin/audit-logs` | admin | `src/modules/admin/admin.routes.ts:86` |
 | POST | `/api/admin/auth/login` | public | `src/modules/admin/admin-login.routes.ts:33` |
-| GET | `/api/admin/boost-campaigns` | admin | `src/modules/admin/admin.routes.ts:101` |
-| PATCH | `/api/admin/boost-campaigns/:campaignId/delivery/adjust` | admin | `src/modules/admin/admin.routes.ts:106` |
-| POST | `/api/admin/boost-campaigns/:campaignId/delivery/configure` | admin | `src/modules/admin/admin.routes.ts:104` |
-| POST | `/api/admin/boost-campaigns/:campaignId/delivery/control` | admin | `src/modules/admin/admin.routes.ts:105` |
-| POST | `/api/admin/boost-campaigns/:campaignId/manual-delivery` | admin | `src/modules/admin/admin.routes.ts:103` |
-| PUT | `/api/admin/boost-campaigns/:campaignId/status` | admin | `src/modules/admin/admin.routes.ts:107` |
-| GET | `/api/admin/boost-delivery` | admin | `src/modules/admin/admin.routes.ts:102` |
+| GET | `/api/admin/boost-campaigns` | admin | `src/modules/admin/admin.routes.ts:103` |
+| PATCH | `/api/admin/boost-campaigns/:campaignId/delivery/adjust` | admin | `src/modules/admin/admin.routes.ts:108` |
+| POST | `/api/admin/boost-campaigns/:campaignId/delivery/configure` | admin | `src/modules/admin/admin.routes.ts:106` |
+| POST | `/api/admin/boost-campaigns/:campaignId/delivery/control` | admin | `src/modules/admin/admin.routes.ts:107` |
+| POST | `/api/admin/boost-campaigns/:campaignId/manual-delivery` | admin | `src/modules/admin/admin.routes.ts:105` |
+| PUT | `/api/admin/boost-campaigns/:campaignId/status` | admin | `src/modules/admin/admin.routes.ts:109` |
+| GET | `/api/admin/boost-delivery` | admin | `src/modules/admin/admin.routes.ts:104` |
 | GET | `/api/admin/broadcast-templates` | admin | `src/modules/admin/broadcast-template.routes.ts:25` |
 | POST | `/api/admin/broadcast-templates` | admin | `src/modules/admin/broadcast-template.routes.ts:26` |
 | DELETE | `/api/admin/broadcast-templates/:id` | admin | `src/modules/admin/broadcast-template.routes.ts:28` |
@@ -45,67 +45,67 @@ Generated from the mounted Express routers on 2026-07-09T11:04:58.339Z.
 | POST | `/api/admin/broadcasts/preview` | admin | `src/modules/admin/broadcast.routes.ts:36` |
 | GET | `/api/admin/dashboard` | admin | `src/modules/admin/admin.routes.ts:81` |
 | GET | `/api/admin/health` | admin | `src/modules/admin/admin.routes.ts:84` |
-| GET | `/api/admin/host-verification/applications` | admin | `src/modules/admin/admin.routes.ts:164` |
-| POST | `/api/admin/host-verification/applications/:id/approve` | admin | `src/modules/admin/admin.routes.ts:165` |
-| POST | `/api/admin/host-verification/applications/:id/reject` | admin | `src/modules/admin/admin.routes.ts:171` |
-| POST | `/api/admin/host-verification/revoke/:userId` | admin | `src/modules/admin/admin.routes.ts:178` |
-| GET | `/api/admin/host-verification/verified-hosts` | admin | `src/modules/admin/admin.routes.ts:177` |
-| GET | `/api/admin/monetization/applications` | admin | `src/modules/admin/admin.routes.ts:125` |
-| POST | `/api/admin/monetization/applications/:applicationId/approve` | admin | `src/modules/admin/admin.routes.ts:126` |
-| POST | `/api/admin/monetization/applications/:applicationId/reject` | admin | `src/modules/admin/admin.routes.ts:127` |
-| GET | `/api/admin/monetization/audit-logs` | admin | `src/modules/admin/admin.routes.ts:115` |
-| GET | `/api/admin/monetization/bank-details` | admin | `src/modules/admin/admin.routes.ts:118` |
-| GET | `/api/admin/monetization/bank-details/:id` | admin | `src/modules/admin/admin.routes.ts:120` |
-| GET | `/api/admin/monetization/bank-details/:id/history` | admin | `src/modules/admin/admin.routes.ts:119` |
-| PATCH | `/api/admin/monetization/bank-details/:id/notes` | admin | `src/modules/admin/admin.routes.ts:123` |
-| POST | `/api/admin/monetization/bank-details/:id/request-update` | admin | `src/modules/admin/admin.routes.ts:122` |
-| POST | `/api/admin/monetization/bank-details/:id/reveal` | admin | `src/modules/admin/admin.routes.ts:124` |
-| PATCH | `/api/admin/monetization/bank-details/:id/verification` | admin | `src/modules/admin/admin.routes.ts:121` |
-| GET | `/api/admin/monetization/bank-details/export.csv` | admin | `src/modules/admin/admin.routes.ts:116` |
-| GET | `/api/admin/monetization/bank-details/export.xls` | admin | `src/modules/admin/admin.routes.ts:117` |
-| GET | `/api/admin/monetization/charts` | admin | `src/modules/admin/admin.routes.ts:110` |
-| GET | `/api/admin/monetization/cpm/:userId` | admin | `src/modules/admin/admin.routes.ts:141` |
-| PUT | `/api/admin/monetization/cpm/:userId` | admin | `src/modules/admin/admin.routes.ts:140` |
-| GET | `/api/admin/monetization/creators` | admin | `src/modules/admin/admin.routes.ts:134` |
-| GET | `/api/admin/monetization/creators/:userId/analytics` | admin | `src/modules/admin/admin.routes.ts:132` |
-| GET | `/api/admin/monetization/creators/:userId/bank-details` | admin | `src/modules/admin/admin.routes.ts:131` |
-| GET | `/api/admin/monetization/creators/:userId/overview` | admin | `src/modules/admin/admin.routes.ts:133` |
-| GET | `/api/admin/monetization/creators/export.csv` | admin | `src/modules/admin/admin.routes.ts:130` |
-| GET | `/api/admin/monetization/dashboard` | admin | `src/modules/admin/admin.routes.ts:109` |
-| POST | `/api/admin/monetization/disable/:userId` | admin | `src/modules/admin/admin.routes.ts:139` |
-| POST | `/api/admin/monetization/grant/:userId` | admin | `src/modules/admin/admin.routes.ts:136` |
-| GET | `/api/admin/monetization/leaderboards` | admin | `src/modules/admin/admin.routes.ts:111` |
-| POST | `/api/admin/monetization/payout-hold/:userId` | admin | `src/modules/admin/admin.routes.ts:128` |
-| POST | `/api/admin/monetization/payout-hold/:userId/release` | admin | `src/modules/admin/admin.routes.ts:129` |
-| GET | `/api/admin/monetization/payouts` | admin | `src/modules/admin/admin.routes.ts:155` |
-| GET | `/api/admin/monetization/payouts/:id` | admin | `src/modules/admin/admin.routes.ts:154` |
-| POST | `/api/admin/monetization/payouts/:id/approve` | admin | `src/modules/admin/admin.routes.ts:156` |
-| POST | `/api/admin/monetization/payouts/:id/cancel` | admin | `src/modules/admin/admin.routes.ts:163` |
-| POST | `/api/admin/monetization/payouts/:id/failed` | admin | `src/modules/admin/admin.routes.ts:159` |
-| GET | `/api/admin/monetization/payouts/:id/history` | admin | `src/modules/admin/admin.routes.ts:151` |
-| POST | `/api/admin/monetization/payouts/:id/hold` | admin | `src/modules/admin/admin.routes.ts:160` |
-| POST | `/api/admin/monetization/payouts/:id/paid` | admin | `src/modules/admin/admin.routes.ts:158` |
-| POST | `/api/admin/monetization/payouts/:id/processing` | admin | `src/modules/admin/admin.routes.ts:157` |
-| POST | `/api/admin/monetization/payouts/:id/reject` | admin | `src/modules/admin/admin.routes.ts:162` |
-| POST | `/api/admin/monetization/payouts/:id/resume` | admin | `src/modules/admin/admin.routes.ts:161` |
-| GET | `/api/admin/monetization/payouts/:id/statement` | admin | `src/modules/admin/admin.routes.ts:153` |
-| POST | `/api/admin/monetization/payouts/:id/statement` | admin | `src/modules/admin/admin.routes.ts:152` |
-| POST | `/api/admin/monetization/payouts/bulk/:action` | admin | `src/modules/admin/admin.routes.ts:150` |
-| GET | `/api/admin/monetization/payouts/export.csv` | admin | `src/modules/admin/admin.routes.ts:148` |
-| POST | `/api/admin/monetization/payouts/generate` | admin | `src/modules/admin/admin.routes.ts:149` |
-| GET | `/api/admin/monetization/reports` | admin | `src/modules/admin/admin.routes.ts:114` |
-| GET | `/api/admin/monetization/reports/export` | admin | `src/modules/admin/admin.routes.ts:112` |
-| POST | `/api/admin/monetization/reports/export` | admin | `src/modules/admin/admin.routes.ts:113` |
-| POST | `/api/admin/monetization/resume/:userId` | admin | `src/modules/admin/admin.routes.ts:138` |
-| POST | `/api/admin/monetization/revoke/:userId` | admin | `src/modules/admin/admin.routes.ts:135` |
-| GET | `/api/admin/monetization/summary` | admin | `src/modules/admin/admin.routes.ts:108` |
-| POST | `/api/admin/monetization/suspend/:userId` | admin | `src/modules/admin/admin.routes.ts:137` |
-| GET | `/api/admin/monetization/withdrawal-requests` | admin | `src/modules/admin/admin.routes.ts:142` |
-| POST | `/api/admin/monetization/withdrawal-requests/:id/approve` | admin | `src/modules/admin/admin.routes.ts:143` |
-| POST | `/api/admin/monetization/withdrawal-requests/:id/cancel` | admin | `src/modules/admin/admin.routes.ts:147` |
-| POST | `/api/admin/monetization/withdrawal-requests/:id/failed` | admin | `src/modules/admin/admin.routes.ts:146` |
-| POST | `/api/admin/monetization/withdrawal-requests/:id/paid` | admin | `src/modules/admin/admin.routes.ts:145` |
-| POST | `/api/admin/monetization/withdrawal-requests/:id/reject` | admin | `src/modules/admin/admin.routes.ts:144` |
+| GET | `/api/admin/host-verification/applications` | admin | `src/modules/admin/admin.routes.ts:166` |
+| POST | `/api/admin/host-verification/applications/:id/approve` | admin | `src/modules/admin/admin.routes.ts:167` |
+| POST | `/api/admin/host-verification/applications/:id/reject` | admin | `src/modules/admin/admin.routes.ts:173` |
+| POST | `/api/admin/host-verification/revoke/:userId` | admin | `src/modules/admin/admin.routes.ts:180` |
+| GET | `/api/admin/host-verification/verified-hosts` | admin | `src/modules/admin/admin.routes.ts:179` |
+| GET | `/api/admin/monetization/applications` | admin | `src/modules/admin/admin.routes.ts:127` |
+| POST | `/api/admin/monetization/applications/:applicationId/approve` | admin | `src/modules/admin/admin.routes.ts:128` |
+| POST | `/api/admin/monetization/applications/:applicationId/reject` | admin | `src/modules/admin/admin.routes.ts:129` |
+| GET | `/api/admin/monetization/audit-logs` | admin | `src/modules/admin/admin.routes.ts:117` |
+| GET | `/api/admin/monetization/bank-details` | admin | `src/modules/admin/admin.routes.ts:120` |
+| GET | `/api/admin/monetization/bank-details/:id` | admin | `src/modules/admin/admin.routes.ts:122` |
+| GET | `/api/admin/monetization/bank-details/:id/history` | admin | `src/modules/admin/admin.routes.ts:121` |
+| PATCH | `/api/admin/monetization/bank-details/:id/notes` | admin | `src/modules/admin/admin.routes.ts:125` |
+| POST | `/api/admin/monetization/bank-details/:id/request-update` | admin | `src/modules/admin/admin.routes.ts:124` |
+| POST | `/api/admin/monetization/bank-details/:id/reveal` | admin | `src/modules/admin/admin.routes.ts:126` |
+| PATCH | `/api/admin/monetization/bank-details/:id/verification` | admin | `src/modules/admin/admin.routes.ts:123` |
+| GET | `/api/admin/monetization/bank-details/export.csv` | admin | `src/modules/admin/admin.routes.ts:118` |
+| GET | `/api/admin/monetization/bank-details/export.xls` | admin | `src/modules/admin/admin.routes.ts:119` |
+| GET | `/api/admin/monetization/charts` | admin | `src/modules/admin/admin.routes.ts:112` |
+| GET | `/api/admin/monetization/cpm/:userId` | admin | `src/modules/admin/admin.routes.ts:143` |
+| PUT | `/api/admin/monetization/cpm/:userId` | admin | `src/modules/admin/admin.routes.ts:142` |
+| GET | `/api/admin/monetization/creators` | admin | `src/modules/admin/admin.routes.ts:136` |
+| GET | `/api/admin/monetization/creators/:userId/analytics` | admin | `src/modules/admin/admin.routes.ts:134` |
+| GET | `/api/admin/monetization/creators/:userId/bank-details` | admin | `src/modules/admin/admin.routes.ts:133` |
+| GET | `/api/admin/monetization/creators/:userId/overview` | admin | `src/modules/admin/admin.routes.ts:135` |
+| GET | `/api/admin/monetization/creators/export.csv` | admin | `src/modules/admin/admin.routes.ts:132` |
+| GET | `/api/admin/monetization/dashboard` | admin | `src/modules/admin/admin.routes.ts:111` |
+| POST | `/api/admin/monetization/disable/:userId` | admin | `src/modules/admin/admin.routes.ts:141` |
+| POST | `/api/admin/monetization/grant/:userId` | admin | `src/modules/admin/admin.routes.ts:138` |
+| GET | `/api/admin/monetization/leaderboards` | admin | `src/modules/admin/admin.routes.ts:113` |
+| POST | `/api/admin/monetization/payout-hold/:userId` | admin | `src/modules/admin/admin.routes.ts:130` |
+| POST | `/api/admin/monetization/payout-hold/:userId/release` | admin | `src/modules/admin/admin.routes.ts:131` |
+| GET | `/api/admin/monetization/payouts` | admin | `src/modules/admin/admin.routes.ts:157` |
+| GET | `/api/admin/monetization/payouts/:id` | admin | `src/modules/admin/admin.routes.ts:156` |
+| POST | `/api/admin/monetization/payouts/:id/approve` | admin | `src/modules/admin/admin.routes.ts:158` |
+| POST | `/api/admin/monetization/payouts/:id/cancel` | admin | `src/modules/admin/admin.routes.ts:165` |
+| POST | `/api/admin/monetization/payouts/:id/failed` | admin | `src/modules/admin/admin.routes.ts:161` |
+| GET | `/api/admin/monetization/payouts/:id/history` | admin | `src/modules/admin/admin.routes.ts:153` |
+| POST | `/api/admin/monetization/payouts/:id/hold` | admin | `src/modules/admin/admin.routes.ts:162` |
+| POST | `/api/admin/monetization/payouts/:id/paid` | admin | `src/modules/admin/admin.routes.ts:160` |
+| POST | `/api/admin/monetization/payouts/:id/processing` | admin | `src/modules/admin/admin.routes.ts:159` |
+| POST | `/api/admin/monetization/payouts/:id/reject` | admin | `src/modules/admin/admin.routes.ts:164` |
+| POST | `/api/admin/monetization/payouts/:id/resume` | admin | `src/modules/admin/admin.routes.ts:163` |
+| GET | `/api/admin/monetization/payouts/:id/statement` | admin | `src/modules/admin/admin.routes.ts:155` |
+| POST | `/api/admin/monetization/payouts/:id/statement` | admin | `src/modules/admin/admin.routes.ts:154` |
+| POST | `/api/admin/monetization/payouts/bulk/:action` | admin | `src/modules/admin/admin.routes.ts:152` |
+| GET | `/api/admin/monetization/payouts/export.csv` | admin | `src/modules/admin/admin.routes.ts:150` |
+| POST | `/api/admin/monetization/payouts/generate` | admin | `src/modules/admin/admin.routes.ts:151` |
+| GET | `/api/admin/monetization/reports` | admin | `src/modules/admin/admin.routes.ts:116` |
+| GET | `/api/admin/monetization/reports/export` | admin | `src/modules/admin/admin.routes.ts:114` |
+| POST | `/api/admin/monetization/reports/export` | admin | `src/modules/admin/admin.routes.ts:115` |
+| POST | `/api/admin/monetization/resume/:userId` | admin | `src/modules/admin/admin.routes.ts:140` |
+| POST | `/api/admin/monetization/revoke/:userId` | admin | `src/modules/admin/admin.routes.ts:137` |
+| GET | `/api/admin/monetization/summary` | admin | `src/modules/admin/admin.routes.ts:110` |
+| POST | `/api/admin/monetization/suspend/:userId` | admin | `src/modules/admin/admin.routes.ts:139` |
+| GET | `/api/admin/monetization/withdrawal-requests` | admin | `src/modules/admin/admin.routes.ts:144` |
+| POST | `/api/admin/monetization/withdrawal-requests/:id/approve` | admin | `src/modules/admin/admin.routes.ts:145` |
+| POST | `/api/admin/monetization/withdrawal-requests/:id/cancel` | admin | `src/modules/admin/admin.routes.ts:149` |
+| POST | `/api/admin/monetization/withdrawal-requests/:id/failed` | admin | `src/modules/admin/admin.routes.ts:148` |
+| POST | `/api/admin/monetization/withdrawal-requests/:id/paid` | admin | `src/modules/admin/admin.routes.ts:147` |
+| POST | `/api/admin/monetization/withdrawal-requests/:id/reject` | admin | `src/modules/admin/admin.routes.ts:146` |
 | GET | `/api/admin/posts` | admin | `src/modules/admin/admin.routes.ts:95` |
 | DELETE | `/api/admin/posts/:postId` | admin | `src/modules/admin/admin.routes.ts:96` |
 | GET | `/api/admin/premium-memberships` | admin | `src/modules/admin/premium-membership.routes.ts:23` |
@@ -129,8 +129,10 @@ Generated from the mounted Express routers on 2026-07-09T11:04:58.339Z.
 | GET | `/api/admin/push/requests` | admin | `src/modules/admin/push.routes.ts:147` |
 | POST | `/api/admin/push/test` | admin | `src/modules/admin/push.routes.ts:378` |
 | GET | `/api/admin/push/voip-deliveries` | admin | `src/modules/admin/push.routes.ts:335` |
-| GET | `/api/admin/reports` | admin | `src/modules/admin/admin.routes.ts:99` |
-| PUT | `/api/admin/reports/:reportId` | admin | `src/modules/admin/admin.routes.ts:100` |
+| GET | `/api/admin/reports` | admin | `src/modules/admin/admin.routes.ts:101` |
+| PUT | `/api/admin/reports/:reportId` | admin | `src/modules/admin/admin.routes.ts:102` |
+| GET | `/api/admin/scrims` | admin | `src/modules/admin/admin.routes.ts:99` |
+| DELETE | `/api/admin/scrims/:scrimId` | admin | `src/modules/admin/admin.routes.ts:100` |
 | GET | `/api/admin/search` | admin | `src/modules/admin/admin.routes.ts:82` |
 | GET | `/api/admin/tournaments` | admin | `src/modules/admin/admin.routes.ts:97` |
 | DELETE | `/api/admin/tournaments/:tournamentId` | admin | `src/modules/admin/admin.routes.ts:98` |
@@ -281,24 +283,24 @@ Generated from the mounted Express routers on 2026-07-09T11:04:58.339Z.
 | GET | `/api/monetization/status` | authenticated | `src/modules/monetization/monetization.routes.ts:21` |
 | POST | `/api/monetization/withdrawal-request` | authenticated | `src/modules/monetization/monetization.routes.ts:22` |
 | GET | `/api/music/search` | user-or-guest | `src/modules/music/music.routes.ts:128` |
-| GET | `/api/notifications` | authenticated | `src/modules/notifications/notifications.routes.ts:887` |
-| DELETE | `/api/notifications/:id` | authenticated | `src/modules/notifications/notifications.routes.ts:1048` |
-| PUT | `/api/notifications/:id/archive` | authenticated | `src/modules/notifications/notifications.routes.ts:1018` |
-| POST | `/api/notifications/:id/click` | authenticated | `src/modules/notifications/notifications.routes.ts:842` |
-| POST | `/api/notifications/:id/delivered` | authenticated | `src/modules/notifications/notifications.routes.ts:777` |
-| POST | `/api/notifications/:id/open` | authenticated | `src/modules/notifications/notifications.routes.ts:806` |
-| PUT | `/api/notifications/:id/read` | authenticated | `src/modules/notifications/notifications.routes.ts:974` |
-| PUT | `/api/notifications/:id/unarchive` | authenticated | `src/modules/notifications/notifications.routes.ts:1033` |
-| DELETE | `/api/notifications/client-context` | authenticated | `src/modules/notifications/notifications.routes.ts:502` |
-| POST | `/api/notifications/client-context` | authenticated | `src/modules/notifications/notifications.routes.ts:392` |
-| GET | `/api/notifications/push-deliveries` | authenticated | `src/modules/notifications/notifications.routes.ts:583` |
-| GET | `/api/notifications/push-status` | authenticated | `src/modules/notifications/notifications.routes.ts:525` |
-| POST | `/api/notifications/push-test` | authenticated | `src/modules/notifications/notifications.routes.ts:611` |
-| DELETE | `/api/notifications/push-token` | authenticated | `src/modules/notifications/notifications.routes.ts:458` |
-| POST | `/api/notifications/push-token` | authenticated | `src/modules/notifications/notifications.routes.ts:213` |
-| PUT | `/api/notifications/read-all` | authenticated | `src/modules/notifications/notifications.routes.ts:999` |
-| DELETE | `/api/notifications/voip-token` | authenticated | `src/modules/notifications/notifications.routes.ts:360` |
-| POST | `/api/notifications/voip-token` | authenticated | `src/modules/notifications/notifications.routes.ts:320` |
+| GET | `/api/notifications` | authenticated | `src/modules/notifications/notifications.routes.ts:922` |
+| DELETE | `/api/notifications/:id` | authenticated | `src/modules/notifications/notifications.routes.ts:1100` |
+| PUT | `/api/notifications/:id/archive` | authenticated | `src/modules/notifications/notifications.routes.ts:1062` |
+| POST | `/api/notifications/:id/click` | authenticated | `src/modules/notifications/notifications.routes.ts:877` |
+| POST | `/api/notifications/:id/delivered` | authenticated | `src/modules/notifications/notifications.routes.ts:812` |
+| POST | `/api/notifications/:id/open` | authenticated | `src/modules/notifications/notifications.routes.ts:841` |
+| PUT | `/api/notifications/:id/read` | authenticated | `src/modules/notifications/notifications.routes.ts:1007` |
+| PUT | `/api/notifications/:id/unarchive` | authenticated | `src/modules/notifications/notifications.routes.ts:1081` |
+| DELETE | `/api/notifications/client-context` | authenticated | `src/modules/notifications/notifications.routes.ts:537` |
+| POST | `/api/notifications/client-context` | authenticated | `src/modules/notifications/notifications.routes.ts:427` |
+| GET | `/api/notifications/push-deliveries` | authenticated | `src/modules/notifications/notifications.routes.ts:618` |
+| GET | `/api/notifications/push-status` | authenticated | `src/modules/notifications/notifications.routes.ts:560` |
+| POST | `/api/notifications/push-test` | authenticated | `src/modules/notifications/notifications.routes.ts:646` |
+| DELETE | `/api/notifications/push-token` | authenticated | `src/modules/notifications/notifications.routes.ts:493` |
+| POST | `/api/notifications/push-token` | authenticated | `src/modules/notifications/notifications.routes.ts:248` |
+| PUT | `/api/notifications/read-all` | authenticated | `src/modules/notifications/notifications.routes.ts:1038` |
+| DELETE | `/api/notifications/voip-token` | authenticated | `src/modules/notifications/notifications.routes.ts:395` |
+| POST | `/api/notifications/voip-token` | authenticated | `src/modules/notifications/notifications.routes.ts:355` |
 | GET | `/api/payments/boost/campaigns` | authenticated | `src/modules/payments/payments.routes.ts:109` |
 | POST | `/api/payments/boost/create-order` | authenticated | `src/modules/payments/payments.routes.ts:110` |
 | POST | `/api/payments/boost/verify` | authenticated | `src/modules/payments/payments.routes.ts:111` |
@@ -310,22 +312,22 @@ Generated from the mounted Express routers on 2026-07-09T11:04:58.339Z.
 | POST | `/api/payments/subscription/verify-recurring` | authenticated | `src/modules/payments/payments.routes.ts:102` |
 | POST | `/api/payments/tournament/create-order` | authenticated | `src/modules/payments/payments.routes.ts:105` |
 | POST | `/api/payments/tournament/verify` | authenticated | `src/modules/payments/payments.routes.ts:106` |
-| GET | `/api/posts` | user-or-guest | `src/modules/posts/posts.routes.ts:49` |
-| POST | `/api/posts` | authenticated | `src/modules/posts/posts.routes.ts:48` |
-| DELETE | `/api/posts/:id` | authenticated | `src/modules/posts/posts.routes.ts:61` |
-| GET | `/api/posts/:id` | user-or-guest | `src/modules/posts/posts.routes.ts:53` |
-| PUT | `/api/posts/:id` | authenticated | `src/modules/posts/posts.routes.ts:60` |
-| POST | `/api/posts/:id/boost` | authenticated | `src/modules/posts/posts.routes.ts:63` |
-| POST | `/api/posts/:id/comment` | authenticated | `src/modules/posts/posts.routes.ts:56` |
-| POST | `/api/posts/:id/like` | authenticated | `src/modules/posts/posts.routes.ts:55` |
-| POST | `/api/posts/:id/report` | authenticated | `src/modules/posts/posts.routes.ts:62` |
-| POST | `/api/posts/:id/save` | authenticated | `src/modules/posts/posts.routes.ts:58` |
-| POST | `/api/posts/:id/share` | authenticated | `src/modules/posts/posts.routes.ts:57` |
-| POST | `/api/posts/:id/view` | authenticated | `src/modules/posts/posts.routes.ts:54` |
-| GET | `/api/posts/clips` | user-or-guest | `src/modules/posts/posts.routes.ts:50` |
-| POST | `/api/posts/interaction` | authenticated | `src/modules/posts/posts.routes.ts:59` |
-| GET | `/api/posts/liked` | authenticated | `src/modules/posts/posts.routes.ts:52` |
-| GET | `/api/posts/saved` | authenticated | `src/modules/posts/posts.routes.ts:51` |
+| GET | `/api/posts` | user-or-guest | `src/modules/posts/posts.routes.ts:54` |
+| POST | `/api/posts` | authenticated | `src/modules/posts/posts.routes.ts:53` |
+| DELETE | `/api/posts/:id` | authenticated | `src/modules/posts/posts.routes.ts:66` |
+| GET | `/api/posts/:id` | user-or-guest | `src/modules/posts/posts.routes.ts:58` |
+| PUT | `/api/posts/:id` | authenticated | `src/modules/posts/posts.routes.ts:65` |
+| POST | `/api/posts/:id/boost` | authenticated | `src/modules/posts/posts.routes.ts:68` |
+| POST | `/api/posts/:id/comment` | authenticated | `src/modules/posts/posts.routes.ts:61` |
+| POST | `/api/posts/:id/like` | authenticated | `src/modules/posts/posts.routes.ts:60` |
+| POST | `/api/posts/:id/report` | authenticated | `src/modules/posts/posts.routes.ts:67` |
+| POST | `/api/posts/:id/save` | authenticated | `src/modules/posts/posts.routes.ts:63` |
+| POST | `/api/posts/:id/share` | authenticated | `src/modules/posts/posts.routes.ts:62` |
+| POST | `/api/posts/:id/view` | authenticated | `src/modules/posts/posts.routes.ts:59` |
+| GET | `/api/posts/clips` | user-or-guest | `src/modules/posts/posts.routes.ts:55` |
+| POST | `/api/posts/interaction` | authenticated | `src/modules/posts/posts.routes.ts:64` |
+| GET | `/api/posts/liked` | authenticated | `src/modules/posts/posts.routes.ts:57` |
+| GET | `/api/posts/saved` | authenticated | `src/modules/posts/posts.routes.ts:56` |
 | GET | `/api/random-connections/active-sessions` | authenticated | `src/modules/random-connections/random-connections.routes.ts:103` |
 | POST | `/api/random-connections/cleanup-current` | authenticated | `src/modules/random-connections/random-connections.routes.ts:107` |
 | GET | `/api/random-connections/current-connection` | authenticated | `src/modules/random-connections/random-connections.routes.ts:102` |
@@ -342,47 +344,54 @@ Generated from the mounted Express routers on 2026-07-09T11:04:58.339Z.
 | POST | `/api/random-connections/v2/disconnect` | authenticated | `src/modules/random-connections/random-connections.routes.ts:114` |
 | POST | `/api/random-connections/v2/join-queue` | authenticated | `src/modules/random-connections/random-connections.routes.ts:111` |
 | DELETE | `/api/random-connections/v2/leave-queue` | authenticated | `src/modules/random-connections/random-connections.routes.ts:112` |
-| PUT | `/api/recruitment/applications/:applicationId/status` | authenticated | `src/modules/recruitment/recruitment.routes.ts:44` |
-| GET | `/api/recruitment/applications/my` | authenticated | `src/modules/recruitment/recruitment.routes.ts:41` |
-| GET | `/api/recruitment/applications/team` | authenticated | `src/modules/recruitment/recruitment.routes.ts:42` |
-| GET | `/api/recruitment/player-profiles` | authenticated | `src/modules/recruitment/recruitment.routes.ts:28` |
-| POST | `/api/recruitment/player-profiles` | authenticated | `src/modules/recruitment/recruitment.routes.ts:26` |
-| DELETE | `/api/recruitment/player-profiles/:id` | authenticated | `src/modules/recruitment/recruitment.routes.ts:32` |
-| GET | `/api/recruitment/player-profiles/:id` | public-optional-auth | `src/modules/recruitment/recruitment.routes.ts:29` |
-| PUT | `/api/recruitment/player-profiles/:id` | authenticated | `src/modules/recruitment/recruitment.routes.ts:31` |
-| POST | `/api/recruitment/player-profiles/:profileId/interest` | authenticated | `src/modules/recruitment/recruitment.routes.ts:39` |
-| GET | `/api/recruitment/player-profiles/daily-limit` | authenticated | `src/modules/recruitment/recruitment.routes.ts:27` |
-| GET | `/api/recruitment/profile/:code` | public-optional-auth | `src/modules/recruitment/recruitment.routes.ts:30` |
-| POST | `/api/recruitment/profile/:profileId/interest` | authenticated | `src/modules/recruitment/recruitment.routes.ts:40` |
-| GET | `/api/recruitment/recruitment/:code` | public-optional-auth | `src/modules/recruitment/recruitment.routes.ts:19` |
-| POST | `/api/recruitment/recruitment/:recruitmentId/apply` | authenticated | `src/modules/recruitment/recruitment.routes.ts:37` |
-| POST | `/api/recruitment/recruitment/:recruitmentId/withdraw` | authenticated | `src/modules/recruitment/recruitment.routes.ts:38` |
-| GET | `/api/recruitment/team-applications` | authenticated | `src/modules/recruitment/recruitment.routes.ts:43` |
-| GET | `/api/recruitment/team-recruitments` | authenticated | `src/modules/recruitment/recruitment.routes.ts:18` |
-| POST | `/api/recruitment/team-recruitments` | authenticated | `src/modules/recruitment/recruitment.routes.ts:17` |
-| DELETE | `/api/recruitment/team-recruitments/:id` | authenticated | `src/modules/recruitment/recruitment.routes.ts:24` |
-| GET | `/api/recruitment/team-recruitments/:id` | public-optional-auth | `src/modules/recruitment/recruitment.routes.ts:20` |
-| PUT | `/api/recruitment/team-recruitments/:id` | authenticated | `src/modules/recruitment/recruitment.routes.ts:21` |
-| POST | `/api/recruitment/team-recruitments/:id/close` | authenticated | `src/modules/recruitment/recruitment.routes.ts:22` |
-| POST | `/api/recruitment/team-recruitments/:id/reopen` | authenticated | `src/modules/recruitment/recruitment.routes.ts:23` |
-| DELETE | `/api/recruitment/team-recruitments/:recruitmentId/apply` | authenticated | `src/modules/recruitment/recruitment.routes.ts:35` |
-| POST | `/api/recruitment/team-recruitments/:recruitmentId/apply` | authenticated | `src/modules/recruitment/recruitment.routes.ts:34` |
-| POST | `/api/recruitment/team-recruitments/:recruitmentId/withdraw` | authenticated | `src/modules/recruitment/recruitment.routes.ts:36` |
+| PUT | `/api/recruitment/applications/:applicationId/status` | authenticated | `src/modules/recruitment/recruitment.routes.ts:49` |
+| GET | `/api/recruitment/applications/my` | authenticated | `src/modules/recruitment/recruitment.routes.ts:46` |
+| GET | `/api/recruitment/applications/team` | authenticated | `src/modules/recruitment/recruitment.routes.ts:47` |
+| GET | `/api/recruitment/player-profiles` | authenticated | `src/modules/recruitment/recruitment.routes.ts:32` |
+| POST | `/api/recruitment/player-profiles` | authenticated | `src/modules/recruitment/recruitment.routes.ts:30` |
+| DELETE | `/api/recruitment/player-profiles/:id` | authenticated | `src/modules/recruitment/recruitment.routes.ts:37` |
+| GET | `/api/recruitment/player-profiles/:id` | public-optional-auth | `src/modules/recruitment/recruitment.routes.ts:34` |
+| PUT | `/api/recruitment/player-profiles/:id` | authenticated | `src/modules/recruitment/recruitment.routes.ts:36` |
+| POST | `/api/recruitment/player-profiles/:profileId/interest` | authenticated | `src/modules/recruitment/recruitment.routes.ts:44` |
+| GET | `/api/recruitment/player-profiles/daily-limit` | authenticated | `src/modules/recruitment/recruitment.routes.ts:31` |
+| GET | `/api/recruitment/profile/:code` | public-optional-auth | `src/modules/recruitment/recruitment.routes.ts:35` |
+| GET | `/api/recruitment/profile/:code/preview` | public-optional-auth | `src/modules/recruitment/recruitment.routes.ts:33` |
+| POST | `/api/recruitment/profile/:profileId/interest` | authenticated | `src/modules/recruitment/recruitment.routes.ts:45` |
+| GET | `/api/recruitment/recruitment/:code` | public-optional-auth | `src/modules/recruitment/recruitment.routes.ts:23` |
+| GET | `/api/recruitment/recruitment/:code/preview` | public-optional-auth | `src/modules/recruitment/recruitment.routes.ts:22` |
+| POST | `/api/recruitment/recruitment/:recruitmentId/apply` | authenticated | `src/modules/recruitment/recruitment.routes.ts:42` |
+| POST | `/api/recruitment/recruitment/:recruitmentId/withdraw` | authenticated | `src/modules/recruitment/recruitment.routes.ts:43` |
+| GET | `/api/recruitment/team-applications` | authenticated | `src/modules/recruitment/recruitment.routes.ts:48` |
+| GET | `/api/recruitment/team-recruitments` | authenticated | `src/modules/recruitment/recruitment.routes.ts:21` |
+| POST | `/api/recruitment/team-recruitments` | authenticated | `src/modules/recruitment/recruitment.routes.ts:20` |
+| DELETE | `/api/recruitment/team-recruitments/:id` | authenticated | `src/modules/recruitment/recruitment.routes.ts:28` |
+| GET | `/api/recruitment/team-recruitments/:id` | public-optional-auth | `src/modules/recruitment/recruitment.routes.ts:24` |
+| PUT | `/api/recruitment/team-recruitments/:id` | authenticated | `src/modules/recruitment/recruitment.routes.ts:25` |
+| POST | `/api/recruitment/team-recruitments/:id/close` | authenticated | `src/modules/recruitment/recruitment.routes.ts:26` |
+| POST | `/api/recruitment/team-recruitments/:id/reopen` | authenticated | `src/modules/recruitment/recruitment.routes.ts:27` |
+| DELETE | `/api/recruitment/team-recruitments/:recruitmentId/apply` | authenticated | `src/modules/recruitment/recruitment.routes.ts:40` |
+| POST | `/api/recruitment/team-recruitments/:recruitmentId/apply` | authenticated | `src/modules/recruitment/recruitment.routes.ts:39` |
+| POST | `/api/recruitment/team-recruitments/:recruitmentId/withdraw` | authenticated | `src/modules/recruitment/recruitment.routes.ts:41` |
 | POST | `/api/reports` | authenticated | `src/modules/reports/reports.routes.ts:7` |
-| GET | `/api/scrims` | public-optional-auth | `src/modules/scrims/scrims.routes.ts:7` |
-| POST | `/api/scrims` | authenticated | `src/modules/scrims/scrims.routes.ts:8` |
-| DELETE | `/api/scrims/:id` | authenticated | `src/modules/scrims/scrims.routes.ts:15` |
-| GET | `/api/scrims/:id` | public-optional-auth | `src/modules/scrims/scrims.routes.ts:13` |
-| PUT | `/api/scrims/:id` | authenticated | `src/modules/scrims/scrims.routes.ts:14` |
-| POST | `/api/scrims/:id/assign-special-prize` | authenticated | `src/modules/scrims/scrims.routes.ts:23` |
-| POST | `/api/scrims/:id/broadcast` | authenticated | `src/modules/scrims/scrims.routes.ts:24` |
-| PUT | `/api/scrims/:id/cancel` | authenticated | `src/modules/scrims/scrims.routes.ts:20` |
-| POST | `/api/scrims/:id/generate-final-result` | authenticated | `src/modules/scrims/scrims.routes.ts:22` |
-| POST | `/api/scrims/:id/join` | authenticated | `src/modules/scrims/scrims.routes.ts:17` |
-| POST | `/api/scrims/:id/leave` | authenticated | `src/modules/scrims/scrims.routes.ts:18` |
-| POST | `/api/scrims/:id/matches/:matchNumber/results` | authenticated | `src/modules/scrims/scrims.routes.ts:19` |
-| POST | `/api/scrims/:id/prize-distribution` | authenticated | `src/modules/scrims/scrims.routes.ts:21` |
-| GET | `/api/scrims/code/:code` | public-optional-auth | `src/modules/scrims/scrims.routes.ts:10` |
+| GET | `/api/rtc/credentials` | admin | `src/legacy-src/routes/rtc.js:100` |
+| DELETE | `/api/rtc/credentials/:username` | admin | `src/legacy-src/routes/rtc.js:109` |
+| GET | `/api/rtc/ice` | authenticated | `src/legacy-src/routes/rtc.js:72` |
+| GET | `/api/rtc/usage` | admin | `src/legacy-src/routes/rtc.js:91` |
+| GET | `/api/rtc/usage/:username` | admin | `src/legacy-src/routes/rtc.js:83` |
+| GET | `/api/scrims` | public-optional-auth | `src/modules/scrims/scrims.routes.ts:12` |
+| POST | `/api/scrims` | authenticated | `src/modules/scrims/scrims.routes.ts:13` |
+| DELETE | `/api/scrims/:id` | authenticated | `src/modules/scrims/scrims.routes.ts:20` |
+| GET | `/api/scrims/:id` | public-optional-auth | `src/modules/scrims/scrims.routes.ts:18` |
+| PUT | `/api/scrims/:id` | authenticated | `src/modules/scrims/scrims.routes.ts:19` |
+| POST | `/api/scrims/:id/assign-special-prize` | authenticated | `src/modules/scrims/scrims.routes.ts:28` |
+| POST | `/api/scrims/:id/broadcast` | authenticated | `src/modules/scrims/scrims.routes.ts:29` |
+| PUT | `/api/scrims/:id/cancel` | authenticated | `src/modules/scrims/scrims.routes.ts:25` |
+| POST | `/api/scrims/:id/generate-final-result` | authenticated | `src/modules/scrims/scrims.routes.ts:27` |
+| POST | `/api/scrims/:id/join` | authenticated | `src/modules/scrims/scrims.routes.ts:22` |
+| POST | `/api/scrims/:id/leave` | authenticated | `src/modules/scrims/scrims.routes.ts:23` |
+| POST | `/api/scrims/:id/matches/:matchNumber/results` | authenticated | `src/modules/scrims/scrims.routes.ts:24` |
+| POST | `/api/scrims/:id/prize-distribution` | authenticated | `src/modules/scrims/scrims.routes.ts:26` |
+| GET | `/api/scrims/code/:code` | public-optional-auth | `src/modules/scrims/scrims.routes.ts:15` |
 | POST | `/api/stories` | authenticated | `src/modules/stories/stories.routes.ts:11` |
 | DELETE | `/api/stories/:storyId` | authenticated | `src/modules/stories/stories.routes.ts:15` |
 | GET | `/api/stories/:storyId` | authenticated | `src/modules/stories/stories.routes.ts:12` |
@@ -492,7 +501,20 @@ Generated from the mounted Express routers on 2026-07-09T11:04:58.339Z.
 
 | Direction | Event | Source |
 |---|---|---|
-| outbound | `broadcast_message` | `src/legacy-src/controllers/tournamentController.js:887` |
+| outbound | `broadcast_message` | `src/legacy-src/controllers/tournamentController.js:879` |
+| outbound | `broadcast_message` | `src/legacy-src/controllers/tournamentController.js:888` |
+| outbound | `broadcast-notification` | `src/legacy-src/utils/notificationEmitter.js:31` |
+| outbound | `broadcast-push-notification` | `src/legacy-src/utils/notificationEmitter.js:44` |
+| inbound | `call-accept` | `src/modules/legacy/legacy.socket.ts:668` |
+| outbound | `call-accept` | `src/modules/legacy/legacy.socket.ts:668` |
+| outbound | `call-accept` | `src/legacy-src/controllers/callController.js:455` |
+| outbound | `call-accept` | `src/legacy-src/controllers/callSessionController.js:78` |
+| inbound | `call-end` | `src/modules/legacy/legacy.socket.ts:668` |
+| outbound | `call-end` | `src/modules/legacy/legacy.socket.ts:668` |
+| outbound | `call-end` | `src/legacy-src/controllers/callController.js:614` |
+| outbound | `call-end` | `src/legacy-src/controllers/callSessionController.js:97` |
+| outbound | `call-end` | `src/legacy-src/services/callSessionService.js:78` |
+| outbound | `call-end` | `src/modules/legacy/legacy.socket.ts:172` |
 | outbound | `call-error` | `src/modules/legacy/legacy.socket.ts:503` |
 | outbound | `call-error` | `src/modules/legacy/legacy.socket.ts:518` |
 | outbound | `call-error` | `src/modules/legacy/legacy.socket.ts:524` |
@@ -509,22 +531,64 @@ Generated from the mounted Express routers on 2026-07-09T11:04:58.339Z.
 | outbound | `call-error` | `src/modules/legacy/legacy.socket.ts:811` |
 | outbound | `call-error` | `src/modules/legacy/legacy.socket.ts:858` |
 | outbound | `call-error` | `src/modules/legacy/legacy.socket.ts:902` |
+| outbound | `call-missed` | `src/legacy-src/services/callSessionService.js:315` |
+| inbound | `call-reject` | `src/modules/legacy/legacy.socket.ts:668` |
+| outbound | `call-reject` | `src/modules/legacy/legacy.socket.ts:668` |
+| outbound | `call-reject` | `src/legacy-src/controllers/callController.js:526` |
+| outbound | `call-reject` | `src/legacy-src/controllers/callSessionController.js:90` |
 | inbound | `call-request` | `src/modules/legacy/legacy.socket.ts:489` |
+| outbound | `call-request` | `src/legacy-src/controllers/callController.js:296` |
+| outbound | `call-request` | `src/modules/legacy/legacy.socket.ts:607` |
+| outbound | `call-session-updated` | `src/legacy-src/controllers/callController.js:44` |
+| outbound | `call-session-updated` | `src/legacy-src/controllers/callSessionController.js:104` |
+| outbound | `call-session-updated` | `src/legacy-src/controllers/callSessionController.js:105` |
+| outbound | `call-session-updated` | `src/legacy-src/services/callSessionService.js:79` |
+| outbound | `call-session-updated` | `src/modules/legacy/legacy.socket.ts:710` |
+| outbound | `call-session-updated` | `src/modules/legacy/legacy.socket.ts:711` |
 | inbound | `call-signal` | `src/modules/legacy/legacy.socket.ts:727` |
+| outbound | `call-signal` | `src/modules/legacy/legacy.socket.ts:769` |
+| outbound | `call:answer` | `src/legacy-src/controllers/callController.js:447` |
+| outbound | `call:ended` | `src/legacy-src/controllers/callController.js:607` |
+| outbound | `call:offer` | `src/legacy-src/controllers/callController.js:295` |
+| outbound | `call:rejected` | `src/legacy-src/controllers/callController.js:519` |
 | outbound | `chat:error` | `src/modules/chat/chat.socket.ts:159` |
 | outbound | `chat:error` | `src/modules/chat/chat.socket.ts:185` |
 | outbound | `chat:error` | `src/modules/chat/chat.socket.ts:192` |
+| outbound | `connection-matched` | `src/legacy-src/controllers/randomConnectController.js:1275` |
+| outbound | `connection-matched` | `src/legacy-src/controllers/randomConnectController.js:1276` |
+| outbound | `connection-matched` | `src/legacy-src/controllers/randomConnectionController.js:186` |
+| outbound | `connection-matched` | `src/legacy-src/controllers/randomConnectionController.js:187` |
 | outbound | `connection-matched` | `src/legacy-src/controllers/randomConnectionController.js:191` |
 | outbound | `connection-matched` | `src/legacy-src/controllers/randomConnectionController.js:197` |
+| outbound | `connection-matched` | `src/legacy-src/controllers/randomConnectionController.js:227` |
+| outbound | `connection-matched` | `src/legacy-src/controllers/randomConnectionController.js:228` |
+| outbound | `connection-matched` | `src/legacy-src/controllers/randomConnectionController.js:233` |
+| outbound | `connection-matched` | `src/legacy-src/controllers/randomConnectionController.js:234` |
+| outbound | `connection-matched` | `src/legacy-src/controllers/randomConnectionController.js:247` |
+| outbound | `connection-matched` | `src/legacy-src/controllers/randomConnectionController.js:248` |
+| outbound | `connection-matched` | `src/legacy-src/controllers/randomConnectionController.js:608` |
+| outbound | `connection-matched` | `src/legacy-src/controllers/randomConnectionController.js:609` |
+| outbound | `connection-matched` | `src/legacy-src/controllers/randomConnectionController.js:743` |
+| outbound | `connection-matched` | `src/legacy-src/controllers/randomConnectionController.js:744` |
+| outbound | `connection-matched` | `src/legacy-src/controllers/randomConnectionControllerNew.js:96` |
+| outbound | `connection-matched` | `src/legacy-src/controllers/randomConnectionControllerNew.js:97` |
 | inbound | `disconnect` | `src/infrastructure/websocket/socket.ts:133` |
 | inbound | `disconnect` | `src/modules/legacy/legacy.socket.ts:918` |
+| outbound | `group-call-ended` | `src/modules/legacy/legacy.socket.ts:343` |
+| outbound | `group-call-incoming` | `src/modules/legacy/legacy.socket.ts:840` |
 | inbound | `group-call-join` | `src/modules/legacy/legacy.socket.ts:848` |
 | outbound | `group-call-joined` | `src/modules/legacy/legacy.socket.ts:834` |
 | outbound | `group-call-joined` | `src/modules/legacy/legacy.socket.ts:879` |
 | inbound | `group-call-leave` | `src/modules/legacy/legacy.socket.ts:912` |
 | outbound | `group-call-not-found` | `src/modules/legacy/legacy.socket.ts:854` |
+| outbound | `group-call-participant-joined` | `src/modules/legacy/legacy.socket.ts:885` |
+| outbound | `group-call-participant-left` | `src/modules/legacy/legacy.socket.ts:333` |
+| outbound | `group-call-participant-left` | `src/modules/legacy/legacy.socket.ts:339` |
 | inbound | `group-call-request` | `src/modules/legacy/legacy.socket.ts:791` |
 | inbound | `group-call-signal` | `src/modules/legacy/legacy.socket.ts:888` |
+| outbound | `group-call-signal` | `src/modules/legacy/legacy.socket.ts:905` |
+| outbound | `groupInfoUpdated` | `src/legacy-src/controllers/messageController.js:1643` |
+| outbound | `groupPermissionsUpdated` | `src/legacy-src/controllers/messageController.js:2751` |
 | inbound | `join-chat-room` | `src/modules/chat/chat.socket.ts:148` |
 | inbound | `join-random-queue` | `src/modules/legacy/legacy.socket.ts:354` |
 | inbound | `join-random-room` | `src/modules/legacy/legacy.socket.ts:370` |
@@ -533,24 +597,92 @@ Generated from the mounted Express routers on 2026-07-09T11:04:58.339Z.
 | inbound | `leave-random-queue` | `src/modules/legacy/legacy.socket.ts:363` |
 | inbound | `leave-random-room` | `src/modules/legacy/legacy.socket.ts:390` |
 | inbound | `media-state` | `src/modules/legacy/legacy.socket.ts:475` |
+| outbound | `media-state` | `src/modules/legacy/legacy.socket.ts:482` |
+| outbound | `memberLeft` | `src/legacy-src/controllers/messageController.js:2458` |
+| outbound | `memberRemoved` | `src/legacy-src/controllers/messageController.js:1900` |
+| outbound | `message_deleted` | `src/legacy-src/controllers/messageController.js:2266` |
+| outbound | `message_deleted` | `src/legacy-src/controllers/messageController.js:2267` |
+| outbound | `message_deleted` | `src/legacy-src/controllers/messageController.js:2373` |
+| outbound | `message_reaction` | `src/legacy-src/controllers/messageController.js:1527` |
+| outbound | `message_reaction` | `src/legacy-src/controllers/messageController.js:1529` |
+| outbound | `message_reaction` | `src/legacy-src/controllers/messageController.js:1530` |
+| outbound | `new-notification` | `src/legacy-src/utils/notificationEmitter.js:20` |
+| outbound | `new-notification` | `src/legacy-src/utils/notificationEmitter.js:316` |
+| outbound | `newMessage` | `src/legacy-src/controllers/callController.js:647` |
+| outbound | `newMessage` | `src/legacy-src/controllers/messageController.js:350` |
+| outbound | `newMessage` | `src/legacy-src/controllers/messageController.js:1214` |
+| outbound | `newMessage` | `src/legacy-src/controllers/messageController.js:1640` |
+| outbound | `newMessage` | `src/legacy-src/controllers/messageController.js:1779` |
+| outbound | `newMessage` | `src/legacy-src/controllers/messageController.js:1895` |
+| outbound | `newMessage` | `src/legacy-src/controllers/messageController.js:2454` |
+| outbound | `newMessage` | `src/legacy-src/controllers/messageController.js:2591` |
+| outbound | `newMessage` | `src/legacy-src/controllers/messageController.js:2596` |
+| outbound | `newMessage` | `src/legacy-src/controllers/messageController.js:2774` |
+| outbound | `newMessage` | `src/legacy-src/controllers/messageController.js:2922` |
+| outbound | `newMessage` | `src/legacy-src/controllers/messageController.js:3009` |
+| outbound | `newMessage` | `src/legacy-src/controllers/recruitmentController.js:175` |
+| outbound | `newMessage` | `src/modules/chat/chat.socket.ts:190` |
+| outbound | `partner-disconnected` | `src/legacy-src/controllers/randomConnectController.js:1314` |
+| outbound | `partner-disconnected` | `src/legacy-src/controllers/randomConnectController.js:1453` |
+| outbound | `partner-disconnected` | `src/legacy-src/controllers/randomConnectController.js:1518` |
+| outbound | `partner-disconnected` | `src/legacy-src/controllers/randomConnectController.js:1731` |
+| outbound | `partner-disconnected` | `src/legacy-src/controllers/randomConnectionController.js:333` |
+| outbound | `partner-disconnected` | `src/legacy-src/controllers/randomConnectionController.js:501` |
+| outbound | `partner-disconnected` | `src/legacy-src/controllers/randomConnectionController.js:922` |
+| outbound | `partner-disconnected` | `src/legacy-src/controllers/randomConnectionController.js:1021` |
+| outbound | `partner-disconnected` | `src/legacy-src/controllers/randomConnectionControllerNew.js:154` |
+| outbound | `partner-disconnected` | `src/legacy-src/controllers/randomConnectionControllerNew.js:310` |
+| outbound | `partner-disconnected` | `src/legacy-src/controllers/randomConnectionControllerNew.js:368` |
 | inbound | `ping` | `src/infrastructure/websocket/socket.ts:122` |
 | outbound | `pong` | `src/infrastructure/websocket/socket.ts:122` |
+| outbound | `premium-entitlement-changed` | `src/legacy-src/services/premiumMembershipService.js:344` |
 | outbound | `presence:snapshot` | `src/modules/presence/presence.socket.ts:89` |
 | inbound | `presence:subscribe` | `src/modules/presence/presence.socket.ts:42` |
 | inbound | `presence:unsubscribe` | `src/modules/presence/presence.socket.ts:98` |
+| outbound | `presence:updated` | `src/legacy-src/utils/presencePrivacy.js:21` |
+| outbound | `presence:updated` | `src/legacy-src/utils/presencePrivacy.js:37` |
+| outbound | `presence:updated` | `src/modules/presence/presence.socket.ts:111` |
+| outbound | `presence:updated` | `src/modules/presence/presence.socket.ts:131` |
+| outbound | `privacy-settings-updated` | `src/legacy-src/utils/presencePrivacy.js:13` |
+| outbound | `privacy-settings-updated` | `src/legacy-src/utils/presencePrivacy.js:14` |
+| outbound | `profile-updated` | `src/legacy-src/controllers/userController.js:1811` |
+| outbound | `profile-updated` | `src/legacy-src/controllers/userController.js:1895` |
+| outbound | `profile-updated` | `src/legacy-src/controllers/userController.js:3674` |
 | inbound | `random-connection-message` | `src/modules/legacy/legacy.socket.ts:408` |
+| outbound | `random-connection-message` | `src/legacy-src/controllers/randomConnectController.js:1662` |
+| outbound | `random-connection-message` | `src/legacy-src/controllers/randomConnectController.js:1667` |
+| outbound | `random-connection-message` | `src/legacy-src/controllers/randomConnectController.js:1676` |
+| outbound | `random-connection-message` | `src/legacy-src/controllers/randomConnectionController.js:829` |
+| outbound | `random-connection-message` | `src/modules/legacy/legacy.socket.ts:418` |
+| outbound | `random-session-ended` | `src/legacy-src/controllers/randomConnectController.js:216` |
+| outbound | `random-session-ended` | `src/legacy-src/controllers/randomConnectController.js:1459` |
+| outbound | `random-session-ended` | `src/legacy-src/controllers/randomConnectController.js:1526` |
+| outbound | `random-session-ended` | `src/legacy-src/controllers/randomConnectController.js:1737` |
 | outbound | `random-session-error` | `src/modules/legacy/legacy.socket.ts:377` |
 | outbound | `random-session-error` | `src/modules/legacy/legacy.socket.ts:401` |
 | outbound | `random-session-error` | `src/modules/legacy/legacy.socket.ts:415` |
 | outbound | `random-session-error` | `src/modules/legacy/legacy.socket.ts:436` |
 | outbound | `random-session-error` | `src/modules/legacy/legacy.socket.ts:453` |
 | inbound | `random-session-ready` | `src/modules/legacy/legacy.socket.ts:396` |
+| outbound | `random-session-ready` | `src/legacy-src/controllers/randomConnectController.js:298` |
+| outbound | `random-session-timer-started` | `src/legacy-src/controllers/randomConnectController.js:330` |
+| outbound | `random-session-timer-sync` | `src/legacy-src/controllers/randomConnectController.js:337` |
 | outbound | `random-session-timer-sync` | `src/modules/legacy/legacy.socket.ts:387` |
+| outbound | `random-session-timer-warning` | `src/legacy-src/controllers/randomConnectController.js:180` |
+| outbound | `rejoined-queue` | `src/legacy-src/controllers/randomConnectionController.js:617` |
+| outbound | `rejoined-queue` | `src/legacy-src/controllers/randomConnectionController.js:774` |
 | outbound | `room-joined` | `src/modules/legacy/legacy.socket.ts:382` |
 | inbound | `send-message` | `src/modules/chat/chat.socket.ts:179` |
-| outbound | `tournament_updated` | `src/legacy-src/controllers/tournamentController.js:803` |
+| outbound | `tournament_updated` | `src/legacy-src/controllers/tournamentController.js:804` |
+| outbound | `tournament_updated` | `src/legacy-src/controllers/tournamentController.js:841` |
 | inbound | `typing-start` | `src/modules/chat/chat.socket.ts:209` |
 | inbound | `typing-stop` | `src/modules/chat/chat.socket.ts:210` |
+| outbound | `user-joined-room` | `src/modules/legacy/legacy.socket.ts:383` |
+| outbound | `user-stopped-typing` | `src/modules/chat/chat.socket.ts:138` |
+| outbound | `user-typing` | `src/modules/chat/chat.socket.ts:138` |
 | inbound | `video-state-change` | `src/modules/legacy/legacy.socket.ts:462` |
+| outbound | `video-state-change` | `src/modules/legacy/legacy.socket.ts:469` |
 | inbound | `webrtc-request-offer` | `src/modules/legacy/legacy.socket.ts:446` |
+| outbound | `webrtc-request-offer` | `src/modules/legacy/legacy.socket.ts:456` |
 | inbound | `webrtc-signal` | `src/modules/legacy/legacy.socket.ts:426` |
+| outbound | `webrtc-signal` | `src/modules/legacy/legacy.socket.ts:439` |

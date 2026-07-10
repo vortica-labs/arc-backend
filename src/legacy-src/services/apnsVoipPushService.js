@@ -4,6 +4,7 @@ const PushDevice = require('../models/PushDevice');
 const User = require('../models/User');
 const CallVoipPushAttempt = require('../models/CallVoipPushAttempt');
 const CallSession = require('../models/CallSession');
+const Notification = require('../models/Notification');
 const PushDeliveryRequest = require('../models/PushDeliveryRequest');
 const PushDeliveryAttempt = require('../models/PushDeliveryAttempt');
 const { invalidateVoipTokensByHash } = require('./pushDeviceService');
@@ -426,8 +427,56 @@ const processVoipAttempt = async (attemptId) => {
 
 const sendVoipCallPush = async (recipientId, session, callPayload = {}) => {
   const requestKey = hash(`${session.callId}:${session.nativeCallId}:apns_voip`);
+  const [recipient, unreadSummaryResult] = await Promise.all([
+    User.findById(recipientId).select('isActive notificationSettings').lean(),
+    Notification.aggregate([
+      {
+        $match: {
+          recipient: session.callee,
+          isRead: false,
+          deletedAt: null,
+          archivedAt: null
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          count: { $sum: 1 },
+          includesCall: {
+            $max: {
+              $cond: [{ $eq: ['$data.customData.callId', session.callId] }, 1, 0]
+            }
+          }
+        }
+      }
+    ])
+      .then((rows) => ({ available: true, rows }))
+      .catch(() => ({ available: false, rows: [] }))
+  ]);
+  // The in-app call row and PushKit dispatch are intentionally concurrent for
+  // low call setup latency. If the durable row has not committed yet, account
+  // for the pending unread row once; if it has committed, the snapshot already
+  // includes it.
+  const callWillBeUnread = Boolean(
+    recipient &&
+    recipient.isActive !== false &&
+    recipient.notificationSettings?.inAppEnabled !== false &&
+    recipient.notificationSettings?.messages !== false
+  );
+  const unreadSnapshot = unreadSummaryResult.rows[0] || {};
+  const canonicalUnreadCount = unreadSummaryResult.available
+    ? Math.max(0, Math.min(
+        9999,
+        Math.floor(Number(unreadSnapshot.count) || 0) +
+          (callWillBeUnread && Number(unreadSnapshot.includesCall) !== 1 ? 1 : 0)
+      ))
+    : null;
   const payload = {
-    aps: { 'content-available': 1 },
+    aps: {
+      'content-available': 1,
+      ...(canonicalUnreadCount !== null ? { badge: canonicalUnreadCount } : {})
+    },
+    ...(canonicalUnreadCount !== null ? { unreadCount: canonicalUnreadCount } : {}),
     uuid: session.nativeCallId,
     callId: session.callId,
     callerId: String(session.caller),
@@ -443,7 +492,6 @@ const sendVoipCallPush = async (recipientId, session, callPayload = {}) => {
   // PushKit is a transport, not a bypass around the recipient's preferences.
   // Calls share the existing `messages` preference bucket in the canonical
   // notification policy, so apply that decision before creating attempts.
-  const recipient = await User.findById(recipientId).select('isActive notificationSettings').lean();
   if (!recipient || recipient.isActive === false) {
     await skipVoipRequest(requestKey, 'RECIPIENT_INACTIVE', 'Recipient is missing or inactive');
     return { submitted: 0, accepted: 0, failed: 0, reason: 'recipient_inactive' };

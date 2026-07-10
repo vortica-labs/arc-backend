@@ -10,6 +10,18 @@ const {
 
 let transporter = null;
 
+const EMAIL_BRAND = 'Squadhunt';
+const DEFAULT_FROM_ADDRESS = 'noreply@squadhunt.in';
+
+const resolveEmailFrom = () => {
+  const configured = String(process.env.SMTP_FROM || process.env.SMTP_USER || '').trim();
+  const bracketedAddress = configured.match(/<\s*([^<>]+)\s*>$/)?.[1];
+  const bareAddress = /^[^\s<>@]+@[^\s<>@]+$/.test(configured) ? configured : '';
+  const candidate = String(bracketedAddress || bareAddress).trim();
+  const address = /^[^\s<>@]+@[^\s<>@]+$/.test(candidate) ? candidate : DEFAULT_FROM_ADDRESS;
+  return `${EMAIL_BRAND} <${address}>`;
+};
+
 function getTransporter() {
   if (transporter) return transporter;
   const host = process.env.SMTP_HOST || 'smtp.gmail.com';
@@ -70,12 +82,15 @@ async function sendMail({
     return { sent: false, error: 'Email not configured' };
   }
   try {
-    const from = process.env.SMTP_FROM || process.env.SMTP_USER || 'ARC Gaming <noreply@arc.local>';
+    // The SMTP mailbox is deployment-configurable, but the public sender name
+    // is canonical so stale infrastructure values cannot reintroduce legacy
+    // branding in a recipient's inbox.
+    const from = resolveEmailFrom();
     log.info('Email dispatch authorized', audit);
     const info = await trans.sendMail({
       from,
       to: Array.isArray(to) ? to.join(', ') : to,
-      subject: subject || 'ARC Gaming',
+      subject: subject || EMAIL_BRAND,
       text: text || '',
       html: html || text
     });
@@ -112,24 +127,24 @@ async function sendOTPEmail(to, otp, purpose = 'login') {
   let headerSubtitle = '';
 
   if (purpose === 'login') {
-    subject = 'Login to ARC using OTP';
-    headerTitle = 'Login to ARC using OTP';
+    subject = 'Login to Squadhunt using OTP';
+    headerTitle = 'Login to Squadhunt using OTP';
     headerSubtitle = 'Secure one‑time verification for your account.';
   } else if (purpose === 'register') {
-    subject = 'Verify your email for ARC';
-    headerTitle = 'Verify your email for ARC';
+    subject = 'Verify your email for Squadhunt';
+    headerTitle = 'Verify your email for Squadhunt';
     headerSubtitle = 'Complete your signup by confirming this email address.';
   } else if (purpose === 'forgot_password') {
-    subject = 'Reset your ARC password';
-    headerTitle = 'Reset your ARC password';
+    subject = 'Reset your Squadhunt password';
+    headerTitle = 'Reset your Squadhunt password';
     headerSubtitle = 'Use this OTP to securely reset your password.';
   } else {
-    subject = 'ARC verification code';
-    headerTitle = 'ARC verification code';
+    subject = 'Squadhunt verification code';
+    headerTitle = 'Squadhunt verification code';
     headerSubtitle = 'Use this code to complete your action.';
   }
 
-  const text = `Your ARC OTP is: ${otp}. Valid for 10 minutes. Do not share with anyone.`;
+  const text = `Your Squadhunt OTP is: ${otp}. Valid for 10 minutes. Do not share with anyone.`;
 
   const html = `
     <div style="font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#0b1120; padding:24px;">
@@ -160,9 +175,9 @@ async function sendOTPEmail(to, otp, purpose = 'login') {
               Need help? Email
               <a href="mailto:support@squadhunt.com" style="color:#9ca3af;text-decoration:none;"> support@squadhunt.com</a>
               or visit
-              <a href="https://arc.squadhunt.com" style="color:#9ca3af;text-decoration:none;"> arc.squadhunt.com</a>.
+              <a href="https://squadhunt.in" style="color:#9ca3af;text-decoration:none;"> squadhunt.in</a>.
             </p>
-            <p style="margin:0;font-size:11px;color:#6b7280;">— ARC</p>
+            <p style="margin:0;font-size:11px;color:#6b7280;">— Squadhunt</p>
           </td>
         </tr>
       </table>
@@ -203,16 +218,16 @@ const sanitizeEmailLink = (value) => {
 };
 
 async function sendNotificationEmail(to, title, message, link, context = {}) {
-  const subject = `ARC: ${title}`;
+  const subject = `Squadhunt: ${title}`;
   const safeLink = sanitizeEmailLink(link);
-  const text = `${title}\n\n${message}${safeLink ? `\n\nView: ${safeLink}` : ''}`;
+  const text = `${title}\n\n${message}${safeLink ? `\n\nView in Squadhunt: ${safeLink}` : ''}\n\n— Squadhunt`;
   const html = `
     <div style="font-family: sans-serif;">
       <h3>${escapeHtml(title)}</h3>
       <p>${escapeHtml(message)}</p>
-      ${safeLink ? `<p><a href="${escapeHtml(safeLink)}">View</a></p>` : ''}
+      ${safeLink ? `<p><a href="${escapeHtml(safeLink)}">View in Squadhunt</a></p>` : ''}
       <p style="margin:8px 0 2px;color: #999; font-size: 12px;">Need help? Email <a href="mailto:support@squadhunt.com" style="color:#9ca3af;text-decoration:none;">support@squadhunt.com</a>.</p>
-      <p style="margin:0;color: #999; font-size: 12px;">— ARC</p>
+      <p style="margin:0;color: #999; font-size: 12px;">— Squadhunt</p>
     </div>
   `;
   return sendTransactionalEmail({
@@ -233,5 +248,6 @@ module.exports = {
   sendOTPEmail,
   sendNotificationEmail,
   escapeHtml,
-  sanitizeEmailLink
+  sanitizeEmailLink,
+  resolveEmailFrom
 };

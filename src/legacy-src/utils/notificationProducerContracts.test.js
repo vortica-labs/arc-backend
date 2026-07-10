@@ -110,6 +110,7 @@ assert(scrimController.includes('customData: {\n            scrimId: scrim._id')
 for (const eventType of [
   'scrim_registration_joined',
   'scrim_registration_left',
+  'scrim_updated',
   'scrim_match_results',
   'scrim_cancelled',
   'scrim_final_results'

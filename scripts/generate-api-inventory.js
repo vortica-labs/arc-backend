@@ -110,7 +110,7 @@ const firstStringArgument = (argumentsSource) => {
 
 const mergeAccess = (...values) => {
   const joined = values.filter(Boolean).join(' ');
-  if (/requireHardcodedAdminAuth|requireAdminPermission|requireSuperAdmin/.test(joined)) return 'admin';
+  if (/\brequireAdmin\b|requireHardcodedAdminAuth|requireAdminPermission|requireSuperAdmin/.test(joined)) return 'admin';
   if (/protectAllowIncomplete/.test(joined)) return 'authenticated-onboarding';
   if (/\bprotect\b|\brequireAuth\b|\bauthorize\s*\(/.test(joined)) return 'authenticated';
   if (/\boptionalAuth\b/.test(joined) && !/publicOptionalAuth/.test(joined)) return 'user-or-guest';
@@ -143,7 +143,7 @@ const getRouterWideAccessSource = (source) => {
   const expression = /router\.use\s*\(([^\n;]+)\)\s*;/g;
   for (const match of masked.matchAll(expression)) {
     if (/^[\s]*["'`]/.test(match[1])) continue;
-    if (/protect|authorize\s*\(|requireHardcodedAdminAuth|requireAdminPermission|requireSuperAdmin/.test(match[1])) {
+    if (/protect|authorize\s*\(|\brequireAdmin\b|requireHardcodedAdminAuth|requireAdminPermission|requireSuperAdmin/.test(match[1])) {
       guards.push(match[1]);
     }
   }
@@ -223,9 +223,13 @@ for (const mount of indexSource.matchAll(mountExpression)) {
   scanRouteFile(file, mount[2]);
 }
 
-// calls.routes.ts deliberately bridges to the one mounted CommonJS legacy
-// router, so include that real implementation instead of reporting the wrapper.
+// These TypeScript wrappers deliberately bridge to mounted CommonJS legacy
+// routers through a computed `require(path.join(...))`. Static ES-import
+// discovery cannot follow that expression, so scan the real implementations.
+// Keeping the bridges here prevents live call/ICE endpoints from silently
+// disappearing from the generated API contract.
 scanRouteFile(path.join(ROOT, 'src', 'legacy-src', 'routes', 'calls.js'), '/api/calls');
+scanRouteFile(path.join(ROOT, 'src', 'legacy-src', 'routes', 'rtc.js'), '/api/rtc');
 
 routeRecords.push(
   { method: 'GET', path: '/', access: 'public', source: 'src/app.ts', line: 64 },
@@ -247,9 +251,8 @@ const sourceFiles = walk(path.join(ROOT, 'src')).filter((file) => {
   if (!/\.(?:ts|js)$/.test(file)) return false;
   return !/\.(?:test|spec)\.(?:ts|js)$/.test(file);
 });
-const inboundSocketFiles = sourceFiles.filter((file) => /(?:socket|Socket).*\.(?:ts|js)$/.test(path.basename(file)));
 const socketEvents = [];
-for (const file of inboundSocketFiles) {
+for (const file of sourceFiles) {
   const source = read(file);
   const masked = maskComments(source);
   const inbound = /\b(?:socket|clientSocket)\.on\s*\(\s*(["'`])([^"'`]+)\1/g;
@@ -261,11 +264,41 @@ for (const file of inboundSocketFiles) {
       line: lineNumberAt(source, match.index)
     });
   }
+
+  // Some handlers intentionally register a fixed set of event names in a
+  // loop. Preserve each literal in the contract instead of losing the whole
+  // group merely because socket.on() receives the loop variable.
+  const loopEvents = /for\s*\(\s*const\s+([A-Za-z_$][\w$]*)\s+of\s+\[([^\]]+)](?:\s+as\s+const)?\s*\)/g;
+  for (const loop of masked.matchAll(loopEvents)) {
+    const variable = loop[1];
+    const nearby = masked.slice(loop.index, Math.min(masked.length, loop.index + 8000));
+    const listens = new RegExp(`\\b(?:socket|clientSocket)\\.on\\s*\\(\\s*${variable}\\b`).test(nearby);
+    const emits = new RegExp(`\\.emit\\s*\\(\\s*${variable}\\b`).test(nearby);
+    if (!listens && !emits) continue;
+    const literals = [...loop[2].matchAll(/(["'`])([^"'`]+)\1/g)];
+    for (const literal of literals) {
+      if (listens) socketEvents.push({
+        direction: 'inbound',
+        event: literal[2],
+        source: relative(file),
+        line: lineNumberAt(source, loop.index)
+      });
+      if (emits) socketEvents.push({
+        direction: 'outbound',
+        event: literal[2],
+        source: relative(file),
+        line: lineNumberAt(source, loop.index)
+      });
+    }
+  }
 }
 for (const file of sourceFiles) {
   const source = read(file);
   const masked = maskComments(source);
-  const outbound = /\b(?:socket|io|server|targetSocket|recipientSocket|callerSocket|calleeSocket)\.emit\s*\(\s*(["'`])([^"'`]+)\1/g;
+  // Socket.IO commonly emits through room/broadcast chains (`io.to(...).emit`)
+  // and through optional chains. Restricting discovery to a bare `io.emit`
+  // omitted most production message, notification, presence, and call events.
+  const outbound = /\.emit\s*\(\s*(["'`])([^"'`]+)\1/g;
   for (const match of masked.matchAll(outbound)) {
     socketEvents.push({
       direction: 'outbound',
@@ -274,6 +307,28 @@ for (const file of sourceFiles) {
       line: lineNumberAt(source, match.index)
     });
   }
+
+  // Capture the two literal outcomes when the emitted name is selected by a
+  // conditional expression (for example typing-start vs typing-stop).
+  const conditionalOutbound = /\.emit\s*\(\s*[^?,\n]+\?\s*(["'`])([^"'`]+)\1\s*:\s*(["'`])([^"'`]+)\3/g;
+  for (const match of masked.matchAll(conditionalOutbound)) {
+    for (const event of [match[2], match[4]]) socketEvents.push({
+      direction: 'outbound',
+      event,
+      source: relative(file),
+      line: lineNumberAt(source, match.index)
+    });
+  }
+
+  // Random Connect deliberately centralizes room fan-out behind this helper;
+  // its third argument is still the concrete Socket.IO event contract.
+  const participantOutbound = /\bemitToParticipants\s*\(\s*[^,]+,\s*[^,]+,\s*(["'`])([^"'`]+)\1/g;
+  for (const match of masked.matchAll(participantOutbound)) socketEvents.push({
+    direction: 'outbound',
+    event: match[2],
+    source: relative(file),
+    line: lineNumberAt(source, match.index)
+  });
 }
 const sockets = [...new Map(socketEvents
   .map((record) => [`${record.direction} ${record.event} ${record.source} ${record.line}`, record]))

@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
+const fs = require('node:fs');
 const path = require('node:path');
 const { extractToken } = require('./jwt');
 
@@ -8,6 +9,20 @@ assert.equal(extractToken({ headers: { authorization: 'Bearer header-token' } })
 assert.equal(extractToken({ headers: {}, cookies: { token: 'secure-cookie-token' } }), 'secure-cookie-token');
 
 const backendRoot = path.resolve(__dirname, '../../..');
+const infrastructureNotes = fs.readFileSync(path.join(backendRoot, 'aws-infra.txt'), 'utf8');
+assert.doesNotMatch(
+  infrastructureNotes,
+  /mongodb(?:\+srv)?:\/\/[^\s:@/]+:[^\s@/]+@/i,
+  'Infrastructure documentation must not contain credential-bearing MongoDB URIs'
+);
+const documentedDatabasePassword = infrastructureNotes
+  .split(/\r?\n/)
+  .find((line) => line.startsWith('DocumentDB Pass'));
+assert.equal(
+  documentedDatabasePassword?.split(':').slice(1).join(':').trim(),
+  '<stored in AWS Secrets Manager>',
+  'Infrastructure documentation must reference Secrets Manager instead of embedding the database password'
+);
 const noPayloadKey = spawnSync(process.execPath, ['-e', `
   delete process.env.ENCRYPTION_KEY;
   process.env.ENABLE_PAYLOAD_ENCRYPTION = 'true';

@@ -5,6 +5,7 @@ const User = require('../models/User');
 const mongoose = require('mongoose');
 const safeAsyncHandler = require('../utils/safeAsyncHandler');
 const log = require('../utils/logger');
+const { isSocialPreviewRequest } = require('../utils/socialPreviewRequest');
 const { createAndEmitNotification } = require('../utils/notificationEmitter');
 const { resolvePrivacyAccess } = require('../utils/privacyPolicy');
 const {
@@ -364,7 +365,7 @@ const getTeamRecruitment = safeAsyncHandler(async (req, res) => {
     });
   }
 
-  if (!isOwner) {
+  if (!isOwner && !isSocialPreviewRequest(req)) {
     await TeamRecruitment.updateOne({ _id: recruitment._id }, { $inc: { views: 1 } });
     recruitment.views = (Number(recruitment.views) || 0) + 1;
   }
@@ -751,7 +752,7 @@ const getPlayerProfile = safeAsyncHandler(async (req, res) => {
     });
   }
 
-  if (!isOwner) {
+  if (!isOwner && !isSocialPreviewRequest(req)) {
     await PlayerProfile.updateOne({ _id: profile._id }, { $inc: { views: 1 } });
     profile.views = (Number(profile.views) || 0) + 1;
   }

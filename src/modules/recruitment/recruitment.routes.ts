@@ -12,10 +12,14 @@ import {
   validateRecruitmentUpdate
 } from "./recruitment.legacy-adapters";
 
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { markSocialPreviewRequest } = require("../../legacy-src/utils/socialPreviewRequest.js");
+
 const router = Router();
 
 router.post("/team-recruitments", protect, ...validateRecruitment, recruitmentController.createTeamRecruitment);
 router.get("/team-recruitments", protect, recruitmentController.getTeamRecruitments);
+router.get("/recruitment/:code/preview", markSocialPreviewRequest, publicOptionalAuth, recruitmentController.getTeamRecruitment);
 router.get("/recruitment/:code", publicOptionalAuth, recruitmentController.getTeamRecruitment);
 router.get("/team-recruitments/:id", publicOptionalAuth, recruitmentController.getTeamRecruitment);
 router.put("/team-recruitments/:id", protect, ...validateRecruitmentUpdate, recruitmentController.updateTeamRecruitment);
@@ -26,6 +30,7 @@ router.delete("/team-recruitments/:id", protect, recruitmentController.deleteTea
 router.post("/player-profiles", protect, ...validatePlayerProfile, recruitmentController.createPlayerProfile);
 router.get("/player-profiles/daily-limit", protect, recruitmentController.getPlayerCardLimit);
 router.get("/player-profiles", protect, recruitmentController.getPlayerProfiles);
+router.get("/profile/:code/preview", markSocialPreviewRequest, publicOptionalAuth, recruitmentController.getPlayerProfile);
 router.get("/player-profiles/:id", publicOptionalAuth, recruitmentController.getPlayerProfile);
 router.get("/profile/:code", publicOptionalAuth, recruitmentController.getPlayerProfile);
 router.put("/player-profiles/:id", protect, ...validatePlayerProfileUpdate, recruitmentController.updatePlayerProfile);

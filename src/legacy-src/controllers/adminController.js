@@ -3,6 +3,7 @@ const Post = require('../models/Post');
 const Report = require('../models/Report');
 const { Message } = require('../models/Message');
 const Tournament = require('../models/Tournament');
+const Scrim = require('../models/Scrim');
 const Notification = require('../models/Notification');
 const Story = require('../models/Story');
 const TeamRecruitment = require('../models/TeamRecruitment');
@@ -705,8 +706,8 @@ const updateUserStatus = async (req, res) => {
       userId,
       isActive ? 'Account Access Restored' : 'Account Suspended',
       isActive
-        ? 'Your ARC account access has been restored by an administrator.'
-        : 'Your ARC account has been suspended by an administrator. Contact ARC support if you believe this was a mistake.',
+        ? 'Your Squadhunt account access has been restored by an administrator.'
+        : 'Your Squadhunt account has been suspended by an administrator. Contact Squadhunt support if you believe this was a mistake.',
       { type: isActive ? 'account_restored' : 'account_suspended' },
       notificationEmail(
         EMAIL_INTENTS.ACCOUNT_LIFECYCLE,
@@ -1056,6 +1057,97 @@ const deleteTournament = async (req, res) => {
   }
 };
 
+// Scrim Management
+// Scrims are embedded competition documents, so the admin surface can inspect
+// and moderate them without creating a second management model or workflow.
+const getScrims = async (req, res) => {
+  try {
+    const page = normalizePage(req.query.page);
+    const limit = normalizeLimit(req.query.limit, 20, 100);
+    const search = normalizeSearchPattern(req.query.search);
+    const status = typeof req.query.status === 'string' ? req.query.status.trim() : '';
+    const scrimType = typeof req.query.scrimType === 'string' ? req.query.scrimType.trim() : '';
+    const format = typeof req.query.format === 'string' ? req.query.format.trim() : '';
+    const allowedStatuses = new Set(['', 'all', 'Open', 'Full', 'In Progress', 'Completed', 'Cancelled']);
+    const allowedTypes = new Set(['', 'all', 'Daily', 'Weekly']);
+    const allowedFormats = new Set(['', 'all', 'Solo', 'Squad']);
+
+    if (!allowedStatuses.has(status) || !allowedTypes.has(scrimType) || !allowedFormats.has(format)) {
+      return res.status(400).json({ success: false, message: 'Invalid scrim filter' });
+    }
+
+    const query = {};
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } },
+        { scrimCode: { $regex: search, $options: 'i' } }
+      ];
+    }
+    if (status && status !== 'all') query.status = status;
+    if (scrimType && scrimType !== 'all') query.scrimType = scrimType;
+    if (format && format !== 'all') query.format = format;
+
+    const [scrims, total, statusSummary] = await Promise.all([
+      Scrim.find(query)
+        .select('name description game format scrimType timeSlot numberOfMatches status date endDate maxTeams registeredTeams scrimCode host matches.matchNumber matches.map matches.idpTime matches.startTime matches.status prizePool prizePoolType prizePoolCurrency timezone createdAt updatedAt')
+        .populate('host', 'username userType profile.displayName profile.avatar')
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      Scrim.countDocuments(query),
+      Scrim.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }])
+    ]);
+
+    const summary = statusSummary.reduce((result, row) => {
+      result[row._id || 'Unknown'] = Number(row.count || 0);
+      return result;
+    }, {});
+
+    return res.json({
+      success: true,
+      data: {
+        scrims: scrims.map((scrim) => ({
+          ...scrim,
+          registeredTeams: Array.isArray(scrim.registeredTeams) ? scrim.registeredTeams.filter(Boolean) : [],
+          matches: Array.isArray(scrim.matches) ? scrim.matches.filter(Boolean) : []
+        })),
+        summary,
+        pagination: {
+          total,
+          pages: Math.ceil(total / limit),
+          currentPage: page,
+          limit
+        }
+      }
+    });
+  } catch (error) {
+    log.error('Get admin scrims error:', { error: String(error) });
+    return res.status(500).json({ success: false, message: 'Failed to load scrims' });
+  }
+};
+
+const deleteScrim = async (req, res) => {
+  try {
+    const { scrimId } = req.params;
+    const scrim = await Scrim.findById(scrimId).select('_id name status').lean();
+    if (!scrim) return res.status(404).json({ success: false, message: 'Scrim not found' });
+
+    const deletion = await Scrim.deleteOne({ _id: scrimId });
+    if (Number(deletion?.deletedCount || 0) !== 1) {
+      return res.status(409).json({ success: false, message: 'Scrim changed while it was being moderated. Refresh and try again.' });
+    }
+
+    res.locals.auditBefore = scrim;
+    res.locals.auditAfter = null;
+    return res.json({ success: true, message: 'Scrim deleted successfully' });
+  } catch (error) {
+    log.error('Delete admin scrim error:', { error: String(error) });
+    return res.status(500).json({ success: false, message: 'Failed to delete scrim' });
+  }
+};
+
 // Reports: list all reports
 const getReports = async (req, res) => {
   try {
@@ -1177,7 +1269,7 @@ const updateReport = async (req, res) => {
         await createSystemNotification(
           targetOwnerId,
           'Account Suspended',
-          'Your ARC account has been suspended following a report review. Contact ARC support if you believe this was a mistake.',
+          'Your Squadhunt account has been suspended following a report review. Contact Squadhunt support if you believe this was a mistake.',
           { type: 'account_suspended', reportId: report._id },
           notificationEmail(EMAIL_INTENTS.ACCOUNT_LIFECYCLE, 'report_account_suspended')
         );
@@ -2785,7 +2877,7 @@ const revokeHostVerification = async (req, res) => {
         createSystemNotification(
           userId,
           'Verified Host Status Revoked',
-          'Your Verified Host status has been revoked by an administrator. Contact ARC support if you believe this was a mistake.',
+          'Your Verified Host status has been revoked by an administrator. Contact Squadhunt support if you believe this was a mistake.',
           {
             type: 'host_verification_revoked',
             applicationId: result.application?._id,
@@ -3936,6 +4028,8 @@ module.exports = {
   deletePost,
   getTournaments,
   deleteTournament,
+  getScrims,
+  deleteScrim,
   resetUserPassword,
   getReports,
   updateReport,

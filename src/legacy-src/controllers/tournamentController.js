@@ -42,6 +42,7 @@ const {
   mongoCapacityUsedExpression
 } = require('../utils/tournamentCapacity');
 const { buildTournamentEntrantRemovalUpdate } = require('../utils/tournamentCompetitionState');
+const { getTimezoneDayBounds } = require('../utils/timezoneDayBounds');
 
 const TOURNAMENT_UPLOAD_DIR = path.resolve(process.cwd(), 'uploads', 'tournaments');
 
@@ -7340,14 +7341,13 @@ const getHostingLimits = async (req, res) => {
 
     // Scrim: 5 per day
     const Scrim = require('../models/Scrim');
-    const startOfDay = new Date();
-    startOfDay.setHours(0, 0, 0, 0);
+    const { start: startOfDay, end: nextDay } = getTimezoneDayBounds('Asia/Kolkata');
     const todayScrimCount = await Scrim.countDocuments({
       host: hostId,
-      createdAt: { $gte: startOfDay }
+      createdAt: { $gte: startOfDay, $lt: nextDay }
     });
     const scrimAllowed = todayScrimCount < 5;
-    const scrimNextAt = scrimAllowed ? null : new Date(startOfDay.getTime() + 24 * 60 * 60 * 1000);
+    const scrimNextAt = scrimAllowed ? null : nextDay;
 
     return res.json({
       success: true,

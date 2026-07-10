@@ -29,7 +29,9 @@ const previousSmtpPass = process.env.SMTP_PASS;
     const email = buildPasswordSecurityEmail(eventType);
     assert.equal(email.eventType, eventType);
     assert.ok(email.subject.includes('password'));
-    assert.ok(email.text.includes('contact ARC support immediately'));
+    assert.ok(email.text.includes('contact Squadhunt support immediately'));
+    assert.ok(email.subject.includes('Squadhunt'));
+    assert.equal(/\bARC\b/i.test(`${email.subject} ${email.text}`), false);
     assert.equal(/otp|one[- ]time|new password|temporary password/i.test(`${email.subject} ${email.text}`), false);
     assert.equal(
       evaluateEmailPolicy({ intent: EMAIL_INTENTS.SECURITY, eventType }).allowed,

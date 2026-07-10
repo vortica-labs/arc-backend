@@ -1,7 +1,12 @@
 import { Router } from "express";
+import type { RequestParamHandler } from "express";
 import { protect, publicOptionalAuth, scrimController } from "./scrims.legacy-adapters";
 
 const router = Router();
+
+const validateIdentifier = scrimController.validateScrimIdentifierParam as unknown as RequestParamHandler;
+router.param("id", validateIdentifier);
+router.param("code", validateIdentifier);
 
 router.route("/")
   .get(publicOptionalAuth, scrimController.getScrims)

@@ -23,7 +23,7 @@ export const rejectStructuredAdminQuery = (req: Request, res: Response, next: Ne
   return next();
 };
 const mongoObjectIdPattern = /^[a-f\d]{24}$/i;
-for (const parameterName of ["userId", "postId", "tournamentId", "reportId", "campaignId", "applicationId", "id"]) {
+for (const parameterName of ["userId", "postId", "tournamentId", "scrimId", "reportId", "campaignId", "applicationId", "id"]) {
   router.param(parameterName, (_req, res, next, value) => {
     if (!mongoObjectIdPattern.test(String(value || ""))) {
       return res.status(400).json({
@@ -96,6 +96,8 @@ router.get("/posts", auditLog("VIEW_POSTS"), requireAdminPermission("content:man
 router.delete("/posts/:postId", auditLog("DELETE_POST"), requireAdminPermission("content:manage"), adminController.deletePost);
 router.get("/tournaments", auditLog("VIEW_TOURNAMENTS"), requireAdminPermission("tournaments:manage"), adminController.getTournaments);
 router.delete("/tournaments/:tournamentId", auditLog("DELETE_TOURNAMENT"), requireAdminPermission("tournaments:manage"), adminController.deleteTournament);
+router.get("/scrims", auditLog("VIEW_SCRIMS"), requireAdminPermission("tournaments:manage"), adminController.getScrims);
+router.delete("/scrims/:scrimId", auditLog("DELETE_SCRIM"), requireAdminPermission("tournaments:manage"), adminController.deleteScrim);
 router.get("/reports", auditLog("VIEW_REPORTS"), requireAdminPermission("reports:manage"), adminController.getReports);
 router.put("/reports/:reportId", auditLog("UPDATE_REPORT"), requireAdminPermission("reports:manage"), adminController.updateReport);
 router.get("/boost-campaigns", auditLog("VIEW_BOOST_CAMPAIGNS"), requireAdminPermission("boost_delivery:read"), adminController.getBoostCampaigns);

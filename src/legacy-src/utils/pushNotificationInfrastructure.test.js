@@ -28,6 +28,7 @@ const queueSource = read('infrastructure/jobs/queue.ts');
 const serverSource = read('server.ts');
 const authSource = read('legacy-src/controllers/authController.js');
 const authMiddlewareSource = read('legacy-src/middleware/auth.js');
+const voipSource = read('legacy-src/services/apnsVoipPushService.js');
 const migrationSource = fs.readFileSync(path.resolve(root, '..', 'scripts', 'migrate-push-infrastructure.js'), 'utf8');
 const preflightSource = fs.readFileSync(path.resolve(root, '..', 'scripts', 'preflight-push-release.js'), 'utf8');
 
@@ -99,6 +100,8 @@ assert.equal(callMessage.channelId, 'calls');
 assert.equal(callMessage.ttl, 30);
 assert.equal(callMessage.priority, 'high');
 assert.equal(callMessage._contentAvailable, true);
+assert.equal(callMessage.badge, 1);
+assert.equal(callMessage.data.unreadCount, 1);
 assert.equal(callMessage.data.callId, '507f1f77bcf86cd799439014');
 assert.equal(callMessage.data.nativeCallId, '89d4a55d-3e3c-4d11-89cb-8df7b4df775b');
 assert.equal(callMessage.data.roomId, 'room-1');
@@ -112,6 +115,7 @@ assert.equal(androidCallMessage.title, undefined, 'Android calls must be data-on
 assert.equal(androidCallMessage.body, undefined);
 assert.equal(androidCallMessage.channelId, undefined);
 assert.equal(androidCallMessage.data.callerName, 'Test Caller');
+assert.equal(androidCallMessage.data.unreadCount, 1, 'data-only Android calls must carry the canonical launcher badge count');
 assert.equal(androidCallMessage.priority, 'high');
 
 const [iosCallStateMessage] = buildExpoMessages([{
@@ -165,6 +169,8 @@ assert.equal(storyMessage.data.storyId, 'story-1');
 assert.equal(storyMessage.data.targetType, 'story');
 assert.equal(storyMessage.data.targetId, 'story-1');
 assert.equal(storyMessage.data.route, '/story/story-1');
+assert.equal(storyMessage.badge, 2);
+assert.equal(storyMessage.data.unreadCount, 2);
 
 const [recruitmentMessage] = buildExpoMessages(['ExpoPushToken[test-recruitment-token]'], {
   type: 'recruitment', title: 'Recruitment update', message: 'Your application was reviewed',
@@ -172,7 +178,31 @@ const [recruitmentMessage] = buildExpoMessages(['ExpoPushToken[test-recruitment-
 }, 1);
 assert.equal(recruitmentMessage.channelId, 'tournaments');
 assert.equal(recruitmentMessage.data.recruitmentId, 'recruitment-1');
+assert.equal(recruitmentMessage.data.unreadCount, 1);
 assert.equal(recruitmentMessage.data.route, '/recruitment/recruitment-1');
+
+const [badgeSyncMessage] = buildExpoMessages([{
+  token: 'ExpoPushToken[test-badge-sync]',
+  platform: 'android'
+}], {
+  type: 'system',
+  title: 'SquadHunt',
+  message: 'Notification badge updated',
+  data: {
+    customData: {
+      eventType: 'badge_sync',
+      deliveryType: 'push',
+      pushOptions: { priority: 'normal', collapseKey: 'badge-sync-user' }
+    }
+  }
+}, 4);
+assert.equal(badgeSyncMessage.title, undefined);
+assert.equal(badgeSyncMessage.body, undefined);
+assert.equal(badgeSyncMessage.badge, 4);
+assert.equal(badgeSyncMessage.data.unreadCount, 4);
+assert.equal(badgeSyncMessage.data.eventType, 'badge_sync');
+assert.equal(badgeSyncMessage._contentAvailable, true);
+assert.equal(badgeSyncMessage.collapseId, 'badge-sync-user');
 
 const callData = buildPushData(callNotification);
 for (const field of ['eventType', 'callId', 'nativeCallId', 'roomId', 'randomRoomId', 'callType', 'callerId', 'deadlineAt', 'expiresAt']) {
@@ -275,6 +305,15 @@ assert(serviceSource.includes('REQUEST_RECOVERY_EXHAUSTED'));
 assert(serviceSource.includes("(!isIncomingCall || allowIosVoipFallback || entry.platform !== 'ios' || !entry.voipTokenHash)"));
 assert(serviceSource.includes("error.retryAfter = response.headers.get('retry-after')"));
 assert(serviceSource.includes("errorCode === 'DeviceNotRegistered'"));
+assert(serviceSource.includes('unreadCountByClient'), 'provider badges must use per-installation visibility');
+assert(serviceSource.includes("'data.targetAppVersions': client.appVersion"));
+assert(!serviceSource.includes("$and: visibility\n    }).catch(() => 0)"), 'unread query failures must never clear a valid badge to zero');
+assert(serviceSource.includes('unreadCount: canonicalUnreadCount'));
+assert(serviceSource.includes('const badge = canonicalUnreadCount'));
+assert(voipSource.includes("'content-available': 1"));
+assert(voipSource.includes("canonicalUnreadCount !== null ? { badge: canonicalUnreadCount }"));
+assert(voipSource.includes("canonicalUnreadCount !== null ? { unreadCount: canonicalUnreadCount }"));
+assert(voipSource.includes(".catch(() => ({ available: false, rows: [] }))"));
 
 assert(notificationRoutes.includes('installationId: requestedInstallationId'));
 assert(notificationRoutes.includes('deviceId'));
@@ -282,6 +321,14 @@ assert(notificationRoutes.includes('router.delete("/client-context"'));
 assert(notificationRoutes.includes('advanceGenericPushDelivery'));
 assert(notificationRoutes.includes('clientDeliveredAt: { $ifNull'));
 assert(notificationRoutes.includes('pushTestLimiter'));
+assert(notificationRoutes.includes('countVisibleUnreadNotifications'));
+assert(notificationRoutes.includes('data: { alreadyRead, unreadCount }'));
+assert(notificationRoutes.includes('data: { unreadCount: 0 }'));
+assert(notificationRoutes.includes('scheduleUnreadBadgeSync(userId, "notification_read")'));
+assert(notificationRoutes.includes('scheduleUnreadBadgeSync(userId, "notifications_read_all")'));
+assert(notificationRoutes.includes('scheduleUnreadBadgeSync(userId, "notification_deleted")'));
+assert(notificationRoutes.includes('scheduleUnreadBadgeSync(userId, "notification_archived")'));
+assert(notificationRoutes.includes('scheduleUnreadBadgeSync(userId, "notification_unarchived")'));
 assert(authSource.includes('removedPushInstallations'));
 assert(authSource.includes("removePushDevices"));
 assert(authSource.includes('delete value.pushTokens'));

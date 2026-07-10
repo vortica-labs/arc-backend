@@ -290,11 +290,16 @@ const buildRouteFromNotification = (notification) => {
   return '/notifications';
 };
 
-const buildPushData = (notification) => {
+const normalizeUnreadCount = (value) => Number.isFinite(Number(value))
+  ? Math.max(0, Math.min(9999, Math.floor(Number(value))))
+  : 0;
+
+const buildPushData = (notification, unreadCount = 0) => {
   const data = notification?.data || {};
   const customData = data.customData || {};
   const route = buildRouteFromNotification(notification);
   const broadcastId = toId(data.broadcastId || customData.broadcastId);
+  const canonicalUnreadCount = normalizeUnreadCount(unreadCount);
 
   // Provider payloads have a tight size ceiling. Broadcast rich media and CTA
   // already travel as richContent/deepLink, so do not duplicate the same large
@@ -316,6 +321,7 @@ const buildPushData = (notification) => {
       targetAppVersions: Array.isArray(data.targetAppVersions)
         ? data.targetAppVersions
         : (Array.isArray(customData.targetAppVersions) ? customData.targetAppVersions : []),
+      unreadCount: canonicalUnreadCount,
       type: notification?.type || 'system'
     };
   }
@@ -337,6 +343,7 @@ const buildPushData = (notification) => {
     pushRequestId: sanitizeString(customData.pushRequestId).slice(0, 200) || undefined,
     pushDeliveryAttemptId: toId(customData.pushDeliveryAttemptId) || undefined,
     collapseKey: sanitizeString(customData.pushOptions?.collapseKey) || undefined,
+    unreadCount: canonicalUnreadCount,
     type: notification?.type || 'system',
     targetType: sanitizeString(data.targetType || customData.targetType).slice(0, 80) || undefined,
     targetId: toId(data.targetId || customData.targetId) || undefined,
@@ -642,29 +649,28 @@ const getRecipientPushState = async (recipientId, notification) => {
   const User = require('../models/User');
   const Notification = require('../models/Notification');
   const { getPushDevicesForUser } = require('../services/pushDeviceService');
-  const [user, unreadCount, devices] = await Promise.all([
+  const [user, devices] = await Promise.all([
     User.findById(recipientId).select('notificationSettings isActive').lean(),
-    Notification.countDocuments({
-      recipient: recipientId,
-      isRead: false,
-      deletedAt: null,
-      archivedAt: null
-    }).catch(() => 0),
     getPushDevicesForUser(recipientId)
   ]);
 
   const preferenceKey = getPreferenceKeyForNotification(notification);
   const settings = { ...NOTIFICATION_SETTING_DEFAULTS, ...(user?.notificationSettings || {}) };
+  const callEventType = sanitizeString(notification?.data?.customData?.eventType).toLowerCase();
+  const isBadgeSync = callEventType === 'badge_sync';
   const callStateReconciliation = notification?.data?.customData?.eventType === 'call_state_update' &&
     notification?.data?.customData?.callStateReconciliation === true;
-  const allowed = Boolean(user) && user.isActive !== false && (callStateReconciliation || (
-    settings.pushEnabled !== false && (!preferenceKey || settings[preferenceKey] !== false)
-  ));
+  const allowed = Boolean(user) && user.isActive !== false && (
+    callStateReconciliation ||
+    (isBadgeSync
+      ? settings.pushEnabled !== false
+      : settings.pushEnabled !== false && (!preferenceKey || settings[preferenceKey] !== false))
+  );
   if (!allowed) {
     const suppressionReason = !user || user.isActive === false
       ? 'RECIPIENT_INACTIVE'
       : settings.pushEnabled === false ? 'PUSH_DISABLED' : 'CATEGORY_MUTED';
-    return { tokens: [], devices: [], unreadCount, suppressionReason };
+    return { tokens: [], devices: [], unreadCountByClient: new Map(), suppressionReason };
   }
   const targetInstallationId = sanitizeString(notification?.data?.customData?.pushTargetInstallationId);
   const targetPlatform = sanitizeString(notification?.data?.customData?.pushTargetPlatform).toLowerCase();
@@ -684,7 +690,6 @@ const getRecipientPushState = async (recipientId, notification) => {
   );
   const validDevices = devices.filter((entry) => typeof entry?.token === 'string' &&
     entry.token.length <= EXPO_PUSH_TOKEN_MAX_LENGTH && EXPO_PUSH_TOKEN_PATTERN.test(entry.token));
-  const callEventType = sanitizeString(notification?.data?.customData?.eventType).toLowerCase();
   const isIncomingCall = callEventType === 'incoming_call' ||
     (notification?.type === 'call' && !callEventType);
   const allowIosVoipFallback = notification?.pushAllowVoipFallback === true;
@@ -700,10 +705,42 @@ const getRecipientPushState = async (recipientId, notification) => {
     // token; iOS installations without PushKit still receive the fallback.
     (!isIncomingCall || allowIosVoipFallback || entry.platform !== 'ios' || !entry.voipTokenHash)
   );
+  const clientContexts = Array.from(new Map(targetedDevices.map((device) => {
+    const platform = sanitizeString(device.platform).toLowerCase();
+    const appVersion = sanitizeString(device.appVersion);
+    return [`${platform}:${appVersion}`, { platform, appVersion }];
+  })).entries());
+  const unreadCountByClient = new Map(await Promise.all(clientContexts.map(async ([key, client]) => {
+    const knownPlatform = ['ios', 'android', 'web'].includes(client.platform);
+    const visibility = [
+      {
+        $or: [
+          { 'data.targetPlatforms': { $exists: false } },
+          { 'data.targetPlatforms': { $size: 0 } },
+          ...(knownPlatform ? [{ 'data.targetPlatforms': client.platform }] : [])
+        ]
+      },
+      {
+        $or: [
+          { 'data.targetAppVersions': { $exists: false } },
+          { 'data.targetAppVersions': { $size: 0 } },
+          ...(client.appVersion ? [{ 'data.targetAppVersions': client.appVersion }] : [])
+        ]
+      }
+    ];
+    const count = await Notification.countDocuments({
+      recipient: recipientId,
+      isRead: false,
+      deletedAt: null,
+      archivedAt: null,
+      $and: visibility
+    });
+    return [key, normalizeUnreadCount(count)];
+  })));
   return {
     tokens: targetedDevices.map((entry) => entry.token),
     devices: targetedDevices,
-    unreadCount,
+    unreadCountByClient,
     suppressionReason: targetedDevices.length
       ? ''
       : (validDevices.length ? 'NO_MATCHING_INSTALLATION' : 'NO_ACTIVE_INSTALLATION')
@@ -723,12 +760,14 @@ const getIncomingCallDeadline = (notification) => {
 const buildExpoMessages = (tokens, notification, unreadCount = 0) => {
   const title = sanitizeString(notification.title, 'SquadHunt');
   const body = sanitizeString(notification.message, 'You have a new notification');
-  const data = buildPushData(notification);
+  const canonicalUnreadCount = normalizeUnreadCount(unreadCount);
+  const data = buildPushData(notification, canonicalUnreadCount);
   const isBroadcast = Boolean(data.broadcastId);
   const image = sanitizeString(notification?.data?.image || notification?.data?.customData?.image);
   const channelId = getChannelIdForNotification(notification);
   const pushOptions = notification?.data?.customData?.pushOptions || {};
   const callEventType = sanitizeString(notification?.data?.customData?.eventType).toLowerCase();
+  const isBadgeSync = callEventType === 'badge_sync';
   const isIncomingCall = callEventType === 'incoming_call' ||
     (notification?.type === 'call' && !callEventType);
   const isCallStateUpdate = callEventType === 'call_state_update';
@@ -743,9 +782,10 @@ const buildExpoMessages = (tokens, notification, unreadCount = 0) => {
   const priority = ['default', 'normal', 'high'].includes(pushOptions.priority)
     ? pushOptions.priority
     : (notification?.data?.customData?.priority === 'normal' ? 'normal' : 'high');
-  const badge = pushOptions.badge !== null && pushOptions.badge !== undefined && Number.isFinite(Number(pushOptions.badge))
-    ? Number(pushOptions.badge)
-    : unreadCount;
+  // The launcher badge represents the canonical unread inbox count. A custom
+  // campaign value can make the native badge disagree with the notification
+  // center after read/delete, so provider payloads always use server state.
+  const badge = canonicalUnreadCount;
   const sound = pushOptions.sound === null || pushOptions.sound === 'none'
     ? undefined
     : sanitizeString(pushOptions.sound, 'default');
@@ -760,16 +800,17 @@ const buildExpoMessages = (tokens, notification, unreadCount = 0) => {
     // FCM does not invoke FirebaseMessagingService for a background/killed
     // app when a message contains a notification envelope. Android incoming
     // calls therefore use a high-priority data-only message so the checked-in
-    // native service can immediately publish CallStyle/full-screen UI. Other
-    // alerts and the iOS fallback retain the normal visible envelope.
-    const isNativeCallData = (isIncomingCall && platform === 'android') ||
+    // native service can immediately publish CallStyle/full-screen UI. Badge
+    // reconciliation is also data-only so it never creates a visible alert.
+    // Other alerts and the iOS fallback retain the normal visible envelope.
+    const isDataOnly = isBadgeSync || (isIncomingCall && platform === 'android') ||
       (isCallStateUpdate && ['android', 'ios'].includes(platform));
     // APNs content-available/data-only notifications require priority 5;
     // Expo's `normal` maps to that value. Android call state remains high.
-    const providerPriority = isCallStateUpdate && platform === 'ios' ? 'normal' : priority;
+    const providerPriority = (isBadgeSync || (isCallStateUpdate && platform === 'ios')) ? 'normal' : priority;
     const message = {
       to: token,
-      ...(!isNativeCallData ? {
+      ...(!isDataOnly ? {
         title,
         body,
         ...(subtitle ? { subtitle } : {}),
@@ -785,7 +826,8 @@ const buildExpoMessages = (tokens, notification, unreadCount = 0) => {
       // Broadcast alerts stay visible while also allowing iOS to wake the app
       // for background delivery tracking. Generic notifications must not all
       // opt into background processing.
-      ...((isBroadcast || isIncomingCall || isCallStateUpdate) ? { _contentAvailable: true } : {}),
+      ...(isBadgeSync ? { badge } : {}),
+      ...((isBroadcast || isIncomingCall || isCallStateUpdate || isBadgeSync) ? { _contentAvailable: true } : {}),
       ...((pushOptions.collapseKey || isIncomingCall) ? {
         collapseId: boundedCollapseId(
           pushOptions.collapseKey || notification?.data?.customData?.callId || notification?.data?.customData?.conversationId,
@@ -1029,7 +1071,7 @@ const markProviderRequestFailure = async (records, leaseKey, error) => {
   await PushDeliveryAttempt.bulkWrite(operations, { ordered: false });
 };
 
-const submitClaimedPushAttempts = async (claimed, devices, notification, unreadCount, leaseKey) => {
+const submitClaimedPushAttempts = async (claimed, devices, notification, unreadCountByClient, leaseKey) => {
   const PushDeliveryAttempt = require('../models/PushDeliveryAttempt');
   const PushDevice = require('../models/PushDevice');
   const { invalidatePushDevicesByHash } = require('../services/pushDeviceService');
@@ -1072,6 +1114,8 @@ const submitClaimedPushAttempts = async (claimed, devices, notification, unreadC
           }
         }
       };
+      const clientKey = `${sanitizeString(device.platform).toLowerCase()}:${sanitizeString(device.appVersion)}`;
+      const unreadCount = unreadCountByClient.get(clientKey) || 0;
       pairs.push({ record, message: buildExpoMessages([device], deliveryNotification, unreadCount)[0] });
     } catch (error) {
       await markProviderRequestFailure([record], leaseKey, error);
@@ -1262,7 +1306,7 @@ const sendPushNotification = async (recipientId, notification) => {
     }
   }
 
-  const { devices, unreadCount, suppressionReason } = await getRecipientPushState(resolvedRecipientId, notification);
+  const { devices, unreadCountByClient, suppressionReason } = await getRecipientPushState(resolvedRecipientId, notification);
   if (!devices.length) {
     const reasonCode = suppressionReason || 'NO_ACTIVE_INSTALLATION';
     const reasonMessage = {
@@ -1346,7 +1390,7 @@ const sendPushNotification = async (recipientId, notification) => {
       }
     };
     try {
-      outcome = await submitClaimedPushAttempts(claimed, devices, deliveryNotification, unreadCount, leaseKey);
+      outcome = await submitClaimedPushAttempts(claimed, devices, deliveryNotification, unreadCountByClient, leaseKey);
     } catch (error) {
       await updatePushDeliveryRequest(requestKey, {
         $set: {
@@ -1420,6 +1464,34 @@ const sendPushNotification = async (recipientId, notification) => {
     pendingReceipts: summary.pendingReceipts
   });
   return summary;
+};
+
+const sendBadgeSyncNotification = (recipientId, reason = 'notification_mutation') => {
+  const issuedAt = new Date();
+  const recipient = toId(recipientId);
+  if (!recipient) return Promise.resolve({ submitted: 0, reasonCode: 'INVALID_RECIPIENT' });
+  return sendPushNotification(recipient, {
+    recipient,
+    type: 'system',
+    title: 'SquadHunt',
+    message: 'Notification badge updated',
+    createdAt: issuedAt,
+    updatedAt: issuedAt,
+    data: {
+      customData: {
+        eventType: 'badge_sync',
+        deliveryType: 'push',
+        pushRequestId: `badge-sync:${recipient}:${issuedAt.getTime()}:${randomUUID()}`,
+        pushOptions: {
+          ttl: 300,
+          priority: 'normal',
+          collapseKey: `badge-sync-${recipient}`,
+          sound: 'none'
+        },
+        reason: sanitizeString(reason).slice(0, 80)
+      }
+    }
+  });
 };
 
 const retryPushDeliveryAttempts = async (attemptIds) => {
@@ -2525,6 +2597,7 @@ const sendBulkPushNotification = async (recipientIds, notification) => {
 
 module.exports = {
   sendPushNotification,
+  sendBadgeSyncNotification,
   retryPushDeliveryAttempts,
   recoverPendingNotificationPushes,
   recoverInterruptedPushRequests,

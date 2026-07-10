@@ -9,9 +9,13 @@ const {
   submitMatchResults,
   updateScrim,
   deleteScrim,
-  cancelScrim
+  cancelScrim,
+  validateScrimIdentifierParam
 } = require('../controllers/scrimController');
 const { protect, publicOptionalAuth } = require('../middleware/auth');
+
+router.param('id', validateScrimIdentifierParam);
+router.param('code', validateScrimIdentifierParam);
 
 // Scrim CRUD operations
 router.route('/')

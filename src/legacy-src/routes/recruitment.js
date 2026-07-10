@@ -22,6 +22,7 @@ const {
   updateApplicationStatus
 } = require('../controllers/recruitmentController');
 const { protect: auth, publicOptionalAuth } = require('../middleware/auth');
+const { markSocialPreviewRequest } = require('../utils/socialPreviewRequest');
 const {
   validateRecruitment,
   validateRecruitmentUpdate,
@@ -35,6 +36,7 @@ const {
 // Team Recruitment Routes
 router.post('/team-recruitments', auth, ...validateRecruitment, createTeamRecruitment);
 router.get('/team-recruitments', auth, getTeamRecruitments);
+router.get('/recruitment/:code/preview', markSocialPreviewRequest, publicOptionalAuth, getTeamRecruitment);
 router.get('/recruitment/:code', publicOptionalAuth, getTeamRecruitment); // Shareable link route (public) - must come before /team-recruitments/:id
 router.get('/team-recruitments/:id', publicOptionalAuth, getTeamRecruitment); // Supports both ID and recruitmentCode (public for viewing)
 router.put('/team-recruitments/:id', auth, ...validateRecruitmentUpdate, updateTeamRecruitment);
@@ -46,6 +48,7 @@ router.delete('/team-recruitments/:id', auth, deleteTeamRecruitment);
 router.post('/player-profiles', auth, ...validatePlayerProfile, createPlayerProfile);
 router.get('/player-profiles/daily-limit', auth, getPlayerCardLimit);
 router.get('/player-profiles', auth, getPlayerProfiles);
+router.get('/profile/:code/preview', markSocialPreviewRequest, publicOptionalAuth, getPlayerProfile);
 router.get('/player-profiles/:id', publicOptionalAuth, getPlayerProfile); // Supports both ID and profileCode (public for viewing)
 router.get('/profile/:code', publicOptionalAuth, getPlayerProfile); // Shareable link route (public)
 router.put('/player-profiles/:id', auth, ...validatePlayerProfileUpdate, updatePlayerProfile);

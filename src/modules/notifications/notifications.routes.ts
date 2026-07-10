@@ -83,6 +83,17 @@ const withClientVisibility = (
   return constraints.length ? { ...base, $and: constraints } : base;
 };
 
+const countVisibleUnreadNotifications = (
+  userId: unknown,
+  platform: string,
+  appVersion: string
+) => Notification.countDocuments(withClientVisibility({
+  recipient: userId,
+  isRead: false,
+  deletedAt: null,
+  archivedAt: null
+}, platform, appVersion));
+
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const BroadcastRecipient = require(path.join(backendRootPath, "models", "BroadcastRecipient.js"));
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -169,6 +180,30 @@ const countRegisteredPushTokens = async (userId: string) => {
       typeof entry?.token === "string" && EXPO_PUSH_TOKEN_PATTERN.test(entry.token)
     ).length
   };
+};
+
+const scheduleUnreadBadgeSync = (userId: unknown, reason: string) => {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { sendBadgeSyncNotification } = require(path.join(
+      backendRootPath,
+      "utils",
+      "pushNotificationService.js"
+    ));
+    void Promise.resolve(sendBadgeSyncNotification(userId, reason)).catch((error) => {
+      logger.warn("Unread badge synchronization failed", {
+        userId: String(userId || ""),
+        reason,
+        error: String(error)
+      });
+    });
+  } catch (error) {
+    logger.warn("Unread badge synchronization could not start", {
+      userId: String(userId || ""),
+      reason,
+      error: String(error)
+    });
+  }
 };
 
 const sendDiagnosticPush = async (userId: string, source = "diagnostic", requestId = "") => {
@@ -941,9 +976,7 @@ router.get("/", protect, async (req, res) => {
     const notifications = await sanitizeNotificationsForViewer(notificationDocuments, req.user);
 
     const total = await Notification.countDocuments(filter);
-    const unreadCount = await Notification.countDocuments(
-      withClientVisibility({ recipient: userId, isRead: false, deletedAt: null, archivedAt: null }, platform, appVersion)
-    );
+    const unreadCount = await countVisibleUnreadNotifications(userId, platform, appVersion);
 
     return res.status(200).json({
       success: true,
@@ -987,7 +1020,13 @@ router.put("/:id/read", protect, async (req, res) => {
     }
     const alreadyRead = notification.isRead === true;
     if (!alreadyRead) await notification.markAsRead();
-    return res.status(200).json({ success: true, message: "Notification marked as read", data: { alreadyRead } });
+    const unreadCount = await countVisibleUnreadNotifications(userId, platform, appVersion);
+    scheduleUnreadBadgeSync(userId, "notification_read");
+    return res.status(200).json({
+      success: true,
+      message: "Notification marked as read",
+      data: { alreadyRead, unreadCount }
+    });
   } catch (error) {
     return res.status(500).json({
       success: false,
@@ -1006,7 +1045,12 @@ router.put("/read-all", protect, async (req, res) => {
       withClientVisibility({ recipient: userId, isRead: false, deletedAt: null, archivedAt: null }, platform, appVersion),
       { isRead: true, readAt: new Date() }
     );
-    return res.status(200).json({ success: true, message: "All notifications marked as read" });
+    scheduleUnreadBadgeSync(userId, "notifications_read_all");
+    return res.status(200).json({
+      success: true,
+      message: "All notifications marked as read",
+      data: { unreadCount: 0 }
+    });
   } catch (error) {
     return res.status(500).json({
       success: false,
@@ -1020,11 +1064,15 @@ router.put("/:id/archive", protect, async (req, res) => {
     const userId = getUserId(req as { user?: { _id?: string } });
     if (!userId) return res.status(401).json({ success: false, message: "Authenticated user is required" });
     if (!isObjectId(req.params.id)) return res.status(404).json({ success: false, message: "Notification not found" });
+    const platform = safeString(req.body?.platform ?? req.query.platform, 40).toLowerCase();
+    const appVersion = safeString(req.body?.appVersion ?? req.query.appVersion, 40);
     const notification = await Notification.findOne({ _id: req.params.id, recipient: userId, deletedAt: null });
     if (!notification) return res.status(404).json({ success: false, message: "Notification not found" });
     notification.archivedAt = new Date();
     await notification.save();
-    return res.json({ success: true, message: "Notification archived" });
+    const unreadCount = await countVisibleUnreadNotifications(userId, platform, appVersion);
+    scheduleUnreadBadgeSync(userId, "notification_archived");
+    return res.json({ success: true, message: "Notification archived", data: { unreadCount } });
   } catch (error) {
     return res.status(500).json({ success: false, message: "Failed to archive notification" });
   }
@@ -1035,11 +1083,15 @@ router.put("/:id/unarchive", protect, async (req, res) => {
     const userId = getUserId(req as { user?: { _id?: string } });
     if (!userId) return res.status(401).json({ success: false, message: "Authenticated user is required" });
     if (!isObjectId(req.params.id)) return res.status(404).json({ success: false, message: "Notification not found" });
+    const platform = safeString(req.body?.platform ?? req.query.platform, 40).toLowerCase();
+    const appVersion = safeString(req.body?.appVersion ?? req.query.appVersion, 40);
     const notification = await Notification.findOne({ _id: req.params.id, recipient: userId, deletedAt: null });
     if (!notification) return res.status(404).json({ success: false, message: "Notification not found" });
     notification.archivedAt = null;
     await notification.save();
-    return res.json({ success: true, message: "Notification restored" });
+    const unreadCount = await countVisibleUnreadNotifications(userId, platform, appVersion);
+    scheduleUnreadBadgeSync(userId, "notification_unarchived");
+    return res.json({ success: true, message: "Notification restored", data: { unreadCount } });
   } catch (error) {
     return res.status(500).json({ success: false, message: "Failed to restore notification" });
   }
@@ -1051,6 +1103,8 @@ router.delete("/:id", protect, async (req, res) => {
     const { id } = req.params;
     if (!userId) return res.status(401).json({ success: false, message: "Authenticated user is required" });
     if (!isObjectId(id)) return res.status(404).json({ success: false, message: "Notification not found" });
+    const platform = safeString(req.body?.platform ?? req.query.platform, 40).toLowerCase();
+    const appVersion = safeString(req.body?.appVersion ?? req.query.appVersion, 40);
     const notification = await Notification.findOne({ _id: id, recipient: userId, deletedAt: null });
     if (!notification) {
       return res.status(404).json({ success: false, message: "Notification not found" });
@@ -1060,7 +1114,13 @@ router.delete("/:id", protect, async (req, res) => {
     notification.isRead = true;
     notification.readAt = notification.readAt || new Date();
     await notification.save();
-    return res.status(200).json({ success: true, message: "Notification deleted" });
+    const unreadCount = await countVisibleUnreadNotifications(userId, platform, appVersion);
+    scheduleUnreadBadgeSync(userId, "notification_deleted");
+    return res.status(200).json({
+      success: true,
+      message: "Notification deleted",
+      data: { unreadCount }
+    });
   } catch (error) {
     return res.status(500).json({
       success: false,

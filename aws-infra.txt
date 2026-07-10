@@ -32,9 +32,9 @@ DATABASES
 DocumentDB Endpoint : arc-db.cluster-ce1iqeycqt5o.us-east-1.docdb.amazonaws.com
 DocumentDB Port     : 27017
 DocumentDB User     : arcadmin
-DocumentDB Pass     : ArcDbPass123!
+DocumentDB Pass     : <stored in AWS Secrets Manager>
 DocumentDB DB Name  : gaming-social-platform
-DocumentDB URI      : mongodb://arcadmin:ArcDbPass123!@arc-db.cluster-ce1iqeycqt5o.us-east-1.docdb.amazonaws.com:27017/gaming-social-platform?replicaSet=rs0&readPreference=secondaryPreferred
+DocumentDB URI      : <stored in AWS Secrets Manager; never commit credentials>
 
 Redis Endpoint : arc-redis-ym9krl.serverless.use1.cache.amazonaws.com
 Redis Port     : 6379

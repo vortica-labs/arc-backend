@@ -72,6 +72,11 @@ function run() {
         /(?:error|message)\s*:\s*(?:err|error)\.message/,
         `${fileName} must not return raw exception messages`
       );
+      assert.doesNotMatch(
+        source,
+        /res\.status\(\s*(?:err|error)\.statusCode\s*\)/,
+        `${fileName} must not allow thrown errors to choose a public HTTP status`
+      );
     }
   } finally {
     if (previousNodeEnv === undefined) delete process.env.NODE_ENV;

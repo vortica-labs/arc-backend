@@ -30,6 +30,7 @@ const scrimSchema = new mongoose.Schema({
   description: {
     type: String,
     required: false,
+    maxlength: 5000,
     default: ''
   },
   game: {
@@ -94,10 +95,13 @@ const scrimSchema = new mongoose.Schema({
     max: 25,
     default: 16
   },
-  registeredTeams: [{
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User'
-  }],
+  registeredTeams: {
+    type: [{
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User'
+    }],
+    default: []
+  },
   
   // Unique shareable ID
   scrimCode: {
@@ -261,7 +265,7 @@ const scrimSchema = new mongoose.Schema({
   },
   
   // Prize Pool
-  prizePool: { type: Number, default: 0 },
+  prizePool: { type: Number, min: 0, default: 0 },
   prizePoolType: {
     type: String,
     enum: ['with_prize', 'without_prize', 'no_prize'],
@@ -274,15 +278,15 @@ const scrimSchema = new mongoose.Schema({
   },
   // Prize Distribution — host decides how to split the prize pool
   prizeDistribution: [{
-    rank: { type: Number, required: true },
-    label: { type: String, default: '' },
-    amount: { type: Number, required: true },
-    percentage: { type: Number, default: 0 }
+    rank: { type: Number, required: true, min: 1 },
+    label: { type: String, maxlength: 120, default: '' },
+    amount: { type: Number, required: true, min: 0 },
+    percentage: { type: Number, min: 0, max: 100, default: 0 }
   }],
   // Special Prizes — custom categories like Most Finishes, Most Wins
   specialPrizes: [{
-    category: { type: String, required: true },
-    amount: { type: Number, required: true },
+    category: { type: String, required: true, maxlength: 120 },
+    amount: { type: Number, required: true, min: 0 },
     winnerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     winnerName: { type: String, default: '' }
   }],
@@ -314,9 +318,9 @@ const scrimSchema = new mongoose.Schema({
   },
 
   broadcasts: [{
-    message: { type: String, required: true },
-    type: { type: String, default: 'info' },
-    senderName: { type: String },
+    message: { type: String, required: true, maxlength: 2000 },
+    type: { type: String, enum: ['info', 'warning', 'match_starting', 'custom'], default: 'info' },
+    senderName: { type: String, maxlength: 120 },
     sentAt: { type: Date, default: Date.now }
   }]
 }, {
@@ -340,7 +344,7 @@ scrimSchema.methods.calculateMatchResults = function(matchNumber) {
   match.results.teams = match.results.teams.map(team => {
     const points = calculateBGMIPoints(team.placement, team.kills);
     return {
-      ...team.toObject(),
+      ...(typeof team?.toObject === 'function' ? team.toObject() : team),
       placementPoints: points.placementPoints,
       killPoints: points.killPoints,
       totalPoints: points.totalPoints
@@ -364,6 +368,7 @@ scrimSchema.methods.calculateOverallStandings = function() {
   this.matches.forEach(match => {
     if (match.results && match.results.teams) {
       match.results.teams.forEach(team => {
+        if (!team?.teamId) return;
         const teamId = team.teamId.toString();
         
         if (!allTeams[teamId]) {
@@ -444,5 +449,6 @@ scrimSchema.methods.calculateOverallStandings = function() {
 scrimSchema.index({ status: 1, date: 1 });
 scrimSchema.index({ host: 1 });
 scrimSchema.index({ scrimType: 1, date: 1 });
+scrimSchema.index({ registeredTeams: 1, date: -1 });
 
 module.exports = mongoose.model('Scrim', scrimSchema);

@@ -3,16 +3,16 @@ const { EMAIL_INTENTS } = require('./notificationChannelPolicy');
 
 const PASSWORD_SECURITY_EVENTS = Object.freeze({
   password_reset: Object.freeze({
-    subject: 'Your ARC password was reset',
-    text: 'Your ARC account password was reset successfully. If you did not make this change, contact ARC support immediately.'
+    subject: 'Your Squadhunt password was reset',
+    text: 'Your Squadhunt account password was reset successfully. If you did not make this change, contact Squadhunt support immediately.'
   }),
   password_changed: Object.freeze({
-    subject: 'Your ARC password was changed',
-    text: 'Your ARC account password was changed successfully. If you did not make this change, contact ARC support immediately.'
+    subject: 'Your Squadhunt password was changed',
+    text: 'Your Squadhunt account password was changed successfully. If you did not make this change, contact Squadhunt support immediately.'
   }),
   admin_password_reset: Object.freeze({
-    subject: 'Your ARC password was reset by an administrator',
-    text: 'An ARC administrator reset your account password. If you did not expect this change, contact ARC support immediately.'
+    subject: 'Your Squadhunt password was reset by an administrator',
+    text: 'A Squadhunt administrator reset your account password. If you did not expect this change, contact Squadhunt support immediately.'
   })
 });
 

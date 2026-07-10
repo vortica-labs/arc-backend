@@ -196,6 +196,23 @@ const run = async () => {
   assert.strictEqual(accessFor('DELETE', '/api/tournaments/:id'), 'authenticated');
   assert.strictEqual(accessFor('GET', '/api/scrims'), 'public-optional-auth');
   assert.strictEqual(accessFor('POST', '/api/scrims'), 'authenticated');
+  assert.strictEqual(accessFor('GET', '/api/rtc/ice'), 'authenticated');
+  assert.strictEqual(accessFor('GET', '/api/rtc/usage'), 'admin');
+  assert.strictEqual(accessFor('DELETE', '/api/rtc/credentials/:username'), 'admin');
+  const socketHas = (direction, event) => inventory.sockets.some((record) => (
+    record.direction === direction && record.event === event
+  ));
+  assert.ok(socketHas('inbound', 'call-accept'));
+  assert.ok(socketHas('inbound', 'call-reject'));
+  assert.ok(socketHas('inbound', 'call-end'));
+  assert.ok(socketHas('outbound', 'call-accept'));
+  assert.ok(socketHas('outbound', 'newMessage'));
+  assert.ok(socketHas('outbound', 'new-notification'));
+  assert.ok(socketHas('outbound', 'presence:updated'));
+  assert.ok(socketHas('outbound', 'user-typing'));
+  assert.ok(socketHas('outbound', 'random-session-timer-started'));
+  assert.ok(socketHas('outbound', 'random-session-timer-warning'));
+  assert.ok(socketHas('outbound', 'random-session-ended'));
 
   console.log(`API surface contracts passed (${inventory.endpointCount} HTTP endpoints inventoried).`);
 };
