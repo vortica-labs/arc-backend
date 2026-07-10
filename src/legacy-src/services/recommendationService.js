@@ -281,7 +281,8 @@ async function getInterestProfile(userId, relationship) {
     return {
       tagWeights: new Map(),
       authorWeights: new Map(),
-      postTypeWeights: new Map()
+      postTypeWeights: new Map(),
+      savedPostIds: new Set()
     };
   }
 
@@ -342,7 +343,12 @@ async function getInterestProfile(userId, relationship) {
     });
   });
 
-  return { tagWeights, authorWeights, postTypeWeights };
+  return {
+    tagWeights,
+    authorWeights,
+    postTypeWeights,
+    savedPostIds: new Set(savedPostIds.map(normalizeId).filter(Boolean))
+  };
 }
 
 function scorePost(post, { mode, relationship, interestProfile, seed }) {
@@ -530,7 +536,11 @@ async function getRecommendedPosts({ user, query = {}, mode = 'feed' }) {
         isGuest,
         Boolean(relationship.currentUserId && normalizeId(post.author) === relationship.currentUserId)
       );
-      if (dto) dto.deliverySource = attributedBoostPostIds.has(normalizeId(post._id)) ? 'boost' : 'organic';
+      if (dto) {
+        const postId = normalizeId(post._id);
+        dto.deliverySource = attributedBoostPostIds.has(postId) ? 'boost' : 'organic';
+        dto.isSaved = Boolean(relationship.currentUserId && interestProfile.savedPostIds.has(postId));
+      }
       return dto;
     }),
     pagination: {

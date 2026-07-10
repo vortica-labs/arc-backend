@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { body, param } from "express-validator";
-import { handleValidationErrors, optionalAuth, postController, protect, uploadFields } from "./posts.legacy-adapters";
+import { handleValidationErrors, optionalAuth, postController, protect, uploadFields, validateAchievementPostBody } from "./posts.legacy-adapters";
 
 const router = Router();
 
@@ -16,7 +16,12 @@ const createPostValidation = [
     return true;
   }),
   body("postType").optional().isIn(["general", "recruitment", "achievement", "looking-for-team"]).withMessage("Invalid post type"),
-  body("visibility").optional().isIn(["public", "followers", "private"]).withMessage("Invalid visibility setting")
+  body("visibility").optional().isIn(["public", "followers", "private"]).withMessage("Invalid visibility setting"),
+  body().custom((_, { req }) => {
+    const validationError = validateAchievementPostBody(req.body);
+    if (validationError) throw new Error(validationError);
+    return true;
+  })
 ];
 
 const updatePostValidation = [

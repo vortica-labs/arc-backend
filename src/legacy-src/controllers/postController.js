@@ -17,6 +17,11 @@ const { isActiveBoost } = require('../services/boostService');
 const log = require('../utils/logger');
 const { respondToMediaUploadError } = require('../utils/mediaUploadError');
 const { resolvePostAccess, filterPostsForViewer } = require('../utils/privacyPolicy');
+const {
+  normalizeAchievementInfoInput,
+  validateAchievementPostBody,
+  toAchievementInfoForPersistence
+} = require('../utils/achievementPostPolicy');
 
 const rejectPrivatePost = (res, decision) => res.status(decision?.reason === 'not_found' ? 404 : 403).json({
   success: false,
@@ -72,25 +77,14 @@ async function incrementAttributionMetric({ postId, source, campaignId, metric, 
 // Create new post
 const createPost = async (req, res) => {
   try {
-    const { text, postType, tags, visibility, recruitmentInfo, achievementInfo, mentions } = req.body;
+    const { text, postType, tags, visibility, recruitmentInfo, mentions } = req.body;
     const authorId = req.user._id;
 
-    // Parse nested FormData fields for achievementInfo if sent as flat fields
-    let parsedAchievementInfo = achievementInfo;
-    if (postType === 'achievement' && !achievementInfo) {
-      // Check if achievementInfo fields are sent as flat fields (achievementInfo[gameTitle], etc.)
-      parsedAchievementInfo = {};
-      if (req.body['achievementInfo[gameTitle]']) {
-        parsedAchievementInfo.gameTitle = req.body['achievementInfo[gameTitle]'];
-      }
-      if (req.body['achievementInfo[achievementType]']) {
-        parsedAchievementInfo.achievementType = req.body['achievementInfo[achievementType]'];
-      }
-      if (req.body['achievementInfo[description]']) {
-        parsedAchievementInfo.description = req.body['achievementInfo[description]'];
-      }
-      if (req.body['achievementInfo[date]']) {
-        parsedAchievementInfo.date = req.body['achievementInfo[date]'];
+    const parsedAchievementInfo = normalizeAchievementInfoInput(req.body);
+    if (postType === 'achievement') {
+      const achievementValidationError = validateAchievementPostBody(req.body);
+      if (achievementValidationError) {
+        return res.status(400).json({ success: false, message: achievementValidationError });
       }
     }
 
@@ -241,13 +235,8 @@ const createPost = async (req, res) => {
     }
 
     // Add achievement info if it's an achievement post
-    if (postType === 'achievement' && parsedAchievementInfo && Object.keys(parsedAchievementInfo).length > 0) {
-      postData.achievementInfo = {
-        gameTitle: parsedAchievementInfo.gameTitle,
-        achievementType: parsedAchievementInfo.achievementType,
-        description: parsedAchievementInfo.description,
-        date: parsedAchievementInfo.date ? new Date(parsedAchievementInfo.date) : new Date()
-      };
+    if (postType === 'achievement') {
+      postData.achievementInfo = toAchievementInfoForPersistence(parsedAchievementInfo, { defaultDate: true });
       if (process.env.NODE_ENV === 'development') { console.log('Creating achievement post with info:', postData.achievementInfo);}
     }
 
@@ -512,11 +501,19 @@ const getPost = async (req, res) => {
     }
 
     const isAuthor = Boolean(req.user && req.user._id && !isGuest && post.author && post.author._id && post.author._id.toString() === req.user._id.toString());
+    const postDto = formatPostDTO(post, isGuest, isAuthor);
+    if (postDto) {
+      postDto.isSaved = Boolean(
+        viewerId
+        && !isGuest
+        && await User.exists({ _id: viewerId, 'savedPosts.post': post._id })
+      );
+    }
 
     res.status(200).json({
       success: true,
       data: {
-        post: formatPostDTO(post, isGuest, isAuthor)
+        post: postDto
       }
     });
 
@@ -944,7 +941,7 @@ const updatePost = async (req, res) => {
     const { text, tags, visibility, recruitmentInfo } = req.body;
     const userId = req.user._id;
 
-    const post = await Post.findById(postId).select('author boostMeta boostExpiresAt isActive');
+    const post = await Post.findById(postId);
 
     if (!post) {
       return res.status(404).json({
@@ -963,7 +960,11 @@ const updatePost = async (req, res) => {
 
     // Update fields
     if (text !== undefined) post.content.text = text;
-    if (tags !== undefined) post.tags = tags.split(',').map(tag => tag.trim());
+    if (tags !== undefined) {
+      post.tags = (Array.isArray(tags) ? tags : String(tags).split(','))
+        .map(tag => String(tag).trim())
+        .filter(Boolean);
+    }
     if (visibility !== undefined) post.visibility = visibility;
 
     // Update recruitment info if provided
@@ -971,7 +972,11 @@ const updatePost = async (req, res) => {
       post.recruitmentInfo = {
         ...post.recruitmentInfo,
         ...recruitmentInfo,
-        positions: recruitmentInfo.positions ? recruitmentInfo.positions.split(',').map(pos => pos.trim()) : post.recruitmentInfo.positions
+        positions: recruitmentInfo.positions
+          ? (Array.isArray(recruitmentInfo.positions) ? recruitmentInfo.positions : String(recruitmentInfo.positions).split(','))
+            .map(pos => String(pos).trim())
+            .filter(Boolean)
+          : post.recruitmentInfo.positions
       };
     }
 
@@ -982,7 +987,7 @@ const updatePost = async (req, res) => {
       success: true,
       message: 'Post updated successfully',
       data: {
-        post
+        post: formatPostDTO(post, false, true)
       }
     });
 

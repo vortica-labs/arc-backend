@@ -11,3 +11,4 @@ export const backendMiddlewarePath = path.join(backendRootPath, "middleware");
 export const backendConfigPath = path.join(backendRootPath, "config");
 export const backendControllerPath = path.join(backendRootPath, "controllers");
 export const backendModelPath = path.join(backendRootPath, "models");
+export const backendUtilsPath = path.join(backendRootPath, "utils");

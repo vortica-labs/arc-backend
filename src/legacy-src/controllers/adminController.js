@@ -888,7 +888,7 @@ const getPosts = async (req, res) => {
 
     const posts = await Post.find(query)
       .populate('author', 'username email profile.displayName profile.avatar userType')
-      .select('content images likes comments createdAt updatedAt isActive author')
+      .select('content images postType achievementInfo visibility likes comments createdAt updatedAt isActive author')
       .sort({ createdAt: -1 })
       .limit(limit * 1)
       .skip((page - 1) * limit);
