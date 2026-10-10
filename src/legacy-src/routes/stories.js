@@ -1,10 +1,11 @@
 const express = require('express');
-const { protect } = require('../middleware/auth');
+const { protect, publicOptionalAuth } = require('../middleware/auth');
 const { uploadFields } = require('../middleware/upload');
 const {
   createStory,
   getStoriesFeed,
   getUserStories,
+  getStory,
   viewStory,
   getStoryViewers,
   deleteStory
@@ -13,7 +14,8 @@ const {
 const router = express.Router();
 
 router.get('/feed', protect, getStoriesFeed);
-router.get('/user/:userId', protect, getUserStories);
+router.get('/user/:userId', publicOptionalAuth, getUserStories);
+router.get('/:storyId', publicOptionalAuth, getStory);
 router.post('/', protect, uploadFields([{ name: 'media', maxCount: 1 }, { name: 'music', maxCount: 1 }]), createStory);
 router.post('/:storyId/view', protect, viewStory);
 router.get('/:storyId/views', protect, getStoryViewers);

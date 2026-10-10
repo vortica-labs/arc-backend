@@ -134,7 +134,7 @@ const getUsers = async (req, res) => {
     );
     const discoverSearch = Boolean(search && req.query.context === 'search');
     const viewerId = req.user?._id;
-    const isGuest = req.user && req.user.userType === 'guest';
+    const isGuest = !req.user || req.user.userType === 'guest';
     const excludeFollowing = req.query.excludeFollowing === 'true' || req.query.suggestions === 'true';
 
     // Build filter object
@@ -1356,7 +1356,7 @@ const getFollowers = async (req, res) => {
       ? result.users.filter((follower) => follower?._id)
       : [];
 
-    const isGuest = req.user && req.user.userType === 'guest';
+    const isGuest = !req.user || req.user.userType === 'guest';
     const viewerId = req.user?._id;
     const [viewerFollows, pendingRequests] = viewerId && !isGuest && followers.length > 0
       ? await Promise.all([
@@ -1441,7 +1441,7 @@ const getFollowing = async (req, res) => {
     const result = await Follow.getFollowing(targetPrivacy.target._id, { page, limit, search, excludeUserIds });
     const following = result.users;
 
-    const isGuest = req.user && req.user.userType === 'guest';
+    const isGuest = !req.user || req.user.userType === 'guest';
     const viewerId = req.user?._id;
     const [viewerFollows, pendingRequests] = viewerId && !isGuest && following.length > 0
       ? await Promise.all([

@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { body, param } from "express-validator";
 import rateLimit from "express-rate-limit";
-import { handleValidationErrors, optionalAuth, postController, protect, uploadFields, validateAchievementPostBody } from "./posts.legacy-adapters";
+import { handleValidationErrors, publicOptionalAuth, postController, protect, uploadFields, validateAchievementPostBody } from "./posts.legacy-adapters";
 
 const router = Router();
 
@@ -60,17 +60,16 @@ const postAvailabilityLimiter = rateLimit({
 });
 
 router.post("/", protect, uploadFields([{ name: "media", maxCount: 5 }, { name: "cover", maxCount: 1 }]), createPostValidation, handleValidationErrors, postController.createPost);
-router.get("/", optionalAuth, postController.getPosts);
-router.get("/clips", optionalAuth, postController.getClips);
-// Anonymous direct-link checks receive only an existence result. The normal
-// post endpoint remains protected by optionalAuth and is the only route that
-// can return post content or viewer-specific authorization information.
+router.get("/", publicOptionalAuth, postController.getPosts);
+router.get("/clips", publicOptionalAuth, postController.getClips);
+// Keep the legacy existence probe for previously published clients. Detail
+// requests now use privacy-aware optional authentication directly.
 router.get("/:id/availability", postAvailabilityLimiter, postIdValidation, handleValidationErrors, postController.getPostAvailability);
 router.get("/saved", protect, postController.getSavedPosts);
 router.get("/liked", protect, postController.getLikedPosts);
-router.get("/:id", optionalAuth, postIdValidation, handleValidationErrors, postController.getPost);
-router.get("/:id/comments", optionalAuth, postIdValidation, handleValidationErrors, postController.getPostComments);
-router.get("/:id/likes", optionalAuth, postIdValidation, handleValidationErrors, postController.getPostLikes);
+router.get("/:id", publicOptionalAuth, postIdValidation, handleValidationErrors, postController.getPost);
+router.get("/:id/comments", publicOptionalAuth, postIdValidation, handleValidationErrors, postController.getPostComments);
+router.get("/:id/likes", publicOptionalAuth, postIdValidation, handleValidationErrors, postController.getPostLikes);
 router.post("/:id/view", protect, postIdValidation, engagementMetricValidation, handleValidationErrors, postController.recordClipView);
 router.post("/:id/like", protect, postIdValidation, handleValidationErrors, postController.toggleLike);
 router.post("/:id/comment", protect, postIdValidation, addCommentValidation, handleValidationErrors, postController.addComment);

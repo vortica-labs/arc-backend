@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { body, param } from "express-validator";
 import rateLimit from "express-rate-limit";
-import { handleValidationErrors, optionalAuth, protect, userController } from "./users.legacy-adapters";
+import { handleValidationErrors, optionalAuth, publicOptionalAuth, protect, userController } from "./users.legacy-adapters";
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const {
@@ -102,8 +102,8 @@ router.put("/gaming-stats/:statId", protect, userController.updateGamingStat);
 router.delete("/gaming-stats/:statId", protect, userController.deleteGamingStat);
 router.post("/gaming-stats/sync-coc", protect, userController.syncClashOfClansData);
 router.post("/gaming-stats/sync-cr", protect, userController.syncClashRoyaleData);
-router.get("/:identifier/tournaments", optionalAuth, userController.getLiveTournamentHistory);
-router.get("/:username/tournament-history", optionalAuth, userController.getUserTournamentHistory);
+router.get("/:identifier/tournaments", publicOptionalAuth, userController.getLiveTournamentHistory);
+router.get("/:username/tournament-history", publicOptionalAuth, userController.getUserTournamentHistory);
 router.get("/privacy-settings", protect, userController.getPrivacySettings);
 router.put("/privacy-settings", protect, userController.updatePrivacySettings);
 router.get("/notification-settings", protect, userController.getNotificationSettings);
@@ -115,13 +115,13 @@ router.post("/follow-requests/:requestId/reject", protect, userController.reject
 // Existence-only direct-link probe. No profile fields or privacy state leave
 // this route; authenticated profile reads continue through /:identifier.
 router.get("/:identifier/availability", profileAvailabilityLimiter, profileAvailabilityValidation, handleValidationErrors, userController.getUserAvailability);
-router.get("/:identifier", optionalAuth, userController.getUser);
+router.get("/:identifier", publicOptionalAuth, userController.getUser);
 router.post("/:id/follow", protect, userController.toggleFollow);
 router.delete("/:id/follow", protect, userController.toggleFollow);
-router.get("/:id/followers", optionalAuth, userController.getFollowers);
-router.get("/:id/following", optionalAuth, userController.getFollowing);
-router.get("/:id/posts", optionalAuth, userController.getUserPosts);
-router.get("/:id/clips", optionalAuth, userController.getUserClips);
+router.get("/:id/followers", publicOptionalAuth, userController.getFollowers);
+router.get("/:id/following", publicOptionalAuth, userController.getFollowing);
+router.get("/:id/posts", publicOptionalAuth, userController.getUserPosts);
+router.get("/:id/clips", publicOptionalAuth, userController.getUserClips);
 router.post("/:teamId/roster/add", protect, teamIdentifierValidation, rosterInviteValidation, handleValidationErrors, userController.addPlayerToRoster);
 router.delete("/:teamId/roster/:game/leave", protect, userController.leaveTeam);
 router.delete("/:teamId/roster/:game/:playerId", protect, userController.removePlayerFromRoster);

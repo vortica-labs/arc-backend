@@ -1224,7 +1224,7 @@ async function getRecommendedPosts({ user, query = {}, mode = 'feed' }) {
     excludedCount: effectiveExcludedIds.length
   });
   const nextCursor = candidates.length >= limit ? encodeCursor(nextCursorPost) : null;
-  const isGuest = user && user.userType === 'guest';
+  const isGuest = !user || user.userType === 'guest';
   // Development-only ranking diagnostics (Phase 4 feed contract + Phase 14
   // observability). Never emitted in production so internal scoring stays
   // private, but locally it exposes exactly why each post holds its slot so a

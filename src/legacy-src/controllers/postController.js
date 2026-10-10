@@ -390,7 +390,7 @@ const createPost = async (req, res) => {
       }
     }
 
-    const isGuest = req.user && req.user.userType === 'guest';
+    const isGuest = !req.user || req.user.userType === 'guest';
     const isAuthor = true; // The creator is the author
 
     res.status(201).json({
@@ -593,7 +593,7 @@ const getPost = async (req, res) => {
     if (!postPrivacyDecision) return;
 
     const viewerId = req.user?._id;
-    const isGuest = req.user && req.user.userType === 'guest';
+    const isGuest = !req.user || req.user.userType === 'guest';
     if (viewerId && !isGuest) {
       const { source, campaignId } = await getRequestAttribution(req, post);
       const viewUpdate = await Post.updateOne(

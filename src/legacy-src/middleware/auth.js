@@ -197,14 +197,26 @@ const optionalAuth = async (req, res, next) => {
   }
 };
 
-// Public-read authentication: anonymous requests continue, while a supplied
-// token is still validated and attached so controllers can recognize owners.
-// Keep this separate from optionalAuth because existing routes intentionally
-// require either a User or Guest token through that legacy middleware.
+// Public-read authentication: attach only a valid active viewer. Missing or
+// stale credentials use the controller's anonymous visibility checks instead.
+// Keep this separate from optionalAuth, which still requires a valid token.
 const publicOptionalAuth = async (req, res, next) => {
   const token = extractToken(req);
   if (!token) return next();
-  return optionalAuth(req, res, next);
+  try {
+    const decoded = verifyToken(token);
+    if (!decoded?.id) return next();
+    if (decoded.userType === 'guest') {
+      req.user = { _id: decoded.id, username: decoded.username, userType: 'guest' };
+      return next();
+    }
+    const user = await getCachedUser(decoded.id);
+    if (user?.isActive && user.needsProfileCompletion !== true) req.user = user;
+  } catch {
+    // Public reads still use the controller's anonymous visibility checks.
+    // A stale browser cookie must not turn a public link into a login error.
+  }
+  return next();
 };
 
 // Check if user owns the resource

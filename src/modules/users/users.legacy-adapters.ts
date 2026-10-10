@@ -6,6 +6,7 @@ type UserController = Record<string, RequestHandler>;
 type AuthMiddleware = {
   protect: RequestHandler;
   optionalAuth: RequestHandler;
+  publicOptionalAuth: RequestHandler;
 };
 type ValidationMiddleware = { handleValidationErrors: RequestHandler };
 
@@ -15,5 +16,5 @@ const loadModule = <T>(modulePath: string): T => {
 };
 
 export const userController = loadModule<UserController>(path.join(backendControllerPath, "userController.js"));
-export const { protect, optionalAuth } = loadModule<AuthMiddleware>(path.join(backendMiddlewarePath, "auth.js"));
+export const { protect, optionalAuth, publicOptionalAuth } = loadModule<AuthMiddleware>(path.join(backendMiddlewarePath, "auth.js"));
 export const { handleValidationErrors } = loadModule<ValidationMiddleware>(path.join(backendMiddlewarePath, "validation.js"));

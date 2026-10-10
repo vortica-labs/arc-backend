@@ -1,5 +1,5 @@
 const express = require('express');
-const { protect, optionalAuth } = require('../middleware/auth');
+const { protect, optionalAuth, publicOptionalAuth } = require('../middleware/auth');
 const {
   getUsers,
   getUser,
@@ -62,8 +62,8 @@ router.post('/block/:username', protect, blockUser);
 router.delete('/block/:username', protect, unblockUser);
 
 // Tournament history (must be before /:identifier)
-router.get('/:identifier/tournaments', optionalAuth, getLiveTournamentHistory);
-router.get('/:username/tournament-history', optionalAuth, getUserTournamentHistory);
+router.get('/:identifier/tournaments', publicOptionalAuth, getLiveTournamentHistory);
+router.get('/:username/tournament-history', publicOptionalAuth, getUserTournamentHistory);
 
 // Privacy settings (must be before /:identifier)
 router.get('/privacy-settings', protect, getPrivacySettings);
@@ -73,13 +73,13 @@ router.get('/follow-requests/incoming', protect, getFollowRequests);
 router.post('/follow-requests/:requestId/accept', protect, acceptFollowRequest);
 router.post('/follow-requests/:requestId/reject', protect, rejectFollowRequest);
 
-router.get('/:identifier', optionalAuth, getUser);
+router.get('/:identifier', publicOptionalAuth, getUser);
 router.post('/:id/follow', protect, toggleFollow);
 router.delete('/:id/follow', protect, toggleFollow);
-router.get('/:id/followers', optionalAuth, getFollowers);
-router.get('/:id/following', optionalAuth, getFollowing);
-router.get('/:id/posts', optionalAuth, getUserPosts);
-router.get('/:id/clips', optionalAuth, getUserClips);
+router.get('/:id/followers', publicOptionalAuth, getFollowers);
+router.get('/:id/following', publicOptionalAuth, getFollowing);
+router.get('/:id/posts', publicOptionalAuth, getUserPosts);
+router.get('/:id/clips', publicOptionalAuth, getUserClips);
 
 // Team management routes
 router.post('/:teamId/roster/add', protect, addPlayerToRoster);

@@ -1,6 +1,6 @@
 const express = require('express');
 const { body, param } = require('express-validator');
-const { protect, optionalAuth } = require('../middleware/auth');
+const { protect, publicOptionalAuth } = require('../middleware/auth');
 const { uploadFields } = require('../middleware/upload');
 const { handleValidationErrors } = require('../middleware/validation');
 const { validateAchievementPostBody } = require('../utils/achievementPostPolicy');
@@ -98,11 +98,11 @@ const interactionValidation = [
 
 // Routes
 router.post('/', protect, uploadFields([{ name: 'media', maxCount: 5 }, { name: 'cover', maxCount: 1 }]), createPostValidation, handleValidationErrors, createPost);
-router.get('/', optionalAuth, getPosts);
-router.get('/clips', optionalAuth, getClips);
-router.get('/:id', optionalAuth, getPost);
-router.get('/:id/comments', optionalAuth, getPostComments);
-router.get('/:id/likes', optionalAuth, getPostLikes);
+router.get('/', publicOptionalAuth, getPosts);
+router.get('/clips', publicOptionalAuth, getClips);
+router.get('/:id', publicOptionalAuth, getPost);
+router.get('/:id/comments', publicOptionalAuth, getPostComments);
+router.get('/:id/likes', publicOptionalAuth, getPostLikes);
 router.post('/:id/view', protect, engagementMetricValidation, handleValidationErrors, recordClipView);
 router.post('/:id/like', protect, toggleLike);
 router.post('/:id/comment', protect, addCommentValidation, handleValidationErrors, addComment);

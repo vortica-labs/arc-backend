@@ -266,7 +266,7 @@ const getStory = async (req, res) => {
     const story = await Story.findOne(buildActiveStoryQuery({
       _id: storyId,
       createdAt: { $gte: since }
-    })).populate('author', 'username userType profile profilePicture privacySettings blockedUsers isActive').lean();
+    })).select('-views').populate('author', 'username userType profile profilePicture privacySettings blockedUsers isActive').lean();
     if (!story) {
       return res.status(404).json({ success: false, message: 'Story not found or expired' });
     }
@@ -632,11 +632,11 @@ const getUserStories = async (req, res) => {
       return rejectStoryPrivacy(res, authorAccess.author, authorAccess.relationship.access);
     }
     const since = new Date(Date.now() - TWENTY_FOUR_HOURS_MS);
-    const isOwnStoryList = toIdStr(userId) === toIdStr(req.user._id);
+    const isOwnStoryList = Boolean(req.user?._id && toIdStr(userId) === toIdStr(req.user._id));
     const query = Story.find(buildActiveStoryQuery({
       author: userId,
       createdAt: { $gte: since }
-    }));
+    })).select('-views');
     if (isOwnStoryList) query.select('+clientUploadId');
     const stories = await query
       .sort({ createdAt: 1 })
