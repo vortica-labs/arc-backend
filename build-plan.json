@@ -1,0 +1,13 @@
+{
+  "runId": "pi-story-reliability-api-r1-20261103",
+  "repository": "906446637180.dkr.ecr.us-east-1.amazonaws.com/arc-backend",
+  "tag": "pi-story-reliability-api-r1-20261103",
+  "sourceContentSha256": "fcf841136a2a07793ed57091a19d58ffa3e6dd3de5f52172eaa415e627c1312f",
+  "archiveSha256": "cac90dc8a889c7658faee950dadf8d61946b9f341cee8d6f52089a299372c627",
+  "fileCount": 767,
+  "builder": "desktop-linux",
+  "platform": "linux/amd64",
+  "sourceBaseline": "API226",
+  "authority": "Owner request: deploy web and backend, 2026-11-03",
+  "ecsAuthority": 0
+}
