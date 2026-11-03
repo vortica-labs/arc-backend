@@ -1,0 +1,36 @@
+{
+  "runId": "pi-bounded-replay-api-r1-20261103",
+  "repository": "906446637180.dkr.ecr.us-east-1.amazonaws.com/arc-backend",
+  "tag": "pi-bounded-replay-api-r1-20261103",
+  "sourceContentSha256": "131be2e3aebf7cb9cf296c6f41f6b5ff9b058fe09e78ef47d4057f930481a315",
+  "sourceZipSha256": "e2f4cd3637a36f3eee3ee2239bb93b03411e389918bdfd64d58fd7ea8614672e",
+  "archiveSha256": "015d236ff6afe13db012c763bb1c5d06c3fa06dd6ac753d71ce4f636d669509d",
+  "filesSha256": "e3b5712ac73f1fa52d3ae4b56d24aefa5d5245844ff2c11b0c60fa26ee34db04",
+  "fileCount": 774,
+  "builder": "desktop-linux",
+  "platform": "linux/amd64",
+  "sourceBaseline": "API228",
+  "ecsAuthority": 0,
+  "controls": [
+    {
+      "path": "build-publish-once.cjs",
+      "sha256": "3b69c853f63ce596dc33f2b6d3e04cb8d904c333a25123fcd6dd153d91220caa"
+    },
+    {
+      "path": "build-publish-once.test.cjs",
+      "sha256": "13b1aa50fef590b2c15363861f0ece568d62a6dee922561a8de5cd7d8233dbf2"
+    },
+    {
+      "path": "source.json.gz",
+      "sha256": "015d236ff6afe13db012c763bb1c5d06c3fa06dd6ac753d71ce4f636d669509d"
+    }
+  ],
+  "decisionAgeMs": 1800000,
+  "buildTimeoutMs": 900000,
+  "otherCommandTimeoutMs": 30000,
+  "providerReads": 3,
+  "builds": 1,
+  "registryReads": 1,
+  "replayActivationAuthority": 0,
+  "carrierLabelOnly": true
+}

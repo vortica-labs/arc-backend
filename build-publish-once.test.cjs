@@ -1,0 +1,13 @@
+const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
+const {unpack,parseBuilder,registry}=require('./build-publish-once.cjs');
+test('exact sealed source verifies all774 records',()=>assert.equal(unpack(fs.readFileSync(path.join(__dirname,'source.json.gz'))).length,774));
+test('changed archive rejects before extraction or provider access',()=>assert.throws(()=>unpack(Buffer.from('changed')),/ARCHIVE_CHANGED/));
+const native='Name:          desktop-linux\nDriver:        docker\nNodes:\nName:             desktop-linux\nEndpoint:         desktop-linux\nStatus:           running\nPlatforms:        linux/amd64, linux/arm64\nDevices:\n Name:                  docker.com/gpu=webgpu\n';
+test('real indented device label is not another builder node',()=>assert.equal(parseBuilder(native).driver,'docker'));
+test('second node rejects',()=>assert.throws(()=>parseBuilder(native+'Name: other\n'),/BUILDER_FIELD_INVALID/));
+test('stopped or foreign builders reject',()=>{assert.throws(()=>parseBuilder(native.replace('running','stopped')),/EXISTING_LOCAL_BUILDER_REQUIRED/);assert.throws(()=>parseBuilder(native.replace('Endpoint:         desktop-linux','Endpoint:         tcp:foreign')),/EXISTING_LOCAL_BUILDER_REQUIRED/);});
+const child='sha256:'+'1'.repeat(64),raw=Buffer.from(JSON.stringify({mediaType:'application/vnd.oci.image.index.v1+json',manifests:[{digest:child,platform:{os:'linux',architecture:'amd64'}}]})),digest='sha256:'+crypto.createHash('sha256').update(raw).digest('hex');
+test('registry byte digest plus unique amd64 manifest required',()=>{assert.equal(registry(raw,digest),child);assert.throws(()=>registry(raw,'sha256:'+'2'.repeat(64)),/INDEX_DIGEST_MISMATCH/);});
+test('newline from Docker output preserves native digest comparison',()=>assert.equal(registry(Buffer.concat([raw,Buffer.from('\n')]),digest),child));
+
+test('fresh exact decision required before any publication',()=>{const C=require('./build-publish-once.cjs'),p=JSON.parse(fs.readFileSync(path.join(__dirname,'build-plan.json'))),a={decision:'APPROVE_EXACT_BOUNDED_REPLAY_API_BUILD_PUSH_ONLY',scopeSha256:C.hash(p),approvedAt:100,exclusiveNewTagBuilderAndJournal:true,sealedArchiveCarrierLabelOnly:true};assert.equal(C.validateApproval(a,p,101),a);assert.throws(()=>C.validateApproval(a,p,1800100),/APPROVAL_EXPIRED/);assert.throws(()=>C.validateApproval({...a,scopeSha256:'wrong'},p,101),/EXACT_APPROVAL_REQUIRED/);});
