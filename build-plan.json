@@ -1,0 +1,13 @@
+{
+  "runId": "pi-system-broadcast-api-r1-20261103",
+  "repository": "906446637180.dkr.ecr.us-east-1.amazonaws.com/arc-backend",
+  "tag": "pi-system-broadcast-api-r1-20261103",
+  "sourceContentSha256": "4361bff8ef4c0b47242accecea0d38a4f2549b8970e14b1fcc0cad36e06e5f95",
+  "archiveSha256": "0f754ce77ed42d4092d301910253545c32dd58c58bc8f1b0780e94898c075725",
+  "fileCount": 770,
+  "builder": "desktop-linux",
+  "platform": "linux/amd64",
+  "sourceBaseline": "API227",
+  "authority": "Owner request deploy backend,web and release v32 aab, 2026-11-03",
+  "ecsAuthority": 0
+}
